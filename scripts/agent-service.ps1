@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('EnableAgent', 'DisableAgent', 'EnableDshWeb', 'DisableDshWeb', 'Install', 'Update', 'Status')]
+    [ValidateSet('EnableAgent', 'DisableAgent', 'ClosePanel', 'EnableDshWeb', 'DisableDshWeb', 'Install', 'Update', 'Status')]
     [string]$Action
 )
 
@@ -19,6 +19,7 @@ $componentInstaller = Join-Path $projectRoot 'scripts\install-components.ps1'
 $updater = Join-Path $projectRoot 'scripts\update-project.ps1'
 $dailyTask = 'DSH A-Share Pre-open Research'
 $reportTask = 'DSH A-Share Report Site'
+$factorTask = 'DSH A-Share Weekly Factor Training'
 
 function Test-PortListening([int]$Port) {
     return $null -ne (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
@@ -110,6 +111,7 @@ switch ($Action) {
         & $taskInstaller
         Set-TaskEnabled $dailyTask $true
         Set-TaskEnabled $reportTask $true
+        Set-TaskEnabled $factorTask $true
         Start-ProjectPythonService $dataServer 8765 'Local stock-data service'
         Start-ProjectPythonService $reportServer 8766 'Report website'
         Write-Host 'Agent enabled: daily report tasks are active. DSH Web was not started.'
@@ -117,6 +119,7 @@ switch ($Action) {
     'DisableAgent' {
         Set-TaskEnabled $dailyTask $false
         Set-TaskEnabled $reportTask $false
+        Set-TaskEnabled $factorTask $false
         Stop-ProjectPort 8766 $reportServer 'report website'
         $pushProcesses = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -and $_.CommandLine -like "*$pushScript*" }
@@ -129,6 +132,20 @@ switch ($Action) {
         } else {
             Write-Host 'Agent disabled: daily report tasks have stopped. Data service remains available for DSH Web.'
         }
+    }
+    'ClosePanel' {
+        Set-TaskEnabled $dailyTask $false
+        Set-TaskEnabled $reportTask $false
+        Stop-ProjectPort 8766 $reportServer 'report website'
+        $pushProcesses = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$pushScript*" }
+        foreach ($process in $pushProcesses) {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-PortListening 3080)) {
+            Stop-ProjectPort 8765 $dataServer 'local stock-data service'
+        }
+        Write-Host 'Control panel closed; weekly factor training remains scheduled.'
     }
     'EnableDshWeb' {
         if (-not (Test-Path -LiteralPath $pythonExe)) {
@@ -183,6 +200,7 @@ switch ($Action) {
     'Install' {
         Set-TaskEnabled $dailyTask $false
         Set-TaskEnabled $reportTask $false
+        Set-TaskEnabled $factorTask $false
         & (Join-Path $projectRoot 'scripts\stop-services.ps1')
         & $componentInstaller
     }
@@ -193,6 +211,7 @@ switch ($Action) {
         Write-Host '[Check 1/4] Reading Windows scheduled tasks...'
         $agentTaskState = Get-TaskState $dailyTask
         $reportTaskState = Get-TaskState $reportTask
+        $factorTaskState = Get-TaskState $factorTask
         Write-Host '[Check 2/4] Checking service ports 8765, 8766, and 3080...'
         $dataServiceRunning = Test-PortListening 8765
         $reportSiteRunning = Test-PortListening 8766
@@ -218,6 +237,7 @@ switch ($Action) {
         [pscustomobject]@{
             agent_task = $agentTaskState
             report_task = $reportTaskState
+            factor_task = $factorTaskState
             data_service = $dataServiceRunning
             report_site = $reportSiteRunning
             dsh_web = $dshWebRunning

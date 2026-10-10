@@ -23,6 +23,7 @@ SERVICES = {
     "data": ([str(PYTHON), str(ROOT / "scripts" / "stock_data_server.py")], 8765),
     "report": ([str(PYTHON), str(ROOT / "scripts" / "report_web_server.py")], 8766),
     "daily": ([str(PYTHON), str(ROOT / "scripts" / "daily_push.py")], None),
+    "factor": ([str(PYTHON), str(ROOT / "scripts" / "factor_scheduler.py")], None),
     "dsh": ([], 3080),
 }
 
@@ -130,7 +131,8 @@ def status() -> dict:
         plugin = "dsh-finance-agent" in json.loads(manifest.read_text()).get("dependencies", {})
     except (OSError, ValueError, AttributeError):
         plugin = False
-    return {"agent_task": "Ready" if running["daily"] else "Disabled", "data_service": running["data"],
+    return {"agent_task": "Ready" if running["daily"] else "Disabled",
+            "factor_task": "Ready" if running["factor"] else "Disabled", "data_service": running["data"],
             "report_site": running["report"], "dsh_web": running["dsh"],
             "node_available": bool(shutil.which("node")), "python_available": bool(shutil.which("python3")),
             "git_available": bool(shutil.which("git")), "git_checkout": (ROOT / ".git").exists(),
@@ -139,14 +141,14 @@ def status() -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("EnableAgent", "EnableDshWeb", "DisableAgent", "DisableDshWeb", "Status"))
+    parser.add_argument("action", choices=("EnableAgent", "EnableDshWeb", "DisableAgent", "ClosePanel", "DisableDshWeb", "Status"))
     action = parser.parse_args().action
     try:
         if action == "EnableAgent":
             config = ROOT / "config" / "daily-push.json"
             if not config.exists():
                 config.write_bytes((ROOT / "config" / "daily-push.example.json").read_bytes())
-            for name in ("data", "report", "daily"):
+            for name in ("data", "report", "daily", "factor"):
                 start(name)
         elif action == "EnableDshWeb":
             start("data")
@@ -156,6 +158,11 @@ def main() -> int:
             if not owned_process("daily"):
                 stop("data")
         elif action == "DisableAgent":
+            for name in ("factor", "daily", "report"):
+                stop(name)
+            if not owned_process("dsh"):
+                stop("data")
+        elif action == "ClosePanel":
             for name in ("daily", "report"):
                 stop(name)
             if not owned_process("dsh"):

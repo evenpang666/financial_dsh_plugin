@@ -23,6 +23,25 @@ REPORT_DIR = PROJECT_ROOT / "data" / "reports"
 CHINA_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
+def with_backtest_section(markdown: str) -> str:
+    from report_web_server import latest_backtest
+
+    report = latest_backtest()
+    if not report.get("available"):
+        return markdown + "\n\n## AI 因子滚动回测\n\n尚无回测结果；请在控制面板点击“一键训练”或“一键回测”。"
+    stats = report["stats"]
+    rank_ic = report.get("oos_rank_ic", {}).get("rank_ic")
+    rank_ic_text = f"{rank_ic:.4f}" if isinstance(rank_ic, (int, float)) else "暂无"
+    return markdown + "\n\n" + "\n".join([
+        "## AI 因子滚动回测",
+        "",
+        f"生成时间：{report['generated_at']}；区间：{report.get('first_day', '未知')} 至 {report.get('last_day', '未知')}（{report.get('days', '未知')} 个交易日）。",
+        f"{report['slot']} 信号，{report.get('execution', '下一根5分钟K线')} 模拟成交；累计收益 {stats.get('total_return', 0):.2%}，最大回撤 {stats.get('max_drawdown', 0):.2%}，样本外 Rank IC {rank_ic_text}。",
+        f"模拟交易 {stats.get('trades', 0)} 笔，费用 {stats.get('costs', 0):,.2f} 元。",
+        "当前股票池按训练时点选取，存在历史选股与存续偏差；价格、滑点和费用均为模拟，仅供研究。",
+    ])
+
+
 def log(message: str):
     print(f"[{datetime.now(CHINA_TZ):%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
@@ -166,6 +185,8 @@ def run_once(config: dict, force: bool = False, session: str = "morning") -> boo
     markdown = str(report.get("markdown", "")).strip()
     if not markdown:
         raise RuntimeError("数据服务未返回简报正文。")
+    if selected_market == "a":
+        markdown = with_backtest_section(markdown)
     report_id = f"{today}-{selected_market}-{session}"
     report_path = archive_report(report_id, markdown)
     try:

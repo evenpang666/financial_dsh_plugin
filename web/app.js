@@ -7,6 +7,8 @@ const refreshButton = document.querySelector('#refreshButton')
 const requestedReport = new URLSearchParams(window.location.search).get('report') || ''
 const rankingMeta = document.querySelector('#rankingMeta')
 const rankingContent = document.querySelector('#rankingContent')
+const backtestMeta = document.querySelector('#backtestMeta')
+const backtestContent = document.querySelector('#backtestContent')
 const globalChart = document.querySelector('#globalChart')
 const sectorChart = document.querySelector('#sectorChart')
 const horizonContent = document.querySelector('#horizonContent')
@@ -207,12 +209,13 @@ async function loadRanking() {
   try {
     const payload = await requestJson('/api/ranking/latest')
     if (!payload.ranking?.length) {
-      rankingMeta.textContent = '尚未生成排名。请在控制面板依次点击“开启训练”“获得因子”“开始推荐”。'
+      rankingMeta.textContent = '尚未生成排名。请在控制面板依次点击“一键训练”“一键排序”。'
       rankingContent.replaceChildren()
       return
     }
     const quality = payload.model_quality === "exploratory" ? "探索性模拟 · 未正式验证" : "已验证"
-    rankingMeta.textContent = `生成于 ${new Date(payload.generated_at).toLocaleString('zh-CN')} · ${quality}模型 ${payload.model_id} · ${payload.candidate_count} 只有效候选`
+    const algorithm = payload.algorithm === 'xgboost' ? 'XGBoost' : 'Elastic Net'
+    rankingMeta.textContent = `生成于 ${new Date(payload.generated_at).toLocaleString('zh-CN')} · ${quality} ${algorithm} 模型 ${payload.model_id} · ${payload.candidate_count} 只有效候选`
     const description = document.createElement('p')
     description.className = 'ranking-note'
     description.textContent = payload.note || ''
@@ -241,6 +244,34 @@ async function loadRanking() {
   }
 }
 
+async function loadBacktest() {
+  try {
+    const payload = await requestJson('/api/backtest/latest')
+    backtestContent.replaceChildren()
+    if (!payload.available) {
+      backtestMeta.textContent = '暂无回测。请在控制面板点击“一键训练”或“一键回测”。'
+      return
+    }
+    const stats = payload.stats || {}
+    backtestMeta.textContent = `${payload.first_day} 至 ${payload.last_day} · ${payload.days} 个交易日 · ${payload.slot} 信号 / ${payload.execution} 模拟成交 · 更新于 ${new Date(payload.generated_at).toLocaleString('zh-CN')}`
+    const grid = document.createElement('div'); grid.className = 'backtest-grid'
+    const metrics = [
+      ['累计收益', stats.total_return == null ? '—' : `${(Number(stats.total_return) * 100).toFixed(2)}%`],
+      ['最大回撤', stats.max_drawdown == null ? '—' : `${(Number(stats.max_drawdown) * 100).toFixed(2)}%`],
+      ['样本外 Rank IC', payload.oos_rank_ic?.rank_ic ?? '—'],
+      ['模拟交易 / 费用', `${stats.trades ?? '—'} 笔 / ${stats.costs == null ? '—' : Number(stats.costs).toLocaleString('zh-CN')} 元`],
+    ]
+    for (const [label, value] of metrics) {
+      const card = document.createElement('div'); card.className = 'backtest-metric'
+      card.append(textNode('small', label), textNode('strong', value)); grid.append(card)
+    }
+    backtestContent.append(grid)
+    backtestContent.append(textNode('p', '当前股票池按本次训练时点选取，历史结果存在选股与存续偏差；成交价、滑点和费用为模拟，结果仅供研究。', 'ranking-note'))
+  } catch (error) {
+    backtestMeta.textContent = `回测暂不可读：${error.message}`
+  }
+}
+
 async function loadIndex(preferredId = '') {
   try {
     const index = await requestJson('/api/reports')
@@ -265,11 +296,13 @@ async function loadIndex(preferredId = '') {
 }
 
 reportDate.addEventListener('change', () => loadIndex(reportDate.value))
-refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRanking() })
+refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRanking(); loadBacktest() })
 loadIndex(requestedReport)
 loadRanking()
+loadBacktest()
 setInterval(() => loadIndex(reportDate.value), 30_000)
 setInterval(loadRanking, 30_000)
+setInterval(loadBacktest, 30_000)
 
 const reportEvents = new EventSource('/api/events')
 reportEvents.addEventListener('report', event => {

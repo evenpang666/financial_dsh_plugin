@@ -123,7 +123,7 @@ class ControlPanel(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("财务研究智能体")
-        self.geometry("760x790")
+        self.geometry("760x860")
         self.resizable(False, False)
         self.configure(bg=self.BG)
         self.option_add("*Font", ("Microsoft YaHei UI", 9))
@@ -148,6 +148,8 @@ class ControlPanel(tk.Tk):
         self.last_status_error = ""
         self.factor_process: subprocess.Popen | None = None
         self.factor_status = tk.StringVar(value="因子模型：未训练")
+        self.factor_schedule_status = tk.StringVar(value="每周训练：状态检测中")
+        self.factor_slot = tk.StringVar(value="14:00")
         self._build_styles()
         self._build()
         self.update_factor_status()
@@ -211,13 +213,26 @@ class ControlPanel(tk.Tk):
         factor_box.pack(fill="x", pady=(0, 14))
         factor_info = tk.Frame(factor_box, bg=self.PANEL)
         factor_info.pack(fill="x", padx=18, pady=(12, 4))
-        tk.Label(factor_info, text="盘中因子研究 · A 股", bg=self.PANEL, fg=self.TEXT, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+        tk.Label(factor_info, text="AI 因子研究 · A 股", bg=self.PANEL, fg=self.TEXT, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
         tk.Label(factor_info, textvariable=self.factor_status, bg=self.PANEL, fg=self.MUTED, anchor="w").pack(anchor="w", pady=(3, 0))
+        tk.Label(factor_info, textvariable=self.factor_schedule_status, bg=self.PANEL, fg="#7f95bd",
+                 anchor="w", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(2, 0))
+        tk.Label(factor_info, text="用法：每周自动训练；交易日选定时点后 5 分钟内点击“一键排序”；先看日报回测。",
+                 bg=self.PANEL, fg=self.MUTED, anchor="w", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(6, 0))
+        slot_row = tk.Frame(factor_box, bg=self.PANEL)
+        slot_row.pack(fill="x", padx=18, pady=(3, 8))
+        tk.Label(slot_row, text="回测信号时点", bg=self.PANEL, fg=self.MUTED).pack(side="left")
+        slot_box = ttk.Combobox(slot_row, textvariable=self.factor_slot, values=("09:35", "10:30", "11:30", "13:30", "14:00", "14:30", "14:50"),
+                                width=7, state="readonly")
+        slot_box.pack(side="left", padx=(8, 10))
+        slot_box.bind("<<ComboboxSelected>>", self.save_factor_slot)
+        tk.Label(slot_row, text="默认 14:00；下一根 5 分钟 K 线模拟成交。改动后请重新回测。",
+                 bg=self.PANEL, fg="#7f95bd", font=("Microsoft YaHei UI", 8)).pack(side="left")
         factor_buttons = tk.Frame(factor_box, bg=self.PANEL)
         factor_buttons.pack(fill="x", padx=13, pady=(0, 11))
-        self._button(factor_buttons, "开启训练", "Secondary.TButton", lambda: self.run_factor_action("train", "训练中")).pack(side="left", padx=5)
-        self._button(factor_buttons, "获得因子", "Secondary.TButton", lambda: self.run_factor_action("select", "选择因子中")).pack(side="left", padx=5)
-        self._button(factor_buttons, "开始推荐", "Primary.TButton", lambda: self.run_factor_action("rank", "获取排名中")).pack(side="left", padx=5)
+        self._button(factor_buttons, "一键训练", "Secondary.TButton", lambda: self.run_factor_action("train", "训练中")).pack(side="left", padx=5)
+        self._button(factor_buttons, "一键回测", "Secondary.TButton", lambda: self.run_factor_action("backtest", "回测中")).pack(side="left", padx=5)
+        self._button(factor_buttons, "一键排序", "Primary.TButton", lambda: self.run_factor_action("rank", "获取排名中")).pack(side="left", padx=5)
         tk.Label(factor_buttons, text="成功排名会即时显示在日报网页", bg=self.PANEL, fg="#7f95bd", font=("Microsoft YaHei UI", 8)).pack(side="right", padx=5)
         maintenance.pack(fill="x")
         info = tk.Frame(maintenance, bg=self.PANEL)
@@ -361,14 +376,14 @@ class ControlPanel(tk.Tk):
             self.factor_process.terminate()
         self.closing = True
         self.set_busy(True, "正在退出")
-        self.status_text.set("正在关闭 DSH Web 与日报智能体服务…")
-        self.append_log("控制台即将关闭，正在停止全部相关服务…")
+        self.status_text.set("正在关闭网页服务；每周训练继续运行…")
+        self.append_log("控制台即将关闭；每周 AI 因子训练计划继续运行。")
         self.withdraw()
 
         def worker():
             self.cancel_startup()
             errors = []
-            for action in ("DisableDshWeb", "DisableAgent"):
+            for action in ("DisableDshWeb", "ClosePanel"):
                 try:
                     self.after(0, lambda value=action: self.append_log(f"> {service_label(value)}"))
                     service_command(action, lambda line: self.after(0, lambda value=line: self.append_log(value)))
@@ -436,18 +451,27 @@ class ControlPanel(tk.Tk):
         try:
             factor_module = __import__("factor_lab")
             state = factor_module.status()
-            if state["model_id"] and state["trained_at"] and state["selected_at"] and state["trained_at"] > state["selected_at"]:
-                self.factor_status.set("新训练已完成 · 请点击“获得因子”发布；旧模型仍可查看")
-            elif state["model_id"]:
-                factors = "、".join(state["factors"])
+            self.factor_slot.set(state["backtest_slot"])
+            if state["model_id"]:
+                if state.get("algorithm") not in ("xgboost", "elastic_net") or state.get("target_version") != factor_module.ML_TARGET_VERSION:
+                    self.factor_status.set("旧版因子模型已停用 · 请点击一键训练")
+                    return
                 quality = "探索性模拟" if state.get("quality") == "exploratory" else "已验证"
-                self.factor_status.set(f"{quality}因子：{factors} · 最近排名：{state['latest_ranking_at'] or '暂无'}")
-            elif state["trained_at"]:
-                self.factor_status.set("训练已完成 · 点击“获得因子”评估并发布模型")
+                label = {"xgboost": "XGBoost", "elastic_net": "Elastic Net"}[state["algorithm"]]
+                self.factor_status.set(f"{quality}模型：{label} · 最近排名：{state['latest_ranking_at'] or '暂无'}")
             else:
-                self.factor_status.set("尚未训练 · 首次训练需下载近期5分钟历史行情")
+                self.factor_status.set("尚未训练 · 首次训练需回填历史5分钟行情")
         except Exception:
             self.factor_status.set("因子状态暂不可读")
+
+    def save_factor_slot(self, _event=None):
+        try:
+            factor_module = __import__("factor_lab")
+            current = factor_module.load_settings()
+            factor_module.save_settings(self.factor_slot.get(), current["weekly_training_enabled"])
+            self.append_log(f"✓ 回测信号时点已设为 {self.factor_slot.get()}；下次训练或回测生效。")
+        except Exception as error:
+            messagebox.showerror("设置失败", str(error))
 
     def run_factor_action(self, action: str, operation: str):
         if self.busy or self.closing:
@@ -476,23 +500,33 @@ class ControlPanel(tk.Tk):
         self.set_busy(False)
         self.update_factor_status()
         self.status_text.set(output.splitlines()[-1] if output else "操作完成。")
-        if action == "select":
+        if action == "train":
             factor_module = __import__("factor_lab")
-            evaluation = factor_module.read_json(factor_module.EVALUATION)
             model = factor_module.read_json(factor_module.MODEL)
-            selected = {item["key"] for item in model.get("factors", [])}
-            quality = "探索性模拟，非正式验证" if model.get("quality") == "exploratory" else "正式通过"
-            lines = [f"模型：{model.get('model_id', '未发布')} · {quality}", "因子按验证窗口 Rank IC 排序："]
-            for position, item in enumerate(evaluation.get("factors", []), 1):
-                marker = "✓" if item["key"] in selected else "·"
-                validation = item.get("validation_ic")
-                holdout = item.get("holdout_ic")
-                share = item.get("validation_positive_share")
-                lines.append(f"{position}. {marker} {item['name']}  训练IC={item.get('train_ic', '不足')}  验证IC={validation if validation is not None else '不足'}  正向占比={share if share is not None else '不足'}  留出IC={holdout if holdout is not None else '不足'}")
-            lines.append("✓ 表示已选；留出结果仅供观察。")
-            if model.get("selection_warning"):
-                lines.append(model["selection_warning"])
-            messagebox.showinfo("因子评估结果", "\n".join(lines))
+            algorithms = model.get("algorithms", {})
+            lines = [f"已发布 AI 模型 {model.get('model_id', '')}，当前使用 {model.get('algorithm', '未知')}"]
+            for name, metrics in algorithms.items():
+                lines.append(f"{name}: 验证 Rank IC={metrics['validation']['rank_ic']}；留出 Rank IC={metrics['holdout']['rank_ic']}")
+            backtest = model.get("backtest", {})
+            if backtest:
+                stats = backtest["stats"]
+                lines.append(f"{backtest.get('slot', '14:00')} 信号滚动回测 {backtest['days']} 日：收益 {stats['total_return']:.2%}；最大回撤 {stats['max_drawdown']:.2%}")
+                lines.append("固定的当前股票池存在历史选股偏差；详细交易见 backtests 目录。")
+            lines.append(f"历史交易日：{model.get('training', {}).get('days', '未知')}；仅供模拟研究。")
+            messagebox.showinfo("双模型训练结果", "\n".join(lines))
+        if action == "backtest":
+            factor_module = __import__("factor_lab")
+            reports = sorted(factor_module.BACKTESTS.glob("*/summary.json"))
+            if reports:
+                report = factor_module.read_json(reports[-1])
+                stats = report.get("stats", {})
+                messagebox.showinfo("滚动回测结果", "\n".join([
+                    f"回测 {report.get('days', '未知')} 个交易日 · {report.get('slot', '14:00')} 信号，{report.get('execution', '14:05')} 模拟成交",
+                    f"收益：{stats.get('total_return', 0):.2%} · 最大回撤：{stats.get('max_drawdown', 0):.2%}",
+                    f"交易：{stats.get('trades', 0)} 笔 · 费用：{stats.get('costs', 0):,.2f} 元",
+                    "固定的当前股票池存在历史选股偏差；本结果仅供研究。",
+                    f"净值与成交文件：{reports[-1].parent}",
+                ]))
         if action == "rank":
             self.append_log("✓ 最新因子排名已推送到日报网页。")
 
@@ -596,6 +630,9 @@ class ControlPanel(tk.Tk):
             return
         self.last_status_error = ""
         agent_on = payload.get("agent_task") in {"Ready", "Running"}
+        factor_on = payload.get("factor_task") in {"Ready", "Running"}
+        self.factor_schedule_status.set("每周训练：已启用 · 工作日 12:00 检查，本周成功后跳过" if factor_on
+                                        else "每周训练：未启用 · 重新启动控制面板后注册")
         values = {
             "日报任务": agent_on,
             "数据服务": bool(payload.get("data_service")),

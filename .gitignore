@@ -7,6 +7,7 @@ data/daily-push-state.json
 data/market-events.json
 data/reports/
 config/daily-push.json
+config/factor-lab.json
 data/report-snapshots/
 data/research-reflections.json
 data/dsh-web.stdout.log

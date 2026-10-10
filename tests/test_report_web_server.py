@@ -57,7 +57,9 @@ class ReportWebServerTests(unittest.TestCase):
     def test_latest_factor_ranking_is_independent_of_daily_reports(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(report_web, "RANKING_FILE", Path(directory) / "latest.json"):
             self.assertFalse(report_web.latest_ranking()["available"])
-            report_web.RANKING_FILE.write_text(json.dumps({"model_id": "m1", "ranking": [{"symbol": "600001"}]}))
+            report_web.RANKING_FILE.write_text(json.dumps({"model_id": "legacy", "ranking": [{"symbol": "600001"}]}))
+            self.assertFalse(report_web.latest_ranking()["available"])
+            report_web.RANKING_FILE.write_text(json.dumps({"model_id": "m1", "algorithm": "xgboost", "ranking": [{"symbol": "600001"}]}))
             self.assertEqual(report_web.latest_ranking()["model_id"], "m1")
             subscriber = queue.Queue()
             with report_web.SUBSCRIBERS_LOCK:
@@ -68,6 +70,16 @@ class ReportWebServerTests(unittest.TestCase):
             finally:
                 with report_web.SUBSCRIBERS_LOCK:
                     report_web.SUBSCRIBERS.discard(subscriber)
+
+    def test_latest_backtest_reads_newest_complete_summary(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(report_web, "BACKTEST_DIR", Path(directory)):
+            self.assertFalse(report_web.latest_backtest()["available"])
+            old = Path(directory) / "old"
+            new = Path(directory) / "new"
+            old.mkdir(); new.mkdir()
+            (old / "summary.json").write_text(json.dumps({"slot": "14:00", "stats": {"total_return": 0.1}}))
+            (new / "summary.json").write_text(json.dumps({"slot": "10:30", "stats": {"total_return": 0.2}}))
+            self.assertEqual(report_web.latest_backtest()["slot"], "10:30")
 
     def test_structured_report_view_excludes_portfolio_data(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -8,12 +9,24 @@ from urllib.error import URLError
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 spec = importlib.util.spec_from_file_location("daily_push", ROOT / "scripts" / "daily_push.py")
 daily_push = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(daily_push)
 
 
 class DailyPushTests(unittest.TestCase):
+    def test_backtest_summary_is_appended_to_a_share_report(self):
+        summary = {"available": True, "generated_at": "2026-10-11T10:00:00+08:00",
+                   "first_day": "2026-01-01", "last_day": "2026-10-10", "days": 100,
+                   "slot": "10:30", "execution": "10:35",
+                   "stats": {"total_return": 0.12, "max_drawdown": -0.08, "trades": 50, "costs": 1000},
+                   "oos_rank_ic": {"rank_ic": 0.04}}
+        with patch("report_web_server.latest_backtest", return_value=summary):
+            result = daily_push.with_backtest_section("# A股日报")
+        self.assertIn("10:30 信号，10:35 模拟成交", result)
+        self.assertIn("样本外 Rank IC 0.0400", result)
+
     def test_default_schedule_is_0920(self):
         with tempfile.TemporaryDirectory() as directory:
             config = daily_push.load_config(Path(directory) / "missing.json")
@@ -60,7 +73,9 @@ class DailyPushTests(unittest.TestCase):
              patch.object(daily_push, "open_report_page") as open_page, \
              patch.object(daily_push, "post_webhook") as post:
             self.assertTrue(daily_push.run_once(config, force=True))
-            post.assert_called_once_with("http://hook", "generic", "# report")
+            self.assertEqual(post.call_args.args[:2], ("http://hook", "generic"))
+            self.assertIn("# report", post.call_args.args[2])
+            self.assertIn("## AI 因子滚动回测", post.call_args.args[2])
             notify.assert_called_once()
             open_page.assert_called_once()
             self.assertTrue(any((Path(directory) / "reports").glob("*.md")))

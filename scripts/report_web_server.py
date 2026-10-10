@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WEB_ROOT = PROJECT_ROOT / "web"
 REPORT_DIR = PROJECT_ROOT / "data" / "reports"
 RANKING_FILE = PROJECT_ROOT / "data" / "factor-lab" / "latest-ranking.json"
+BACKTEST_DIR = PROJECT_ROOT / "data" / "factor-lab" / "backtests"
 SNAPSHOT_DIR = PROJECT_ROOT / "data" / "report-snapshots"
 HOST = os.getenv("FINANCE_REPORT_HOST", "0.0.0.0")
 PORT = int(os.getenv("FINANCE_REPORT_PORT", "8766"))
@@ -46,9 +47,28 @@ def publish_ranking_event():
 def latest_ranking():
     try:
         payload = json.loads(RANKING_FILE.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) and payload.get("ranking") else {"available": False}
+        return (payload if isinstance(payload, dict) and payload.get("ranking")
+                and payload.get("algorithm") in {"xgboost", "elastic_net"} else {"available": False})
     except (OSError, json.JSONDecodeError):
         return {"available": False}
+
+
+def latest_backtest():
+    try:
+        reports = sorted(BACKTEST_DIR.glob("*/summary.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return {"available": False}
+    for path in reports:
+        try:
+            summary = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(summary, dict) or "stats" not in summary or "slot" not in summary:
+                continue
+            return {"available": True, "model_id": path.parent.name,
+                    "generated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+                    **summary}
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {"available": False}
 
 
 def report_metadata(report_id: str) -> dict:
@@ -131,6 +151,8 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"reports": list_reports()})
             if path == "/api/ranking/latest":
                 return self.send_json(200, latest_ranking())
+            if path == "/api/backtest/latest":
+                return self.send_json(200, latest_backtest())
             if path == "/api/events":
                 return self.stream_events()
             if path == "/api/reports/latest":
