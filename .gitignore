@@ -8,6 +8,8 @@ data/market-events.json
 data/reports/
 config/daily-push.json
 config/factor-lab.json
+config/tushare.token
+*.token
 data/report-snapshots/
 data/research-reflections.json
 data/dsh-web.stdout.log

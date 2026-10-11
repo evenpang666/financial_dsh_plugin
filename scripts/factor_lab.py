@@ -4,20 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 import pandas as pd
 import requests
-from factor_models import NEXT_BAR
+from factor_models import EXECUTION_BAR, NEXT_BAR
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +29,9 @@ BACKTESTS = STORE / "backtests"
 MODEL = STORE / "model.json"
 LATEST = STORE / "latest-ranking.json"
 SETTINGS = ROOT / "config" / "factor-lab.json"
+UNIVERSE_HISTORY = STORE / "universe-history.csv"
+MARKET_STATE = STORE / "market-state.csv"
+SOURCE_MANIFEST = STORE / "source-manifest.json"
 CHINA = timezone(timedelta(hours=8))
 SLOTS = tuple(NEXT_BAR)
 FACTOR_NAMES = {
@@ -39,7 +43,7 @@ FACTOR_NAMES = {
 }
 MIN_STOCKS = 12
 UNIVERSE_SIZE = 40
-ML_TARGET_VERSION = 2
+ML_TARGET_VERSION = 3
 EM_MINUTE_UNAVAILABLE = threading.Event()
 SINA_MINUTE_UNAVAILABLE = threading.Event()
 SINA_REQUEST_GATE = threading.Lock()
@@ -66,6 +70,14 @@ def read_json(path: Path) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def load_settings() -> dict:
@@ -296,7 +308,8 @@ def backfill_baostock(universe: list[dict], start: datetime, end: datetime) -> d
     return {"filled": filled, "failures": failures}
 
 
-def history_samples(symbol: str, bars: pd.DataFrame) -> list[dict]:
+def history_samples(symbol: str, bars: pd.DataFrame,
+                    market_state: pd.DataFrame | None = None) -> list[dict]:
     if bars.empty:
         return []
     frame = bars.copy()
@@ -305,11 +318,21 @@ def history_samples(symbol: str, bars: pd.DataFrame) -> list[dict]:
     # Candidate features must not depend on whether this day *later* completes.
     observed_days = [(day, group.reset_index(drop=True)) for day, group in frame.groupby("day", sort=True)
                      if group.iloc[0]["clock"] <= "09:35"]
+    events = ({} if market_state is None else
+              {str(row.day): row for row in market_state[market_state.symbol.eq(symbol)].itertuples(index=False)})
+    first_event_day = min(events) if events else None
     samples = []
     for index, (day, group) in enumerate(observed_days):
         if index == 0:
             continue
         prev_close = valid_number(observed_days[index - 1][1].iloc[-1]["close"])
+        event = events.get(day)
+        if market_state is not None and event is None and first_event_day and day < first_event_day:
+            continue
+        if market_state is not None and event is None:
+            raise RuntimeError(f"{day} {symbol} 缺少逐日公司行为数据。")
+        if event is not None and prev_close:
+            prev_close = (prev_close - float(event.cash_dividend)) / float(event.split_ratio)
         opening = valid_number(group.iloc[0]["open"])
         if not prev_close or not opening:
             continue
@@ -325,19 +348,27 @@ def history_samples(symbol: str, bars: pd.DataFrame) -> list[dict]:
             factors = factor_values(price, opening, prev_close, high, low, vwap)
             if factors is None:
                 continue
-            # A signal is available only after the slot bar closes. Execution is
-            # the OPEN of the next bar, never the signal bar's close. The label
-            # exits at the same execution slot on the next complete stock day.
-            execution = group[group["clock"] == NEXT_BAR[slot]]
-            entry_price = valid_number(execution.iloc[0]["open"]) if not execution.empty else None
+            # The slot bar ends at the signal time. Allow a complete bar for
+            # snapshot publication and order entry, then execute over the
+            # following bar at its VWAP. The label exits in the same window
+            # on the next complete market session.
+            execution = group[group["clock"] == EXECUTION_BAR[slot]]
+            entry_price = (inferred_vwap(execution.iloc[0]["amount"], execution.iloc[0]["volume"],
+                                         execution.iloc[0]["close"]) if not execution.empty else None)
             exit_day, exit_price = None, None
             if index + 1 < len(observed_days):
                 exit_day, next_group = observed_days[index + 1]
-                exit_bars = next_group[next_group["clock"] == NEXT_BAR[slot]]
+                exit_bars = next_group[next_group["clock"] == EXECUTION_BAR[slot]]
                 if not exit_bars.empty:
-                    exit_price = valid_number(exit_bars.iloc[0]["open"])
+                    exit_price = inferred_vwap(exit_bars.iloc[0]["amount"], exit_bars.iloc[0]["volume"],
+                                               exit_bars.iloc[0]["close"])
+            if exit_day and market_state is not None and exit_day not in events:
+                raise RuntimeError(f"{exit_day} {symbol} 缺少逐日公司行为数据。")
+            exit_event = events.get(exit_day)
+            exit_value = (exit_price * float(exit_event.split_ratio) + float(exit_event.cash_dividend)
+                          if exit_price and exit_event is not None else exit_price)
             samples.append({"symbol": symbol, "day": day, "slot": slot,
-                            "target": (exit_price / entry_price - 1 if entry_price and exit_price else None),
+                            "target": (exit_value / entry_price - 1 if entry_price and exit_value else None),
                             "exit_day": exit_day, **factors})
     return samples
 
@@ -368,6 +399,8 @@ def inferred_vwap(amount, volume, reference) -> float | None:
 
 
 def train() -> dict:
+    if read_json(SOURCE_MANIFEST).get("validated"):
+        return train_pit_from_cache()
     log("[1/5] 获取 A 股行情并选择40只候选股票...")
     EM_MINUTE_UNAVAILABLE.clear()
     SINA_MINUTE_UNAVAILABLE.clear()
@@ -433,39 +466,37 @@ def train() -> dict:
 
 def publish_training(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame],
                      universe: list[dict], failed: list[str], method: str,
-                     spot_source: str, minute_source: str) -> dict:
+                     spot_source: str, minute_source: str,
+                     point_in_time: bool = False) -> dict:
     from factor_models import fit_models
 
     log(f"[4/5] 准备 {len(samples)} 条盘中样本，并仅使用已完成次日交易的收益标签...")
     if len(failed) >= len(universe) - MIN_STOCKS + 1:
         log(f"  {len(failed)}/{len(universe)} 只股票取数失败；首条失败：{failed[0]}")
-    universe_method = method + "；这是受限候选池，不代表全A股，也有存续偏差"
+    universe_method = (method + "；逐日全市场成交额历史名单"
+                       if point_in_time else
+                       method + "；这是受限候选池，不代表全A股，也有存续偏差")
     model_id = now_cn().strftime("%Y%m%d-%H%M%S")
     log("[5/5] 训练 XGBoost 排序模型与 Elastic Net，并按验证期 Rank IC 选择...")
     ml = fit_models(samples, MODELS / model_id)
-    from factor_backtest import run as run_backtest
     slot = load_settings()["backtest_slot"]
-    log(f"  按历史时间滚动训练/验证，并在后续日期模拟 {slot} 信号、{NEXT_BAR[slot]} 成交与 T+1 持仓...")
-    backtest = run_backtest(samples, bars_by_symbol, BACKTESTS / model_id, slot=slot)
-    log(f"  回测 {backtest['days']} 日：收益 {backtest['stats']['total_return']:.2%}；"
-        f"最大回撤 {backtest['stats']['max_drawdown']:.2%}；样本外 Rank IC={backtest['oos_rank_ic']['rank_ic']}")
+    log("  模型训练已完成；滚动回测需单独运行，其绩效不代表当前发布模型权重。")
     holdout_ics = [entry.get("holdout", {}).get("rank_ic") for entry in ml["algorithms"].values()]
     holdout_warning = (" 本次两种算法的留出期 Rank IC 均为负，尚无稳定样本外证据。"
                        if holdout_ics and all(value is not None and value <= 0 for value in holdout_ics) else "")
     validation_warning = (" 两种算法的验证期均未达到正向门槛，仅按较高 Rank IC 排序，不代表有效预测。"
                           if not ml.get("validation_eligible", True) else "")
     model = {"model_id": model_id, "selected_at": now_cn().isoformat(timespec="seconds"),
-             "market": "a", "target": "信号后下一根5分钟K线开盘买入至下一交易日相同时点开盘卖出的价格变化",
+             "market": "a", "target": "信号后预留一根完整5分钟K线，再按下一根K线VWAP买入至次日同一窗口VWAP卖出的价格变化",
              "universe_method": universe_method,
+             "universe_policy": ("previous_day_turnover_top40" if point_in_time else "runtime_snapshot"),
              "universe": universe, "quality": "exploratory", "algorithm": ml["algorithm"],
              "target_version": ML_TARGET_VERSION,
              "algorithms": ml["algorithms"], "features": ml["features"],
-             "backtest": {"path": str(BACKTESTS / model_id / "summary.json"), "slot": slot,
-                          "days": backtest["days"], "stats": backtest["stats"],
-                          "oos_rank_ic": backtest["oos_rank_ic"]},
+             "backtest": None, "backtest_slot": slot,
              "data_sources": {"spot": spot_source, "minute": minute_source},
              "failed_symbols": failed,
-             "selection_warning": "机器学习模型仅供模拟研究；候选池按训练当日快照选取，历史回看存在选股偏差。"
+             "selection_warning": "机器学习模型仅供模拟研究；滚动回测评估的是逐窗口训练规则，并非当前发布模型权重的独立绩效。"
                                   + validation_warning + holdout_warning,
              "training": {"days": ml["days"], "last_day": ml["last_day"],
                           "samples": ml["samples"], "holdout_days": ml["holdout_days"]}}
@@ -497,6 +528,110 @@ def cached_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], list[dict]]:
     return samples, bars_by_symbol, universe
 
 
+def _pit_symbol_inputs(symbol: str, path: Path, first_day: str, last_day: str,
+                       cutoff_day: str, state: pd.DataFrame) -> tuple[str, pd.DataFrame, list[dict]]:
+    bars = normalized_bars(pd.read_csv(path))
+    study = bars[(bars.time.dt.strftime("%Y-%m-%d") <= last_day)
+                 & (bars.time.dt.strftime("%Y-%m-%d") < cutoff_day)].copy()
+    warmup = study[study.time.dt.strftime("%Y-%m-%d") < first_day]
+    warmup_day = warmup.time.dt.strftime("%Y-%m-%d").max() if not warmup.empty else None
+    bars = study[(study.time.dt.strftime("%Y-%m-%d") >= first_day)
+                 | (study.time.dt.strftime("%Y-%m-%d") == warmup_day)].copy()
+    return symbol, bars, history_samples(symbol, bars, state)
+
+
+def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
+    from factor_backtest import validate_context
+
+    try:
+        universe_history = pd.read_csv(UNIVERSE_HISTORY, dtype={"symbol": str})
+        market_state = pd.read_csv(MARKET_STATE, dtype={"symbol": str})
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("缺少 universe-history.csv 或 market-state.csv；新版回测要求逐日时点数据。") from exc
+    universe_history, market_state = validate_context(universe_history, market_state)
+    manifest = read_json(SOURCE_MANIFEST)
+    if not manifest.get("validated") or manifest.get("source_scope") != "historical_vendor_reconstruction":
+        raise RuntimeError("缺少通过验收的数据来源清单；请先运行 factor_data_prep.py。")
+    for name, digest in manifest.get("files", {}).items():
+        if name not in ("universe-history.csv", "market-state.csv") or file_sha256(STORE / name) != digest:
+            raise RuntimeError(f"数据文件 {name} 与验收清单不一致。")
+    if set(manifest.get("files", {})) != {"universe-history.csv", "market-state.csv"}:
+        raise RuntimeError("数据来源清单缺少回测输入文件的校验值。")
+    symbols = set(universe_history.symbol)
+    if set(manifest.get("bars", {})) != symbols:
+        raise RuntimeError("数据来源清单未覆盖全部历史候选股分钟线。")
+    first_day, last_day = min(universe_history.day), max(universe_history.day)
+    samples, bars_by_symbol = [], {}
+    cutoff_day = now_cn().strftime("%Y-%m-%d")
+    for symbol in sorted(symbols):
+        path = BARS / f"{symbol}.csv"
+        if not path.exists() or file_sha256(path) != manifest["bars"][symbol]:
+            raise RuntimeError(f"历史股票池 {symbol} 的分钟线与验收清单不一致。")
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_pit_symbol_inputs, symbol, BARS / f"{symbol}.csv",
+                                   first_day, last_day, cutoff_day,
+                                   market_state[market_state.symbol.eq(symbol)])
+                   for symbol in sorted(symbols)]
+        for index, future in enumerate(as_completed(futures), 1):
+            symbol, bars, stock_samples = future.result()
+            bars_by_symbol[symbol] = bars
+            samples.extend(stock_samples)
+            if index % 40 == 0 or index == len(symbols):
+                log(f"  已载入 {index}/{len(symbols)} 只历史股票的分钟线与时点样本")
+    return samples, bars_by_symbol, universe_history, market_state
+
+
+def train_pit_from_cache() -> dict:
+    """Fit a live model from the same changing historical pool as the replay."""
+    samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
+    provenance = read_json(SOURCE_MANIFEST)
+    eligible = universe_history.merge(market_state[["day", "symbol", "is_st", "is_suspended"]],
+                                      on=["day", "symbol"], how="left")
+    eligible = eligible[~eligible.is_st & ~eligible.is_suspended][["day", "symbol"]]
+    filtered = pd.DataFrame(samples).merge(eligible, on=["day", "symbol"], how="inner")
+    final_day = max(universe_history.day)
+    today = universe_history[universe_history.day.eq(final_day)]
+    current = [{"symbol": symbol} for symbol in today.symbol]
+    return publish_training(filtered.to_dict("records"), bars_by_symbol, current, [],
+                            "前一交易日全市场成交额前40只",
+                            provenance.get("daily_source", "逐日历史股票池"),
+                            provenance.get("minute_source", "未复权5分钟线"),
+                            point_in_time=True)
+
+
+def today_pit_universe(moment: datetime) -> set[str]:
+    """Use yesterday's daily turnover and today's known risk-warning status."""
+    day = moment.strftime("%Y-%m-%d")
+    manifest = read_json(SOURCE_MANIFEST)
+    trusted_cache = (manifest.get("validated") is True and
+                     set(manifest.get("files", {})) == {"universe-history.csv", "market-state.csv"} and
+                     UNIVERSE_HISTORY.exists() and MARKET_STATE.exists() and
+                     all(file_sha256(STORE / name) == digest
+                         for name, digest in manifest["files"].items()))
+    if trusted_cache:
+        universe = pd.read_csv(UNIVERSE_HISTORY, dtype={"symbol": str})
+        state = pd.read_csv(MARKET_STATE, dtype={"symbol": str})
+        rows = universe[universe.day.eq(day)].merge(state, on=["day", "symbol"], how="left")
+        if len(rows) == UNIVERSE_SIZE and rows.is_st.notna().all() and rows.is_suspended.notna().all():
+            st = rows.is_st.astype(str).str.lower().isin({"true", "1", "yes"})
+            halted = rows.is_suspended.astype(str).str.lower().isin({"true", "1", "yes"})
+            return set(rows.loc[~st & ~halted, "symbol"])
+    from factor_data_prep import RAW, _daily_from_cache, collect_daily, construct_universe, fetch_calendar_baostock
+
+    compact = day.replace("-", "")
+    calendar = fetch_calendar_baostock(day, day)
+    today_row = calendar[calendar.cal_date.astype(str).eq(compact)]
+    if len(today_row) != 1 or str(today_row.iloc[0].is_open) != "1":
+        raise RuntimeError("交易日历未确认今天可交易。")
+    previous = str(today_row.iloc[0].pretrade_date)
+    previous_date = pd.Timestamp(previous).strftime("%Y-%m-%d")
+    _, category, source = collect_daily(previous_date, previous_date, RAW)
+    log(f"  今日历史股票池来源：{source}")
+    daily = _daily_from_cache([previous], RAW, category=category)
+    universe = construct_universe(daily, calendar, day, day)
+    return set(universe.symbol)
+
+
 def train_from_cache() -> dict:
     """Retrain a previously snapshotted candidate pool without network calls."""
     samples, bars_by_symbol, universe = cached_inputs()
@@ -508,10 +643,12 @@ def backtest_from_cache() -> dict:
     """Re-run the research backtest without downloading or publishing a model."""
     from factor_backtest import run as run_backtest
 
-    samples, bars_by_symbol, _ = cached_inputs()
+    samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
     identifier = now_cn().strftime("%Y%m%d-%H%M%S")
     summary = run_backtest(samples, bars_by_symbol, BACKTESTS / identifier,
-                           slot=load_settings()["backtest_slot"])
+                           slot=load_settings()["backtest_slot"],
+                           universe_history=universe_history, market_state=market_state,
+                           source_manifest=read_json(SOURCE_MANIFEST))
     log(f"回测完成：{summary['days']} 日；收益 {summary['stats']['total_return']:.2%}；"
         f"最大回撤 {summary['stats']['max_drawdown']:.2%}；详情：{BACKTESTS / identifier}")
     return summary
@@ -554,8 +691,16 @@ def rank() -> dict:
     fetched = now_cn()
     if fetched.date() != started.date() or not is_trading_time(fetched):
         raise RuntimeError("行情获取跨过交易时段，请重新点击推荐。")
-    allowed = {item["symbol"] for item in model["universe"]}
+    allowed = (today_pit_universe(fetched) if model.get("universe_policy") == "previous_day_turnover_top40"
+               else {item["symbol"] for item in model["universe"]})
+    if not is_trading_time(now_cn()):
+        raise RuntimeError("获取当日股票池时跨过交易时段，请重新点击推荐。")
     frame = frame[frame["代码"].astype(str).isin(allowed)].copy()
+    if model.get("universe_policy") == "previous_day_turnover_top40":
+        frame = frame[~frame["名称"].astype(str).str.contains(r"\*?ST|退", regex=True, case=False)]
+        for column in ("成交量", "成交额"):
+            if column in frame.columns:
+                frame = frame[pd.to_numeric(frame[column], errors="coerce").gt(0)]
     records = []
     for _, row in frame.iterrows():
         factors = live_factors(row)
@@ -568,9 +713,7 @@ def rank() -> dict:
     log(f"[2/3] 在 {len(data)} 只有效候选中用模型 {model['model_id']} 排序...")
     from factor_models import minute_of_day, predict
     backtest_slot = load_settings()["backtest_slot"]
-    minutes_after_slot = minute_of_day(fetched.strftime("%H:%M")) - minute_of_day(backtest_slot)
-    comparable_slot = 0 <= minutes_after_slot < 5
-    data["minute_of_day"] = minute_of_day(backtest_slot if comparable_slot else fetched.strftime("%H:%M"))
+    data["minute_of_day"] = minute_of_day(fetched.strftime("%H:%M"))
     data["score"] = predict(data, model, MODELS / model["model_id"])
     data = data.sort_values("score", ascending=False)
     ranking = []
@@ -578,16 +721,16 @@ def rank() -> dict:
         ranking.append({"rank": position, "symbol": row["symbol"], "name": row["name"],
                         "price": round(float(row["price"]), 3), "score": round(float(row["score"]), 4),
                         "factors": {key: round(float(row[key]), 5) for key in model["features"]}})
-    slot_warning = (" 本次排名时点与所选回测时点不同，不适用该回测结果。"
-                    if not comparable_slot else "")
+    slot_warning = " 实时快照缺少逐股报价时间戳，无法证明与所选5分钟K线收盘时点一致；本次排名不与回测直接对应。"
     payload = {"id": fetched.strftime("%Y%m%d-%H%M%S-%f"), "market": "a", "generated_at": fetched.isoformat(timespec="seconds"),
                "model_id": model["model_id"], "model_quality": model.get("quality", "validated"),
                "algorithm": model["algorithm"], "backtest_slot": backtest_slot,
+               "backtest_comparable": False,
                "candidate_count": len(data), "ranking": ranking,
                "factors": [{"key": key, "name": "盘中时点" if key == "minute_of_day" else FACTOR_NAMES.get(key, key)}
                            for key in model["features"]],
                "universe_method": model["universe_method"],
-               "note": ("预测目标为信号后下一根5分钟K线至下一交易日同一时点；AKShare全市场快照未提供逐股行情时间戳，无法验证逐股延迟。排名是研究结果，不是收益概率或买入指令。"
+               "note": ("预测目标为预留一根完整5分钟K线后下一根K线VWAP至次日同一窗口VWAP；排名是研究结果，不是收益概率或买入指令。"
                         + model.get("selection_warning", "") + slot_warning)}
     write_json(STORE / "rankings" / f"{payload['id']}.json", payload)
     write_json(LATEST, payload)

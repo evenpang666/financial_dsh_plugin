@@ -78,7 +78,10 @@ class ReportWebServerTests(unittest.TestCase):
             new = Path(directory) / "new"
             old.mkdir(); new.mkdir()
             (old / "summary.json").write_text(json.dumps({"slot": "14:00", "stats": {"total_return": 0.1}}))
-            (new / "summary.json").write_text(json.dumps({"slot": "10:30", "stats": {"total_return": 0.2}}))
+            self.assertFalse(report_web.latest_backtest()["available"])
+            (new / "summary.json").write_text(json.dumps({"schema_version": 2,
+                                                           "kind": "point_in_time_backtest",
+                                                           "slot": "10:30", "stats": {"total_return": 0.2}}))
             self.assertEqual(report_web.latest_backtest()["slot"], "10:30")
 
     def test_structured_report_view_excludes_portfolio_data(self):

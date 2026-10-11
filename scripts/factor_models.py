@@ -11,6 +11,10 @@ import pandas as pd
 FEATURES = ("open_momentum", "gap", "range_position", "range_width", "vwap_gap", "minute_of_day")
 NEXT_BAR = {"09:35": "09:40", "10:30": "10:35", "11:30": "13:05",
             "13:30": "13:35", "14:00": "14:05", "14:30": "14:35", "14:50": "14:55"}
+# Bars are stamped at their END. Leave one complete bar for a live snapshot
+# and order submission; the execution bar is then worked over its interval.
+EXECUTION_BAR = {"09:35": "09:45", "10:30": "10:40", "11:30": "13:10",
+                 "13:30": "13:40", "14:00": "14:10", "14:30": "14:40", "14:50": "15:00"}
 MIN_ML_DAYS = 60
 
 
@@ -94,27 +98,27 @@ def score_estimator(estimators: dict, algorithm: str, frame: pd.DataFrame) -> np
     return estimators[algorithm].predict(frame[list(FEATURES)])
 
 
-def fit_models(samples: list[dict], destination: Path) -> dict:
-    frame = sample_frame(samples)
+def select_algorithm(frame: pd.DataFrame) -> tuple[str, dict, bool, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Use one chronological selection policy for deployment and replay."""
     train, validation, holdout = day_splits(frame)
     if "exit_day" in frame.columns:
-        # Adjacent-day labels at a boundary mature only after the first day
-        # of the next partition; they cannot inform selection at that boundary.
         train = train[train.exit_day.lt(str(validation.day.min()))].copy()
         validation = validation[validation.exit_day.lt(str(holdout.day.min()))].copy()
-    features = list(FEATURES)
     estimators = fit_estimators(train)
-    linear_validation = rank_ic(validation, score_estimator(estimators, "elastic_net", validation))
-    linear_holdout = rank_ic(holdout, score_estimator(estimators, "elastic_net", holdout))
-    xgb_validation = rank_ic(validation, score_estimator(estimators, "xgboost", validation))
-    xgb_holdout = rank_ic(holdout, score_estimator(estimators, "xgboost", holdout))
-
-    results = {"elastic_net": {"validation": linear_validation, "holdout": linear_holdout},
-               "xgboost": {"validation": xgb_validation, "holdout": xgb_holdout}}
+    results = {name: {"validation": rank_ic(validation, score_estimator(estimators, name, validation)),
+                      "holdout": rank_ic(holdout, score_estimator(estimators, name, holdout))}
+               for name in ("elastic_net", "xgboost")}
     eligible = [(name, result) for name, result in results.items()
                 if result["validation"]["rank_ic"] > 0 and result["validation"]["positive_share"] >= 0.5]
     pool = eligible or list(results.items())
     chosen = max(pool, key=lambda item: item[1]["validation"]["rank_ic"])[0]
+    return chosen, results, bool(eligible), train, validation, holdout
+
+
+def fit_models(samples: list[dict], destination: Path) -> dict:
+    frame = sample_frame(samples)
+    chosen, results, eligible, train, validation, holdout = select_algorithm(frame)
+    features = list(FEATURES)
 
     # Historical scores above stay untouched. The deployed model may now use
     # all labels that have matured before the present training run.
@@ -127,7 +131,7 @@ def fit_models(samples: list[dict], destination: Path) -> dict:
                     "intercept": float(linear.intercept_), "mean": scaler.mean_.tolist(),
                     "scale": scaler.scale_.tolist()}
     (destination / "elastic_net.json").write_text(json.dumps(linear_state, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"algorithm": chosen, "validation_eligible": bool(eligible),
+    return {"algorithm": chosen, "validation_eligible": eligible,
             "algorithms": results, "features": features,
             "days": int(frame.day.nunique()), "samples": len(frame),
             "train_days": int(train.day.nunique()), "validation_days": int(validation.day.nunique()),

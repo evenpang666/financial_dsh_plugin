@@ -217,7 +217,7 @@ class ControlPanel(tk.Tk):
         tk.Label(factor_info, textvariable=self.factor_status, bg=self.PANEL, fg=self.MUTED, anchor="w").pack(anchor="w", pady=(3, 0))
         tk.Label(factor_info, textvariable=self.factor_schedule_status, bg=self.PANEL, fg="#7f95bd",
                  anchor="w", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(2, 0))
-        tk.Label(factor_info, text="用法：每周自动训练；交易日选定时点后 5 分钟内点击“一键排序”；先看日报回测。",
+        tk.Label(factor_info, text="用法：每周自动训练；交易日选定时点后 5 分钟内点击“一键排序”；回测需逐日历史数据。",
                  bg=self.PANEL, fg=self.MUTED, anchor="w", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(6, 0))
         slot_row = tk.Frame(factor_box, bg=self.PANEL)
         slot_row.pack(fill="x", padx=18, pady=(3, 8))
@@ -226,7 +226,7 @@ class ControlPanel(tk.Tk):
                                 width=7, state="readonly")
         slot_box.pack(side="left", padx=(8, 10))
         slot_box.bind("<<ComboboxSelected>>", self.save_factor_slot)
-        tk.Label(slot_row, text="默认 14:00；下一根 5 分钟 K 线模拟成交。改动后请重新回测。",
+        tk.Label(slot_row, text="默认 14:00；预留一根完整 K 线后，于后一根按 VWAP 模拟成交。",
                  bg=self.PANEL, fg="#7f95bd", font=("Microsoft YaHei UI", 8)).pack(side="left")
         factor_buttons = tk.Frame(factor_box, bg=self.PANEL)
         factor_buttons.pack(fill="x", padx=13, pady=(0, 11))
@@ -511,20 +511,22 @@ class ControlPanel(tk.Tk):
             if backtest:
                 stats = backtest["stats"]
                 lines.append(f"{backtest.get('slot', '14:00')} 信号滚动回测 {backtest['days']} 日：收益 {stats['total_return']:.2%}；最大回撤 {stats['max_drawdown']:.2%}")
-                lines.append("固定的当前股票池存在历史选股偏差；详细交易见 backtests 目录。")
+                lines.append("详细交易见 backtests 目录；旧版回测结果不再作为有效绩效展示。")
             lines.append(f"历史交易日：{model.get('training', {}).get('days', '未知')}；仅供模拟研究。")
             messagebox.showinfo("双模型训练结果", "\n".join(lines))
         if action == "backtest":
             factor_module = __import__("factor_lab")
             reports = sorted(factor_module.BACKTESTS.glob("*/summary.json"))
+            reports = [path for path in reports
+                       if factor_module.read_json(path).get("schema_version") == 2]
             if reports:
                 report = factor_module.read_json(reports[-1])
                 stats = report.get("stats", {})
                 messagebox.showinfo("滚动回测结果", "\n".join([
-                    f"回测 {report.get('days', '未知')} 个交易日 · {report.get('slot', '14:00')} 信号，{report.get('execution', '14:05')} 模拟成交",
+                    f"回测 {report.get('days', '未知')} 个交易日 · {report.get('slot', '14:00')} 信号，{report.get('execution', '延后VWAP')} 模拟成交",
                     f"收益：{stats.get('total_return', 0):.2%} · 最大回撤：{stats.get('max_drawdown', 0):.2%}",
-                    f"交易：{stats.get('trades', 0)} 笔 · 费用：{stats.get('costs', 0):,.2f} 元",
-                    "固定的当前股票池存在历史选股偏差；本结果仅供研究。",
+                    f"交易：{stats.get('trades', 0)} 笔 · 显式费用：{stats.get('costs', 0):,.2f} 元 · 估计滑点：{stats.get('slippage_costs', 0):,.2f} 元",
+                    "已使用逐日历史股票池和交易状态；成交仍是5分钟数据模拟，仅供研究。",
                     f"净值与成交文件：{reports[-1].parent}",
                 ]))
         if action == "rank":

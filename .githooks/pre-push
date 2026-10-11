@@ -1,0 +1,11 @@
+#!/bin/sh
+# Check the whole pushed history, including a token added then removed later.
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in
+        0000000000000000000000000000000000000000) continue ;;
+    esac
+    if git log --format= --name-only "$local_sha" | grep -Eiq '(^|/)[^/]+\.token$'; then
+        echo "Push blocked: reachable history contains a .token file. Remove it from history before pushing." >&2
+        exit 1
+    fi
+done

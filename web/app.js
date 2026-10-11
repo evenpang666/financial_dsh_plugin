@@ -249,7 +249,7 @@ async function loadBacktest() {
     const payload = await requestJson('/api/backtest/latest')
     backtestContent.replaceChildren()
     if (!payload.available) {
-      backtestMeta.textContent = '暂无回测。请在控制面板点击“一键训练”或“一键回测”。'
+      backtestMeta.textContent = '暂无符合新版逐日历史股票池与交易状态要求的回测。'
       return
     }
     const stats = payload.stats || {}
@@ -259,14 +259,14 @@ async function loadBacktest() {
       ['累计收益', stats.total_return == null ? '—' : `${(Number(stats.total_return) * 100).toFixed(2)}%`],
       ['最大回撤', stats.max_drawdown == null ? '—' : `${(Number(stats.max_drawdown) * 100).toFixed(2)}%`],
       ['样本外 Rank IC', payload.oos_rank_ic?.rank_ic ?? '—'],
-      ['模拟交易 / 费用', `${stats.trades ?? '—'} 笔 / ${stats.costs == null ? '—' : Number(stats.costs).toLocaleString('zh-CN')} 元`],
+      ['模拟交易 / 显式费用 / 估计滑点', `${stats.trades ?? '—'} 笔 / ${stats.costs == null ? '—' : Number(stats.costs).toLocaleString('zh-CN')} 元 / ${stats.slippage_costs == null ? '—' : Number(stats.slippage_costs).toLocaleString('zh-CN')} 元`],
     ]
     for (const [label, value] of metrics) {
       const card = document.createElement('div'); card.className = 'backtest-metric'
       card.append(textNode('small', label), textNode('strong', value)); grid.append(card)
     }
     backtestContent.append(grid)
-    backtestContent.append(textNode('p', '当前股票池按本次训练时点选取，历史结果存在选股与存续偏差；成交价、滑点和费用为模拟，结果仅供研究。', 'ranking-note'))
+    backtestContent.append(textNode('p', '股票池使用交易日前已知的逐日名单；VWAP、成交参与率和滑点仍为模拟假设，结果仅供研究。', 'ranking-note'))
   } catch (error) {
     backtestMeta.textContent = `回测暂不可读：${error.message}`
   }

@@ -61,7 +61,9 @@ def latest_backtest():
     for path in reports:
         try:
             summary = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(summary, dict) or "stats" not in summary or "slot" not in summary:
+            if (not isinstance(summary, dict) or summary.get("schema_version") != 2
+                    or summary.get("kind") != "point_in_time_backtest"
+                    or "stats" not in summary or "slot" not in summary):
                 continue
             return {"available": True, "model_id": path.parent.name,
                     "generated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
