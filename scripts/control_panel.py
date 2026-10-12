@@ -12,7 +12,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -173,33 +175,58 @@ def detect_lan_ip() -> str | None:
     return None
 
 
-def stream_command(args: list[str], on_output=None, on_process=None) -> str:
+def stream_command(args: list[str], on_output=None, on_process=None, *, timeout: float | None = None) -> str:
     environment = os.environ.copy()
     environment["PYTHONIOENCODING"] = "utf-8"
-    process = subprocess.Popen(
-        args,
-        cwd=PROJECT_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=environment,
-        bufsize=1,
-        creationflags=WINDOWS_CREATION_FLAGS if sys.platform == "win32" else 0,
-    )
-    if on_process:
-        on_process(process)
+    environment["PYTHONUNBUFFERED"] = "1"
+    # A background service can inherit the launcher's stdout on Windows. A pipe
+    # then never reaches EOF, even after the launcher exits. Follow a file and
+    # the launcher's lifetime instead, so descendants cannot hold up the UI.
+    output_file = tempfile.NamedTemporaryFile(mode="w+b", delete=False)
+    process = None
     try:
+        process = subprocess.Popen(
+            args,
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=output_file,
+            stderr=subprocess.STDOUT,
+            env=environment,
+            creationflags=WINDOWS_CREATION_FLAGS if sys.platform == "win32" else 0,
+        )
+        if on_process:
+            on_process(process)
+        started = time.monotonic()
         lines = []
-        if process.stdout:
-            for raw_line in process.stdout:
-                line = ANSI_ESCAPE.sub("", raw_line.rstrip())
+        pending = b""
+
+        def collect(source, final=False):
+            nonlocal pending
+            pending += source.read()
+            parts = pending.split(b"\n")
+            pending = parts.pop()
+            if final and pending:
+                parts.append(pending)
+                pending = b""
+            for raw_line in parts:
+                line = ANSI_ESCAPE.sub("", raw_line.decode("utf-8", errors="replace").rstrip())
                 if not line:
                     continue
                 lines.append(line)
                 if on_output:
                     on_output(line)
+
+        with open(output_file.name, "rb") as source:
+            while process.poll() is None:
+                collect(source)
+                if timeout is not None and time.monotonic() - started >= timeout:
+                    process.kill()
+                    process.wait(timeout=5)
+                    collect(source, final=True)
+                    detail = "\n".join(lines[-40:])
+                    raise RuntimeError(f"操作超时（{timeout:g} 秒），已结束当前命令。" + (f"\n{detail}" if detail else ""))
+                time.sleep(0.05)
+            collect(source, final=True)
         return_code = process.wait()
         output = "\n".join(lines).strip()
         if return_code:
@@ -207,8 +234,15 @@ def stream_command(args: list[str], on_output=None, on_process=None) -> str:
             raise RuntimeError(detail or f"操作失败（退出码 {return_code}）。")
         return output
     finally:
-        if process.stdout:
-            process.stdout.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        output_file.close()
+        try:
+            os.unlink(output_file.name)
+        except OSError:
+            # An unexpected descendant may still hold the log handle on Windows.
+            pass
         if on_process:
             on_process(None)
 
@@ -220,7 +254,9 @@ def service_command(action: str, on_output=None, on_process=None) -> str:
         args = ["bash", str(LINUX_UPDATE_SCRIPT)]
     else:
         args = [str(VENV_PYTHON), str(LINUX_SERVICE_SCRIPT), action]
-    return stream_command(args, on_output, on_process)
+    timeout = {"Status": 20, "EnableAgent": 90, "EnableDshWeb": 60,
+               "DisableAgent": 60, "DisableDshWeb": 60, "ClosePanel": 60}.get(action)
+    return stream_command(args, on_output, on_process, timeout=timeout)
 
 
 def service_label(action: str) -> str:
@@ -320,6 +356,7 @@ class ControlPanel(tk.Tk):
         self.factor_busy = False
         self.report_busy = False
         self.status_checking = False
+        self.operation_revision = 0
         self.starting_services = False
         self.startup_thread: threading.Thread | None = None
         self.startup_process: subprocess.Popen | None = None
@@ -616,6 +653,7 @@ class ControlPanel(tk.Tk):
             self.restart_through_launcher()
 
     def set_busy(self, busy: bool, operation: str = "空闲"):
+        self.operation_revision = getattr(self, "operation_revision", 0) + 1
         self.busy = busy
         if not busy:
             self.factor_busy = False
@@ -624,10 +662,10 @@ class ControlPanel(tk.Tk):
         self._update_controls()
 
     def _update_controls(self):
-        disabled = self.busy or self.status_checking or self.starting_services or self.closing
+        disabled = self.busy or self.starting_services or self.closing
         for button in (*self.action_buttons, *self.utility_buttons):
             button.configure(state="disabled" if disabled else "normal")
-        web_disabled = (self.status_checking or self.starting_services or self.closing
+        web_disabled = (self.starting_services or self.closing
                         or (self.busy and not (self.factor_busy or getattr(self, "report_busy", False))))
         for button in self.web_buttons:
             button.configure(state="disabled" if web_disabled else "normal")
@@ -649,6 +687,7 @@ class ControlPanel(tk.Tk):
             self.operation_text.set("等待安装")
             return
         self.starting_services = True
+        self.operation_revision = getattr(self, "operation_revision", 0) + 1
         self._update_controls()
         self.startup_cancelled = False
         self.operation_text.set("后台启动中")
@@ -672,8 +711,11 @@ class ControlPanel(tk.Tk):
                 if not self.closing and not self.startup_cancelled:
                     self.after(0, lambda detail=str(exc): self.startup_failed(detail))
 
-        self.startup_thread = threading.Thread(target=worker, daemon=True)
-        self.startup_thread.start()
+        try:
+            self.startup_thread = threading.Thread(target=worker, daemon=True)
+            self.startup_thread.start()
+        except Exception as exc:
+            self.startup_failed(str(exc))
 
     def track_startup_process(self, process: subprocess.Popen | None):
         with self.startup_process_lock:
@@ -864,7 +906,7 @@ class ControlPanel(tk.Tk):
             messagebox.showerror("设置失败", str(error))
 
     def run_manual_report(self):
-        if self.busy or self.closing or self.status_checking or self.starting_services:
+        if self.busy or self.closing or self.starting_services:
             return
         self.report_busy = True
         self.set_busy(True, "生成日报中")
@@ -1053,10 +1095,10 @@ class ControlPanel(tk.Tk):
         self.refresh_status()
 
     def refresh_status(self, verbose: bool = True):
-        if self.busy or self.closing or self.status_checking:
+        if self.busy or self.closing or self.status_checking or self.starting_services:
             return
         self.status_checking = True
-        self._update_controls()
+        revision = getattr(self, "operation_revision", 0)
         if verbose:
             self.append_log("检测中：日报调度、服务端口、Node.js、Python、Git、虚拟环境与 DSH 插件…")
 
@@ -1064,18 +1106,23 @@ class ControlPanel(tk.Tk):
             try:
                 output = service_command("Status", (lambda line: self.after(0, lambda value=line: self.append_log(value)) if not line.lstrip().startswith("{") else None) if verbose else None)
                 payload = json.loads(output.splitlines()[-1])
-                self.after(0, lambda: self._finish_status(payload=payload, verbose=verbose))
+                self.after(0, lambda: self._finish_status(payload=payload, verbose=verbose, revision=revision))
             except Exception as exc:
-                self.after(0, lambda detail=str(exc): self._finish_status(detail=detail))
+                self.after(0, lambda detail=str(exc): self._finish_status(detail=detail, revision=revision))
 
         try:
             threading.Thread(target=worker, daemon=True).start()
         except Exception as exc:
-            self._finish_status(detail=str(exc))
+            self._finish_status(detail=str(exc), revision=revision)
 
     def _finish_status(self, payload: dict | None = None, detail: str | None = None,
-                       verbose: bool = False):
+                       verbose: bool = False, revision: int | None = None):
         try:
+            # A read-only check must neither block actions nor overwrite their
+            # progress/results if the user started an operation while it ran.
+            if (self.busy or self.starting_services or self.closing
+                    or (revision is not None and revision != getattr(self, "operation_revision", 0))):
+                return
             if detail is None:
                 self.show_status(payload or {}, verbose)
             else:

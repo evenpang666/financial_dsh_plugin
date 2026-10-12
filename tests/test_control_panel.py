@@ -1,8 +1,10 @@
 import importlib.util
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -28,6 +30,85 @@ class StreamCommandTests(unittest.TestCase):
                 )
         self.assertEqual(received, [message])
         self.assertEqual(str(caught.exception), message)
+
+    def test_launcher_completion_does_not_wait_for_inherited_stdout(self):
+        # The service keeps the same output handle open after its launcher exits.
+        command = (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(4)'], "
+            "stdout=sys.stdout, stderr=sys.stderr); "
+            "print('launcher finished', flush=True)"
+        )
+        tracked = []
+        started = time.monotonic()
+        output = control_panel.stream_command(
+            [sys.executable, "-c", command], on_process=tracked.append, timeout=3,
+        )
+        self.assertEqual(output, "launcher finished")
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(tracked[0].returncode, 0)
+        self.assertIsNone(tracked[-1])
+
+    def test_timeout_ends_launcher_and_keeps_last_progress(self):
+        tracked = []
+        received = []
+        with self.assertRaisesRegex(RuntimeError, "操作超时") as caught:
+            control_panel.stream_command(
+                [sys.executable, "-c", "import time; print('正在启动数据服务', flush=True); time.sleep(30)"],
+                received.append, tracked.append, timeout=0.5,
+            )
+        self.assertIn("正在启动数据服务", str(caught.exception))
+        self.assertEqual(received, ["正在启动数据服务"])
+        self.assertIsNotNone(tracked[0].poll())
+        self.assertIsNone(tracked[-1])
+
+    def test_split_utf8_and_final_line_without_newline(self):
+        command = (
+            "import sys, time; value='启动完成'.encode('utf-8'); "
+            "sys.stdout.buffer.write(value[:2]); sys.stdout.buffer.flush(); time.sleep(0.1); "
+            "sys.stdout.buffer.write(value[2:]); sys.stdout.buffer.flush()"
+        )
+        received = []
+        output = control_panel.stream_command([sys.executable, "-c", command], received.append)
+        self.assertEqual(output, "启动完成")
+        self.assertEqual(received, ["启动完成"])
+
+    def test_service_commands_bound_startup_and_status_but_allow_long_install(self):
+        for action, timeout in (("Status", 20), ("EnableAgent", 90), ("EnableDshWeb", 60), ("Install", None)):
+            with self.subTest(action=action), patch.object(control_panel, "stream_command", return_value="ok") as run:
+                self.assertEqual(control_panel.service_command(action), "ok")
+                self.assertEqual(run.call_args.kwargs["timeout"], timeout)
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows service launcher test")
+class WindowsServiceTests(unittest.TestCase):
+    def test_python_start_failure_reports_stderr_from_script_path_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="service test ") as directory:
+            project = Path(directory)
+            script = project / "failing service.py"
+            script.write_text("import sys\nprint('synthetic startup failure：启动失败', file=sys.stderr)\nraise SystemExit(7)\n", encoding="utf-8")
+            # Load only the real helper functions; do not register tasks or launch
+            # the user's services. Override the port check for this failing child.
+            helpers = (ROOT / "scripts" / "agent-service.ps1").read_text(encoding="utf-8").split("switch ($Action)")[0]
+            quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+            harness = project / "test-service.ps1"
+            harness.write_text(
+                helpers + f"\n$projectRoot = {quote(project)}\n$pythonExe = {quote(sys.executable)}\n"
+                + "function Test-PortListening([int]$Port) { return $false }\n"
+                + f"Start-ProjectPythonService {quote(script)} 18765 'Synthetic service'\n",
+                encoding="utf-8-sig",
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
+                creationflags=control_panel.WINDOWS_CREATION_FLAGS,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("synthetic startup failure", result.stdout)
+            self.assertIn("启动失败", result.stdout)
+            self.assertIn("exited before listening", result.stderr)
+            self.assertIn("exit code 7", result.stderr)
 
 
 class ResponsiveLayoutTests(unittest.TestCase):
@@ -171,6 +252,7 @@ class ManualDailyReportTests(unittest.TestCase):
             def start(self):
                 pending.append(self.target)
         panel = self.panel()
+        panel.status_checking = True
         with (patch.object(control_panel.threading, "Thread", DeferredThread),
               patch.object(control_panel, "stream_command", return_value="日报2（收盘前复盘）已生成：test.md") as run):
             control_panel.ControlPanel.run_manual_report(panel)
@@ -186,15 +268,16 @@ class ManualDailyReportTests(unittest.TestCase):
         self.assertTrue(all(button.state == "normal" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
         self.assertIn("已生成", panel.status[-1])
 
-    def test_manual_report_rejects_status_detection_and_other_busy_states(self):
-        for flag in ("busy", "status_checking", "starting_services", "closing"):
+    def test_manual_report_rejects_busy_starting_and_closing_states(self):
+        for flag in ("busy", "starting_services", "closing"):
             panel = self.panel(); setattr(panel, flag, True)
             with patch.object(control_panel.threading, "Thread") as thread:
                 control_panel.ControlPanel.run_manual_report(panel)
             thread.assert_not_called()
         panel = self.panel(); panel.busy = True; panel.report_busy = True; panel.status_checking = True
         panel._update_controls()
-        self.assertTrue(all(button.state == "disabled" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
+        self.assertTrue(all(button.state == "disabled" for button in panel.action_buttons + panel.utility_buttons))
+        self.assertTrue(all(button.state == "normal" for button in panel.web_buttons))
 
     def test_manual_report_failure_and_holiday_release_busy_state(self):
         class ImmediateThread:
@@ -342,6 +425,42 @@ class BacktestPreparationTests(unittest.TestCase):
 
 
 class StatusControlTests(unittest.TestCase):
+    def test_startup_failure_releases_controls_and_stops_remaining_actions(self):
+        pending = []
+
+        class DeferredThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                pending.append(self.target)
+
+        panel = SimpleNamespace(
+            busy=False, starting_services=False, closing=False,
+            operation_text=SimpleNamespace(set=Mock()), status_text=SimpleNamespace(set=Mock()),
+            _update_controls=Mock(), append_log=Mock(), refresh_status=Mock(), track_startup_process=Mock(),
+            after=lambda delay, callback: callback(),
+        )
+        panel.startup_failed = lambda detail: control_panel.ControlPanel.startup_failed(panel, detail)
+        with (patch.object(control_panel.threading, "Thread", DeferredThread),
+              patch.object(control_panel, "service_command", side_effect=RuntimeError("操作超时")) as run,
+              patch.object(control_panel, "VENV_PYTHON", SimpleNamespace(exists=lambda: True))):
+            control_panel.ControlPanel.start_all_services(panel)
+            self.assertTrue(panel.starting_services)
+            pending.pop()()
+        self.assertFalse(panel.starting_services)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(panel._update_controls.call_count, 2)
+        panel.refresh_status.assert_called_once()
+        self.assertIn("操作超时", panel.append_log.call_args.args[0])
+
+    def test_periodic_status_does_not_overlap_service_startup(self):
+        panel = SimpleNamespace(busy=False, closing=False, status_checking=False, starting_services=True)
+        with patch.object(control_panel.threading, "Thread") as thread:
+            control_panel.ControlPanel.refresh_status(panel, False)
+        thread.assert_not_called()
+        self.assertFalse(panel.status_checking)
+
     def test_strategy_selection_and_slot_changes_preserve_settings(self):
         panel = SimpleNamespace(
             strategy_choice=SimpleNamespace(get=lambda: "Elastic Net 因子模型"),
@@ -355,7 +474,7 @@ class StatusControlTests(unittest.TestCase):
             settings = control_panel.read_json(control_panel.FACTOR_SETTINGS)
             self.assertEqual(settings, {"strategy": "elastic_net", "backtest_slot": "10:30", "weekly_training_enabled": False})
 
-    def test_status_check_disables_all_controls_until_result(self):
+    def test_status_checks_keep_controls_available_and_prevent_duplicate_checks(self):
         class Control:
             def __init__(self):
                 self.state = "normal"
@@ -406,13 +525,14 @@ class StatusControlTests(unittest.TestCase):
                 pending.append(self.target)
 
         panel = Panel()
+        panel._update_controls()
         with (patch.object(control_panel.threading, "Thread", DeferredThread),
               patch.object(control_panel, "service_command", return_value='{"agent_task":"Ready"}')):
             control_panel.ControlPanel.refresh_status(panel, False)
             self.assertTrue(panel.status_checking)
-            self.assertTrue(all(button.state == "disabled" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
-            self.assertEqual(panel.factor_slot_box.state, "disabled")
-            self.assertEqual(panel.strategy_box.state, "disabled")
+            self.assertTrue(all(button.state == "normal" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
+            self.assertEqual(panel.factor_slot_box.state, "readonly")
+            self.assertEqual(panel.strategy_box.state, "readonly")
             control_panel.ControlPanel.refresh_status(panel, False)
             self.assertEqual(len(pending), 1)
             pending.pop()()
@@ -425,12 +545,44 @@ class StatusControlTests(unittest.TestCase):
 
         with (patch.object(control_panel.threading, "Thread", DeferredThread),
               patch.object(control_panel, "service_command", side_effect=RuntimeError("状态服务不可用"))):
-            control_panel.ControlPanel.refresh_status(panel, False)
-            self.assertTrue(all(button.state == "disabled" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
+            control_panel.ControlPanel.refresh_status(panel, True)
+            self.assertTrue(all(button.state == "normal" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
             pending.pop()()
         self.assertEqual(panel.results[-1], "状态服务不可用")
         self.assertFalse(panel.status_checking)
         self.assertTrue(all(button.state == "normal" for button in panel.action_buttons + panel.web_buttons + panel.utility_buttons))
+
+    def test_late_status_result_cannot_overwrite_a_newer_operation(self):
+        for detail in (None, "状态检查超时"):
+            with self.subTest(detail=detail):
+                panel = SimpleNamespace(
+                    busy=False, starting_services=False, closing=False, status_checking=True,
+                    factor_busy=False, report_busy=False, operation_revision=0,
+                    operation_text=SimpleNamespace(set=Mock()), _update_controls=Mock(),
+                    show_status=Mock(), status_failed=Mock(),
+                )
+                # A check started at revision 0. The user finishes an operation
+                # before the check's queued result reaches Tk's main thread.
+                control_panel.ControlPanel.set_busy(panel, True, "生成日报中")
+                control_panel.ControlPanel.set_busy(panel, False)
+                control_panel.ControlPanel._finish_status(panel, payload={"report_site": False}, detail=detail, revision=0)
+                panel.show_status.assert_not_called()
+                panel.status_failed.assert_not_called()
+                self.assertFalse(panel.status_checking)
+                control_panel.ControlPanel._finish_status(panel, payload={"report_site": True}, revision=panel.operation_revision)
+                panel.show_status.assert_called_once_with({"report_site": True}, False)
+
+    def test_status_result_during_operation_preserves_busy_controls(self):
+        for flag in ("busy", "starting_services", "closing"):
+            panel = SimpleNamespace(
+                busy=False, starting_services=False, closing=False, status_checking=True,
+                _update_controls=Mock(), show_status=Mock(), status_failed=Mock(),
+            )
+            setattr(panel, flag, True)
+            control_panel.ControlPanel._finish_status(panel, payload={"report_site": True})
+            panel.show_status.assert_not_called()
+            self.assertTrue(getattr(panel, flag))
+            self.assertFalse(panel.status_checking)
 
     def test_web_buttons_remain_available_during_factor_work(self):
         class Control:
@@ -454,7 +606,7 @@ class StatusControlTests(unittest.TestCase):
 
         panel.status_checking = True
         control_panel.ControlPanel._update_controls(panel)
-        self.assertTrue(all(button.state == "disabled" for button in panel.web_buttons))
+        self.assertTrue(all(button.state == "normal" for button in panel.web_buttons))
 
         panel.status_checking = False
         panel.factor_busy = False

@@ -22,21 +22,41 @@ $reportTask = 'DSH A-Share Report Site'
 $factorTask = 'DSH A-Share Weekly Factor Training'
 
 function Test-PortListening([int]$Port) {
-    return $null -ne (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    # Avoid a CIM query on every startup poll; it can take seconds per call.
+    $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    return $null -ne ($listeners | Where-Object { $_.Port -eq $Port } | Select-Object -First 1)
 }
 
 function Start-ProjectPythonService([string]$Script, [int]$Port, [string]$Label) {
     if (Test-PortListening $Port) {
         return
     }
-    Start-Process -FilePath $pythonExe -ArgumentList @($Script) -WorkingDirectory $projectRoot -WindowStyle Hidden
-    foreach ($attempt in 1..15) {
+    $logDirectory = Join-Path $projectRoot 'data'
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    $logName = [System.IO.Path]::GetFileNameWithoutExtension($Script)
+    $stdoutLog = Join-Path $logDirectory "$logName.stdout.log"
+    $stderrLog = Join-Path $logDirectory "$logName.stderr.log"
+    Write-Host "Starting $Label on port $Port..."
+    $process = Start-Process -FilePath $pythonExe -ArgumentList @("`"$Script`"") -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    # Keep the process handle open so Windows retains the exit code for fast failures.
+    $processHandle = $process.Handle
+    $startupClock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($startupClock.Elapsed.TotalSeconds -lt 15) {
         if (Test-PortListening $Port) {
+            Write-Host "$Label is running on port $Port."
             return
         }
-        Start-Sleep -Seconds 1
+        $process.Refresh()
+        if ($process.HasExited) {
+            $process.WaitForExit()
+            Write-StartupLogs @($stdoutLog, $stderrLog)
+            throw "$Label exited before listening on port $Port (exit code $($process.ExitCode))."
+        }
+        Start-Sleep -Milliseconds 250
     }
-    throw "$Label did not start on port $Port."
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    Write-StartupLogs @($stdoutLog, $stderrLog)
+    throw "$Label did not start on port $Port within 15 seconds. Logs: $stdoutLog; $stderrLog"
 }
 
 function Stop-ProjectPort([int]$Port, [string]$ExpectedCommand, [string]$Label) {
@@ -86,12 +106,10 @@ function Start-DshWebProcess([string]$CommandPath) {
     return $process
 }
 
-function Write-DshStartupLogs {
-    $stdoutLog = Join-Path $projectRoot 'data\dsh-web.stdout.log'
-    $stderrLog = Join-Path $projectRoot 'data\dsh-web.stderr.log'
-    foreach ($logPath in @($stdoutLog, $stderrLog)) {
+function Write-StartupLogs([string[]]$LogPaths) {
+    foreach ($logPath in $LogPaths) {
         if (Test-Path -LiteralPath $logPath) {
-            $lines = Get-Content -LiteralPath $logPath -Tail 30 -ErrorAction SilentlyContinue
+            $lines = Get-Content -LiteralPath $logPath -Encoding UTF8 -Tail 30 -ErrorAction SilentlyContinue
             if ($lines) {
                 Write-Host "--- $(Split-Path -Leaf $logPath) ---"
                 $lines | ForEach-Object { Write-Host $_ }
@@ -108,11 +126,14 @@ switch ($Action) {
         if (-not (Test-Path -LiteralPath $pushConfig)) {
             Copy-Item -LiteralPath $pushConfigExample -Destination $pushConfig
         }
+        Write-Host '[Start 1/3] Registering Windows scheduled tasks...'
         & $taskInstaller
         Set-TaskEnabled $dailyTask $true
         Set-TaskEnabled $reportTask $true
         Set-TaskEnabled $factorTask $true
+        Write-Host '[Start 2/3] Starting the local stock-data service...'
         Start-ProjectPythonService $dataServer 8765 'Local stock-data service'
+        Write-Host '[Start 3/3] Starting the report website...'
         Start-ProjectPythonService $reportServer 8766 'Report website'
         Write-Host 'Agent enabled: daily report tasks are active. DSH Web was not started.'
     }
@@ -164,12 +185,14 @@ switch ($Action) {
             throw 'dsh command was not found. Run install-and-start.ps1 once first.'
         }
         $dshProcess = Start-DshWebProcess $dsh.Source
-        foreach ($attempt in 1..30) {
+        $startupClock = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($startupClock.Elapsed.TotalSeconds -lt 30) {
             if (Test-PortListening 3080) {
                 Write-Host 'DSH Web is running.'
                 break
             }
-            if ($dshProcess.HasExited -and $attempt -ge 5) {
+            $dshProcess.Refresh()
+            if ($dshProcess.HasExited) {
                 break
             }
             Start-Sleep -Seconds 1
@@ -179,7 +202,7 @@ switch ($Action) {
                 Stop-Process -Id $dshProcess.Id -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Milliseconds 250
             }
-            Write-DshStartupLogs
+            Write-StartupLogs @((Join-Path $projectRoot 'data\dsh-web.stdout.log'), (Join-Path $projectRoot 'data\dsh-web.stderr.log'))
             throw 'DSH Web did not start within 30 seconds.'
         }
     }

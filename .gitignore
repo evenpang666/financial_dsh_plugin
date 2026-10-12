@@ -14,5 +14,7 @@ data/report-snapshots/
 data/research-reflections.json
 data/dsh-web.stdout.log
 data/dsh-web.stderr.log
+data/stock_data_server.*.log
+data/report_web_server.*.log
 data/factor-lab/
 data/linux-services/
