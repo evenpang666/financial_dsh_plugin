@@ -249,10 +249,11 @@ class BacktestIntegrityTests(unittest.TestCase):
                                "is_st": False, "is_suspended": False} for symbol in symbols])
         market = {symbol: bars([day], [10]) for symbol in symbols}
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(factor_backtest, "walk_forward_signals",
+             patch.object(factor_backtest, "checkpoint_signals",
                           return_value=({day: [symbols[0]]}, [], {})):
             result = factor_backtest.run(samples, market, Path(directory),
-                                         universe_history=universe, market_state=state)
+                                         universe_history=universe, market_state=state,
+                                         checkpoint={"model_id": "test", "algorithm": "xgboost"}, model_dir=Path(directory))
         self.assertEqual(result["schema_version"], 2)
         self.assertIn("14:05–14:10", result["execution"])
         self.assertGreater(result["stats"]["slippage_costs"], 0)

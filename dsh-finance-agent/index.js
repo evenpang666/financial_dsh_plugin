@@ -86,8 +86,16 @@ export function apply(ctx, config = {}) {
     parameters: { type: 'object', properties: {
       market: { type: 'string', enum: ['a', 'hk'] },
       strategy: { type: 'string', enum: ['xgboost', 'elastic_net', 'mean_reversion', 'momentum', 'breakout', 'ma_crossover', 'macd', 'rsi_rebound', 'bollinger_reversion', 'donchian_breakout'], description: '不传时沿用控制面板设置；当前策略仅支持A股。' },
+      parameters: { type: 'object', description: '本次策略超参数；字段与范围从 get_strategy_checkpoints 的 parameter_schema 读取。不传时使用保存配置及推荐默认值。', additionalProperties: { type: 'number' } },
+      checkpoint: { type: 'string', description: '多因子模型策略必须指定已训练 checkpoint ID；先用 get_strategy_checkpoints 获取。经典策略不传。' },
     }, additionalProperties: false },
-    execute: ({market: selectedMarket = 'a', strategy = ''}) => call(`/v1/portfolio-analysis?${marketParam(selectedMarket)}&strategy=${encodeURIComponent(strategy)}`, {timeoutMs: 180000}),
+    execute: ({market: selectedMarket = 'a', strategy = '', checkpoint = '', parameters = null}) => call(`/v1/portfolio-analysis?${marketParam(selectedMarket)}&strategy=${encodeURIComponent(strategy)}&checkpoint=${encodeURIComponent(checkpoint)}&parameters=${encodeURIComponent(JSON.stringify(parameters))}`, {timeoutMs: 180000}),
+  })
+  register({
+    name: 'get_strategy_checkpoints',
+    description: '列出经典策略和实际已训练的模型 checkpoint，含训练时间及版本 ID。模型列表为空时不能运行模型部署。',
+    parameters: {type: 'object', properties: {}, additionalProperties: false},
+    execute: () => call('/v1/strategy-options'),
   })
   register({
     name: 'set_portfolio',

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="本地股票双时点日报">
-  <title>股票双时点日报与全市场盘中排序</title>
+  <title>股票双时点日报与全市场盘中策略部署</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -42,7 +42,7 @@
           <a href="#reviewVisuals" data-index-target><span>07</span>盘中复盘</a>
           <a href="#reportDetails" data-index-target><span>08</span>完整研究正文</a>
           <div id="reportHeadingIndex" class="index-subsections"></div>
-          <a href="#researchTools" data-index-target><span>09</span>持仓与盘中排序</a>
+          <a href="#researchTools" data-index-target><span>09</span>持仓与盘中策略部署</a>
           <a href="#pageTop" class="index-top-link">↑ 返回顶部</a>
         </nav>
       </details>
@@ -71,14 +71,16 @@
       </div>
       <article id="report" class="report" hidden></article>
     </section>
-    <details id="researchTools" class="research-tools"><summary>研究工具 · 持仓与盘中排序</summary><p class="ranking-note">以下为当前研究工具结果，时间可能与所选归档日报不同。</p>
+    <details id="researchTools" class="research-tools"><summary>研究工具 · 持仓与盘中策略部署</summary><p class="ranking-note">以下为当前研究工具结果，时间可能与所选归档日报不同。</p>
     <section class="insight-card portfolio-shell" aria-labelledby="portfolioTitle">
-      <div class="section-heading"><div><p class="eyebrow">ON-DEMAND PORTFOLIO</p><h2 id="portfolioTitle">持仓分析与仓位总结</h2><p id="portfolioMeta" class="insight-meta">默认不读取持仓；点击后对照个股研究与所选策略。</p></div><div class="portfolio-actions"><label class="select-control" for="portfolioStrategy"><span>对照策略 · 默认沿用控制面板</span><select id="portfolioStrategy" disabled><option value="">正在读取策略…</option></select></label><button id="portfolioButton" type="button">分析我的持仓</button></div></div>
+      <div class="section-heading"><div><p class="eyebrow">ON-DEMAND PORTFOLIO</p><h2 id="portfolioTitle">持仓分析与仓位总结</h2><p id="portfolioMeta" class="insight-meta">默认不读取持仓；点击后对照个股研究与所选策略。</p></div><div class="portfolio-actions"><label class="select-control" for="portfolioKind"><span>策略类型</span><select id="portfolioKind"><option value="fixed">经典策略</option><option value="model">多因子模型策略</option></select></label><label class="select-control" for="portfolioStrategy"><span>经典策略 / 已训练 checkpoint</span><select id="portfolioStrategy" disabled><option value="">正在读取策略…</option></select></label><button id="portfolioButton" type="button">分析我的持仓</button></div></div>
+      <div id="portfolioParameters" class="strategy-parameters"></div>
       <div id="portfolioContent" aria-live="polite"></div>
     </section>
     <section class="ranking-shell" aria-labelledby="rankingTitle">
-      <div class="ranking-heading"><div><p class="eyebrow">INTRADAY MARKET RANKING</p><h2 id="rankingTitle">全市场盘中排序</h2><p id="rankingMeta" role="status">选择固定交易策略或已训练的因子模型，点击排序获取当前盘中结果。</p></div><span class="ranking-badge">沪深 A 股 · 盘中研究</span></div>
-      <div class="ranking-actions"><label class="select-control" for="rankingStrategy"><span>排序策略 / 模型</span><select id="rankingStrategy" disabled><option>正在读取可用策略…</option></select></label><button id="rankMarketButton" type="button" disabled>开始盘中排序</button></div>
+      <div class="ranking-heading"><div><p class="eyebrow">STRATEGY DEPLOYMENT</p><h2 id="rankingTitle">全市场盘中策略部署</h2><p id="rankingMeta" role="status">选择经典交易策略或已训练的因子模型，点击策略部署获取当前盘中结果。</p></div><span class="ranking-badge">沪深 A 股 · 盘中研究</span></div>
+      <div class="ranking-actions"><label class="select-control" for="rankingKind"><span>策略类型</span><select id="rankingKind"><option value="fixed">经典策略</option><option value="model">多因子模型策略</option></select></label><label class="select-control" for="rankingStrategy"><span>经典策略 / 已训练 checkpoint</span><select id="rankingStrategy" disabled><option>正在读取可用策略…</option></select></label><button id="rankMarketButton" type="button" disabled>开始盘中策略部署</button></div>
+      <div id="rankingParameters" class="strategy-parameters"></div>
       <p id="rankingOptionsNote" class="ranking-note"></p>
       <p class="ranking-note">扫描全市场沪深 A 股，排除 ST、退市标记和无成交股票；缺失数据会单独计数。技术指标策略需要逐股分钟线，可在后台查看处理进度。</p>
       <div id="rankingContent" class="ranking-content" aria-live="polite"></div>

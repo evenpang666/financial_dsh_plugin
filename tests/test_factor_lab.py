@@ -326,7 +326,7 @@ class FactorLabTests(unittest.TestCase):
                              "成交量": 1000, "成交额": price * 100000})
             fake_ak = types.SimpleNamespace(tool_trade_date_hist_sina=lambda: pd.DataFrame({"trade_date": [moment.date()]}))
             with patch.object(factor_lab, "MODEL", base / "model.json"):
-                with self.assertRaisesRegex(RuntimeError, "所选因子模型尚未训练"):
+                with self.assertRaisesRegex(ValueError, "checkpoint"):
                     factor_lab.rank()
 
     def test_live_ranking_uses_selected_ml_algorithm(self):
@@ -351,7 +351,7 @@ class FactorLabTests(unittest.TestCase):
                  patch.object(factor_lab, "MODELS", base / "models"), \
                  patch.object(factor_lab, "LATEST", base / "latest.json"), \
                  patch.object(factor_lab, "now_cn", return_value=moment), \
-                 patch.object(factor_lab, "load_settings", return_value={"backtest_slot": "10:30", "weekly_training_enabled": True, "strategy": "elastic_net"}), \
+                 patch.object(factor_lab, "load_settings", return_value={"backtest_slot": "10:30", "weekly_training_enabled": True, "strategy": "elastic_net", "checkpoint_id": "ml-test"}), \
                  patch.object(factor_lab, "spot_frame", return_value=pd.DataFrame(rows)), \
                  patch.object(factor_lab, "urlopen", side_effect=OSError("web offline")), \
                  patch.object(factor_models, "predict", return_value=np.arange(15)) as predict, \
@@ -368,7 +368,7 @@ class FactorLabTests(unittest.TestCase):
             path = Path(directory) / "model.json"
             path.write_text(json.dumps({"algorithm": "xgboost", "model_id": "old"}), encoding="utf-8")
             with patch.object(factor_lab, "MODEL", path):
-                with self.assertRaisesRegex(RuntimeError, "所选因子模型尚未训练"):
+                with self.assertRaisesRegex(ValueError, "checkpoint"):
                     factor_lab.rank()
 
     def test_one_click_train_publishes_chosen_ml_model(self):
@@ -381,6 +381,10 @@ class FactorLabTests(unittest.TestCase):
             ml_result = {"algorithm": "xgboost", "algorithms": {"xgboost": {}, "elastic_net": {}},
                          "features": list(factor_models.FEATURES), "days": 100, "samples": 10000,
                          "last_day": "2026-09-22", "holdout_days": 20}
+            def fit(samples, destination, algorithm, parameters=None):
+                destination.mkdir(parents=True)
+                (destination / f"{algorithm}.json").write_text("{}", encoding="utf-8")
+                return ml_result
             with patch.object(factor_lab, "STORE", base), patch.object(factor_lab, "BARS", base / "bars"), \
                  patch.object(factor_lab, "SOURCE_MANIFEST", base / "source-manifest.json"), \
                  patch.object(factor_lab, "MODELS", base / "models"), \
@@ -391,8 +395,9 @@ class FactorLabTests(unittest.TestCase):
                  patch.object(factor_lab, "spot_frame", return_value=snapshot), \
                  patch.object(factor_lab, "backfill_baostock", return_value={"filled": 40, "failures": []}), \
                  patch.object(factor_lab, "refresh_bars", return_value=pd.DataFrame({"time": pd.to_datetime(["2026-09-22 09:35"])})), \
-                 patch.object(factor_lab, "history_samples", return_value=[{"day": "2026-09-22"}]), \
-                  patch.object(factor_models, "fit_models", return_value=ml_result), \
+                 patch.object(factor_lab, "load_settings", return_value={"strategy": "xgboost", "backtest_slot": "14:00", "training_start": "2026-01-01", "training_end": "2026-09-22"}), \
+                 patch.object(factor_lab, "history_samples", return_value=[{"day": "2026-09-21", "exit_day": "2026-09-22"}]), \
+                  patch.object(factor_models, "fit_models", side_effect=fit), \
                   patch("factor_backtest.run", side_effect=AssertionError("training must not run a backtest")):
                 published = factor_lab.train()
             self.assertEqual(published["algorithm"], "xgboost")

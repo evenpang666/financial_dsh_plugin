@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 
 from data_diagnostics import readable_issues
-from strategy_catalog import MODEL_STRATEGIES, RULE_FEATURES, STRATEGIES, TECHNICAL_STRATEGIES, rule_scores, validate_strategy
+from strategy_catalog import MODEL_STRATEGIES, RULE_FEATURES, STRATEGIES, TECHNICAL_STRATEGIES, rule_scores, validate_strategy, strategy_description
 
 ROOT = Path(__file__).resolve().parents[1]
 CHINA = timezone(timedelta(hours=8))
@@ -93,7 +93,7 @@ def reference_close_response(symbol, day):
     return value
 
 
-def load_signal_record(item, strategy, asof, previous_day, deadline=None):
+def load_signal_record(item, strategy, asof, previous_day, deadline=None, parameters=None):
     """Use verified completed 5-minute bars; keep optional cache separate from replay."""
     from factor_lab import normalized_bars, sina_minute_frame, factor_values, inferred_vwap
     from factor_data_prep import _minute_times, _minute_cache_complete, minute_quality_issues
@@ -133,7 +133,7 @@ def load_signal_record(item, strategy, asof, previous_day, deadline=None):
         prior = bars[bars.time.dt.strftime("%Y-%m-%d").eq(previous_day)]
         events = pd.DataFrame([{"day": day, "cash_dividend": 0,
                                 "split_ratio": float(prior.iloc[-1].close) / previous_close}])
-        factors.update(indicator_frame(bars, events).iloc[-1].to_dict())
+        factors.update(indicator_frame(bars, events, {strategy: parameters} if parameters else None).iloc[-1].to_dict())
     factors["minute_of_day"] = asof.hour * 60 + asof.minute
     needed = ("open_momentum", "gap", "range_position", "range_width", "vwap_gap", "minute_of_day") if strategy in MODEL_STRATEGIES else RULE_FEATURES[strategy]
     if any(finite(factors.get(key)) is None for key in needed):
@@ -144,10 +144,14 @@ def load_signal_record(item, strategy, asof, previous_day, deadline=None):
     return {"symbol": symbol, "price": price, "as_of": asof.isoformat(), **factors}
 
 
-def strategy_review(items, strategy, market, now=None):
+def strategy_review(items, strategy, market, now=None, checkpoint_id=None, parameters=None):
+    from strategy_config import validate_parameters, configured_parameters
+    from factor_lab import load_settings
+    parameters = (configured_parameters(load_settings(), strategy) if parameters is None
+                  else validate_parameters(strategy, parameters))
     now = now or datetime.now(CHINA)
     result = {"strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
-              "description": STRATEGIES[strategy]["description"], "scope": "仅本次已保存持仓池，独立评分；不是全市场排名",
+              "description": strategy_description(strategy, parameters), "strategy_parameters": parameters, "scope": "仅本次已保存持仓池，独立评分；不是全市场排名",
               "available": False, "rows": {}, "as_of": None, "input_count": len(items), "valid_count": 0}
     if market != "a":
         return {**result, "note": "当前交易策略仅支持 A 股，港股结果2/3暂不形成数值配置。"}
@@ -168,17 +172,16 @@ def strategy_review(items, strategy, market, now=None):
         cutoff = "15:00" if now.strftime("%H:%M") >= "15:00" else "11:30" if "11:30" <= now.strftime("%H:%M") < "13:05" else pd.Timestamp(now).floor("5min").strftime("%H:%M")
         asof = pd.Timestamp(f"{now.date()} {cutoff}")
         result["as_of"] = asof.isoformat()
-        model = selected_model(strategy) if strategy in MODEL_STRATEGIES else None
+        model = selected_model(strategy, checkpoint_id or "") if strategy in MODEL_STRATEGIES else None
         if strategy in MODEL_STRATEGIES:
             if not model or model.get("target_version") != ML_TARGET_VERSION:
                 raise ValueError("所选模型尚未有效训练，请先在控制面板训练")
             selected_at = datetime.fromisoformat(model["selected_at"])
             if selected_at.tzinfo is None:
                 selected_at = selected_at.replace(tzinfo=CHINA)
-            if not timedelta(0) <= now - selected_at <= timedelta(days=30):
-                raise ValueError("模型超过30天或日期异常，请重新训练")
-            if model.get("quality") == "exploratory" and not timedelta(0) <= now.date() - pd.Timestamp(model["training"]["last_day"]).date() <= timedelta(days=7):
-                raise ValueError("探索性模型训练数据超过7天，请重新训练")
+            if now < selected_at:
+                raise ValueError("checkpoint 训练日期晚于当前时间")
+            result.update(checkpoint_id=model["model_id"], checkpoint_trained_at=model["selected_at"])
         from concurrent.futures import ThreadPoolExecutor
         deadline = time.monotonic() + 45
         def load(item):
@@ -191,7 +194,7 @@ def strategy_review(items, strategy, market, now=None):
                 name = str(item.get("analysis", {}).get("name", "")).upper()
                 if "ST" in name or "退" in name:
                     raise ValueError("ST 标的仅作风险复核，不生成入场配置")
-                return load_signal_record(item, strategy, asof, previous[-1].isoformat(), deadline), None
+                return load_signal_record(item, strategy, asof, previous[-1].isoformat(), deadline, parameters=parameters), None
             except Exception as error:
                 logging.getLogger(__name__).warning("持仓策略 %s/%s: %s", strategy, symbol, error)
                 return None, {"symbol": symbol, "status": "unavailable", "note": readable_issues([f"策略信号不可用：{error}"])[0]}
@@ -206,15 +209,17 @@ def strategy_review(items, strategy, market, now=None):
                 frame["score"] = predict(frame, model, MODELS / model["model_id"])
                 frame["entry"] = True
             else:
-                frame["score"], frame["entry"] = rule_scores(frame, strategy)
+                frame["score"], frame["entry"] = rule_scores(frame, strategy, parameters)
             if not frame.score.map(lambda value: finite(value) is not None).all():
                 raise ValueError("策略评分包含无效数值")
             frame["rank"] = frame.loc[frame.entry, "score"].rank(method="min", ascending=False)
+            deployed = set(frame[frame.entry].sort_values(["score", "symbol"], ascending=[False, True]).head(parameters["top_n"]).symbol)
+            result["deployment_candidates"] = sorted(deployed)
             for row in frame.to_dict("records"):
                 rank = int(row["rank"]) if row["entry"] else None
                 result["rows"][row["symbol"]] = {"status": "triggered" if row["entry"] else "not_triggered",
                     "score": round(float(row["score"]), 5), "rank": rank,
-                    "allocation_score": 1.0 / rank if rank else 0.0,
+                    "allocation_score": 1.0 / rank if rank and row["symbol"] in deployed else 0.0,
                     "as_of": row["as_of"], "note": "已满足所选策略入场条件" if rank else "未触发新增入场；不等同于原持仓卖出信号"}
         result["available"] = len(records) == len(items)
         if not result["available"]:

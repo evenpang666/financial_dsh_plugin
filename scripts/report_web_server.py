@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from strategy_catalog import STRATEGIES
+from model_checkpoints import execution_options, resolve_selection
 from report_content import without_backtest_section
 from data_diagnostics import readable_issues
 
@@ -55,14 +56,17 @@ def ranking_job(job_id):
         return None
 
 
-def run_ranking_worker(job_id, strategy):
+def run_ranking_worker(job_id, strategy, checkpoint_id=""):
     global ACTIVE_RANKING_JOB
     from factor_lab import write_json
     directory = PROJECT_ROOT / "data" / "factor-lab" / "ranking-jobs"
     try:
         with (directory / f"{job_id}.log").open("w", encoding="utf-8") as output:
-            result = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "intraday_ranking.py"),
-                                     "--strategy", strategy, "--job-id", job_id],
+            command = [sys.executable, str(PROJECT_ROOT / "scripts" / "intraday_ranking.py"),
+                       "--strategy", strategy, "--job-id", job_id]
+            if checkpoint_id:
+                command += ["--checkpoint", checkpoint_id]
+            result = subprocess.run(command,
                                     cwd=PROJECT_ROOT, stdout=output, stderr=subprocess.STDOUT, timeout=1200)
         state = ranking_job(job_id) or {}
         if result.returncode or state.get("status") != "completed":
@@ -80,22 +84,30 @@ def run_ranking_worker(job_id, strategy):
                 ACTIVE_RANKING_JOB = ""
 
 
-def start_ranking_job(strategy):
+def start_ranking_job(strategy, parameters=None):
     global ACTIVE_RANKING_JOB
     from intraday_ranking import ranking_options
     from factor_lab import write_json
     if strategy not in ranking_options()["strategies"]:
         raise ValueError("所选策略或模型当前不可用，请刷新列表并检查训练状态。")
+    selection_id = strategy
+    strategy, checkpoint_id, _ = resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+    from strategy_config import configured_parameters, validate_parameters
+    from factor_lab import load_settings
+    parameters = (configured_parameters(load_settings(), strategy) if parameters is None
+                  else validate_parameters(strategy, parameters))
     with RANKING_JOB_LOCK:
         if ACTIVE_RANKING_JOB:
             return ranking_job(ACTIVE_RANKING_JOB), False
         job_id = uuid.uuid4().hex
         state = {"job_id": job_id, "strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
-                 "scope": "full_market", "status": "running", "stage": "queued", "message": "已开始全市场盘中排序",
+                 "selection_id": selection_id, "checkpoint_id": checkpoint_id or None,
+                 "strategy_parameters": parameters,
+                 "scope": "full_market", "status": "running", "stage": "queued", "message": "已开始全市场策略部署",
                  "started_at": datetime.now(CHINA).isoformat(timespec="seconds")}
         write_json(PROJECT_ROOT / "data" / "factor-lab" / "ranking-jobs" / f"{job_id}.json", state)
         ACTIVE_RANKING_JOB = job_id
-        threading.Thread(target=run_ranking_worker, args=(job_id, strategy), daemon=True).start()
+        threading.Thread(target=run_ranking_worker, args=(job_id, strategy, checkpoint_id), daemon=True).start()
         return state, True
 
 
@@ -117,19 +129,20 @@ def publish_ranking_event():
 def latest_ranking(strategy="", scope=""):
     try:
         if scope == "full_market":
-            if strategy not in STRATEGIES:
-                raise ValueError("策略参数无效。")
-            path = PROJECT_ROOT / "data" / "factor-lab" / f"full-market-{strategy}.json"
+            strategy, checkpoint_id, _ = resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+            suffix = f"-{checkpoint_id}" if checkpoint_id else ""
+            path = PROJECT_ROOT / "data" / "factor-lab" / f"full-market-{strategy}{suffix}.json"
         else:
             path = RANKING_FILE
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return {"available": False}
-        if scope == "full_market" and (payload.get("scope") != scope or payload.get("strategy_id") != strategy):
+        if scope == "full_market" and (payload.get("scope") != scope or payload.get("strategy_id") != strategy
+                                       or (payload.get("checkpoint_id") or "") != checkpoint_id):
             return {"available": False}
         return (payload if isinstance(payload, dict) and (payload.get("ranking") or payload.get("available"))
                 and payload.get("algorithm") in STRATEGIES else {"available": False})
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {"available": False}
 
 
@@ -279,7 +292,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"reports": list_reports()})
             if path == "/api/ranking/latest":
                 query = parse_qs(urlparse(self.path).query)
-                if query.get("scope", [""])[0] not in {"", "full_market"} or (query.get("scope", [""])[0] == "full_market" and query.get("strategy", [""])[0] not in STRATEGIES):
+                if query.get("scope", [""])[0] not in {"", "full_market"}:
                     return self.send_json(400, {"error": "排序范围或策略参数无效。"})
                 return self.send_json(200, latest_ranking(query.get("strategy", [""])[0], query.get("scope", [""])[0]))
             if path == "/api/ranking/strategies":
@@ -294,7 +307,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 except (OSError, ValueError):
                     settings = {}
                 selected = settings.get("strategy", "xgboost") if isinstance(settings, dict) else "xgboost"
-                return self.send_json(200, {"selected": selected if selected in STRATEGIES else "xgboost", "strategies": STRATEGIES})
+                return self.send_json(200, execution_options(PROJECT_ROOT / "data" / "factor-lab", settings))
             if path == "/api/backtest/latest":
                 return self.send_json(200, latest_backtest())
             if path == "/api/backtests":
@@ -349,10 +362,10 @@ class ReportHandler(BaseHTTPRequestHandler):
             if self.headers.get("X-Report-Market", "a") != "a":
                 return self.send_json(400, {"error": "当前盘中交易策略只支持沪深 A 股。"})
             strategy = self.headers.get("X-Ranking-Strategy", "")
-            if strategy not in STRATEGIES:
-                return self.send_json(400, {"error": "策略参数无效。"})
             try:
-                state, created = start_ranking_job(strategy)
+                resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+                parameters = json.loads(self.headers.get("X-Strategy-Parameters", "null"))
+                state, created = start_ranking_job(strategy, parameters) if parameters is not None else start_ranking_job(strategy)
                 return self.send_json(202 if created else 409, state)
             except (OSError, ValueError) as exc:
                 return self.send_json(400, {"error": str(exc)})
@@ -365,10 +378,18 @@ class ReportHandler(BaseHTTPRequestHandler):
             if market not in {"a", "hk"}:
                 return self.send_json(400, {"error": "市场参数无效。"})
             strategy = str(self.headers.get("X-Portfolio-Strategy", ""))
-            if strategy and strategy not in STRATEGIES:
-                return self.send_json(400, {"error": "策略参数无效。"})
             try:
-                query = urlencode({"market": market, "strategy": strategy})
+                if strategy:
+                    resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+                parameters = json.loads(self.headers.get("X-Strategy-Parameters", "null"))
+                if parameters is not None:
+                    from strategy_config import validate_parameters
+                    algorithm, _, _ = resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+                    parameters = validate_parameters(algorithm, parameters)
+            except ValueError as exc:
+                return self.send_json(400, {"error": str(exc)})
+            try:
+                query = urlencode({"market": market, "strategy": strategy, "parameters": json.dumps(parameters)})
                 request = Request(f"http://127.0.0.1:8765/v1/portfolio-analysis?{query}",
                                   headers={"Accept": "application/json"})
                 with urlopen(request, timeout=180) as response:

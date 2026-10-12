@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from factor_models import EXECUTION_BAR, FEATURES, NEXT_BAR, fit_estimators, minute_of_day, rank_ic, sample_frame, score_estimator, select_algorithm
-from strategy_catalog import MODEL_STRATEGIES, RULE_FEATURES, STRATEGIES, rule_scores, validate_strategy
+from strategy_catalog import MODEL_STRATEGIES, RULE_FEATURES, STRATEGIES, rule_scores, validate_strategy, strategy_description
 
 DEFAULT_SLOT = "14:00"
 TRAIN_DAYS = 100
@@ -25,7 +25,7 @@ MIN_COMMISSION = 5.0
 SELL_TAX = 0.0005
 TRANSFER_FEE = 0.00001
 DIVIDEND_TAX_RESERVE = 0.20
-ENGINE_VERSION = 4
+ENGINE_VERSION = 6
 SLIPPAGE = 0.0005
 MAX_BAR_PARTICIPATION = 0.10
 ORDER_PRICE_BUFFER = 0.02
@@ -165,15 +165,15 @@ def signal_candidates(samples: list[dict], universe_history: pd.DataFrame,
     return candidates
 
 
-def rule_strategy_signals(samples, universe_history, slot, market_state, strategy):
+def rule_strategy_signals(samples, universe_history, slot, market_state, strategy, parameters=None):
     candidates = signal_candidates(samples, universe_history, slot, market_state, strategy)
     days = sorted(candidates.day.unique())
-    if len(days) < TRAIN_DAYS + VALIDATION_DAYS + STEP_DAYS:
-        raise RuntimeError(f"策略对比至少需要 {TRAIN_DAYS + VALIDATION_DAYS + STEP_DAYS} 个完整交易日。")
+    if len(days) < 2:
+        raise RuntimeError("经典策略回测至少需要两个完整交易日。")
     signals = {}
-    for day in days[TRAIN_DAYS + VALIDATION_DAYS:]:
+    for day in days:
         rows = candidates[candidates.day.eq(day)].copy()
-        rows["score"], entries = rule_scores(rows, strategy)
+        rows["score"], entries = rule_scores(rows, strategy, parameters)
         rows = rows[entries].sort_values(["score", "symbol"], ascending=[False, True])
         signals[day] = rows.symbol.tolist()
     return signals, [], {"rank_ic": None, "positive_share": None, "groups": 0}
@@ -231,10 +231,29 @@ def walk_forward_signals(samples: list[dict], universe_history: pd.DataFrame,
     return signals, folds, oos_ic
 
 
+def checkpoint_signals(samples, universe_history, slot, market_state, checkpoint, model_dir):
+    """Score one frozen artifact; exclude every label used to fit its weights."""
+    from factor_models import predict
+    cutoff = checkpoint.get("training", {}).get("label_end_day")
+    if not cutoff:
+        raise RuntimeError("此旧 checkpoint 未保存训练标签结束日期，不能确认样本外回测边界，请重新训练。")
+    candidates = signal_candidates(samples, universe_history, slot, market_state)
+    candidates = candidates[candidates.day.gt(cutoff)].copy()
+    if candidates.day.nunique() < 2:
+        raise RuntimeError(f"该 checkpoint 的训练标签截至 {cutoff}；需要此日期之后至少两个交易日的数据才能回测。")
+    candidates["score"] = predict(candidates, checkpoint, model_dir)
+    signals = {day: group.sort_values(["score", "symbol"], ascending=[False, True]).symbol.tolist()
+               for day, group in candidates.groupby("day")}
+    measured = candidates.dropna(subset=["target"]) if "target" in candidates else pd.DataFrame()
+    ic = rank_ic(measured, measured.score.to_numpy()) if not measured.empty else {"rank_ic": None, "groups": 0}
+    return signals, [{"checkpoint_id": checkpoint["model_id"], "training_label_end": cutoff,
+                      "test_first": min(signals), "test_last": max(signals), "refitted": False}], ic
+
+
 def simulate(signals: dict, bars_by_symbol: dict[str, pd.DataFrame],
              signal_time: str = DEFAULT_SLOT, execution_time: str | None = None,
              market_state: pd.DataFrame | None = None, *,
-             config: ExecutionConfig | None = None, market: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+             config: ExecutionConfig | None = None, market: dict | None = None, top_n: int = TOP_N) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     execution_time = execution_time or EXECUTION_BAR[signal_time]
     config = config or ExecutionConfig()
     market = market if market is not None else _prices(bars_by_symbol, signal_time, execution_time)
@@ -247,7 +266,7 @@ def simulate(signals: dict, bars_by_symbol: dict[str, pd.DataFrame],
     dividend_tax_reserved = 0.0
     for day in sorted(signals):
         today = market.get(day, {})
-        wanted = set(signals[day][:TOP_N])
+        wanted = set(signals[day][:top_n])
         for symbol, holding in positions.items():
             state = state_by_day.get((day, symbol))
             if market_state is not None and state is None:
@@ -286,7 +305,7 @@ def simulate(signals: dict, bars_by_symbol: dict[str, pd.DataFrame],
             for symbol, item in positions.items())
         buy_orders = {}
         reserved_cash = pre_sale_cash
-        for symbol in signals[day][:TOP_N]:
+        for symbol in signals[day][:top_n]:
             if symbol in positions:
                 continue
             bar = today.get(symbol, {})
@@ -300,7 +319,7 @@ def simulate(signals: dict, bars_by_symbol: dict[str, pd.DataFrame],
                 continue
             order_limit = signal_price * (1 + ORDER_PRICE_BUFFER)
             known_capacity = math.floor(bar["signal_amount"] * participation / order_limit / 100) * 100
-            budget = min(max(0.0, reserved_cash - MIN_COMMISSION), equity_before_buy / TOP_N)
+            budget = min(max(0.0, reserved_cash - MIN_COMMISSION), equity_before_buy / top_n)
             quantity = min(known_capacity, math.floor(budget / (order_limit * 100)) * 100)
             minimum = 200 if symbol.startswith(("688", "689")) else 100
             while quantity >= minimum and quantity * order_limit + _cost(quantity * order_limit, "buy", day, commission) > reserved_cash:
@@ -421,7 +440,17 @@ def run(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame], destinatio
         slot: str = DEFAULT_SLOT, universe_history: pd.DataFrame | None = None,
         market_state: pd.DataFrame | None = None,
         source_manifest: dict | None = None, strategy: str = "xgboost",
-        market: dict | None = None) -> dict:
+        market: dict | None = None, checkpoint: dict | None = None,
+        model_dir: Path | None = None, parameters=None, start=None, end=None) -> dict:
+    from strategy_config import validate_parameters, validate_range
+    parameters = validate_parameters(strategy, parameters)
+    if start is not None or end is not None:
+        validate_range(start, end, checkpoint)
+        samples = [{**row, **({"target": None} if "exit_day" in row
+                    and (not row["exit_day"] or row["exit_day"] > end) else {})}
+                   for row in samples if start <= row["day"] <= end]
+        universe_history = universe_history[universe_history.day.between(start, end)].copy()
+        market_state = market_state[market_state.day.between(start, end)].copy()
     validate_strategy(strategy)
     if slot not in EXECUTION_BAR:
         raise ValueError(f"回测时点无效：{slot}")
@@ -445,9 +474,8 @@ def run(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame], destinatio
     valid_samples = sample_frame_all[sample_frame_all.slot.eq(slot)].copy()
     finite_features = np.isfinite(valid_samples[required_features].to_numpy(dtype=float)).all(axis=1)
     sample_keys = set(zip(valid_samples.loc[finite_features, "day"], valid_samples.loc[finite_features, "symbol"]))
-    first_input_day = min(universe_history.day)
     absent_features = [(row.day, row.symbol) for row in tradable.itertuples(index=False)
-                       if row.day != first_input_day and (row.day, row.symbol) not in sample_keys]
+                       if (row.day, row.symbol) not in sample_keys]
     if absent_features:
         raise RuntimeError(f"非停牌候选股缺少 {len(absent_features)} 条信号特征，不能删除缺样本股票后回测，例如 {absent_features[:3]}。")
     if tradable.groupby("day").symbol.nunique().lt(12).any():
@@ -467,18 +495,22 @@ def run(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame], destinatio
            for day in study_days if day >= first):
         raise RuntimeError("历史持仓后续日期缺少逐日交易状态。")
     if strategy in MODEL_STRATEGIES:
-        signals, folds, oos_ic = walk_forward_signals(samples, universe_history, slot, market_state, strategy)
+        if not checkpoint or checkpoint.get("algorithm") != strategy or model_dir is None:
+            raise RuntimeError("模型回测必须选择已训练且类型匹配的 checkpoint。")
+        signals, folds, oos_ic = checkpoint_signals(samples, universe_history, slot, market_state, checkpoint, model_dir)
     else:
-        signals, folds, oos_ic = rule_strategy_signals(samples, universe_history, slot, market_state, strategy)
+        if checkpoint:
+            raise RuntimeError("经典策略没有 checkpoint。")
+        signals, folds, oos_ic = rule_strategy_signals(samples, universe_history, slot, market_state, strategy, parameters)
     market = _prices(bars_by_symbol, slot, execution_time) if market is None else market
-    equity, trades, stats = simulate(signals, bars_by_symbol, slot, execution_time, market_state, market=market)
+    equity, trades, stats = simulate(signals, bars_by_symbol, slot, execution_time, market_state, market=market, top_n=parameters["top_n"])
     stress_tests = []
     for name, config in (
         ("佣金率与滑点加倍", ExecutionConfig(slippage=SLIPPAGE * 2, commission=COMMISSION * 2)),
         ("成交参与率降至 2%", ExecutionConfig(participation=0.02)),
     ):
         _, _, scenario_stats = simulate(signals, bars_by_symbol, slot, execution_time, market_state,
-                                        market=market, config=config)
+                                        market=market, config=config, top_n=parameters["top_n"])
         stress_tests.append({"scenario": name, "slippage": config.slippage, "commission": config.commission,
                              "participation": config.participation, "stats": scenario_stats})
     destination.mkdir(parents=True, exist_ok=True)
@@ -489,21 +521,27 @@ def run(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame], destinatio
     summary = {"kind": "point_in_time_backtest", "schema_version": SCHEMA_VERSION,
                "engine_version": ENGINE_VERSION,
                "strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
-               "strategy_description": STRATEGIES[strategy]["description"],
+               "strategy_description": strategy_description(strategy, parameters),
+               "strategy_parameters": parameters, "requested_start": start, "requested_end": end,
                "data_provenance": {"source_scope": source_manifest.get("source_scope"),
                                    "manifest_created_at": source_manifest.get("created_at"),
                                    "limit_source": source_manifest.get("limit_source")}
                                   if source_manifest else None,
-               "model_scope": ("walk_forward_policy_not_current_published_weights" if strategy in MODEL_STRATEGIES
+               "checkpoint_id": checkpoint["model_id"] if checkpoint else None,
+               "checkpoint_trained_at": checkpoint.get("selected_at") if checkpoint else None,
+               "training_parameters": checkpoint.get("training_parameters", {}) if checkpoint else None,
+               "training_range": checkpoint.get("training", {}) if checkpoint else None,
+               "training_label_end": checkpoint.get("training", {}).get("label_end_day") if checkpoint else None,
+               "model_scope": ("frozen_checkpoint_after_training_labels" if strategy in MODEL_STRATEGIES
                                else "fixed_signal_time_rule"),
-               "algorithm_policy": (f"固定使用 {strategy}，滚动窗口按时间划分评估并以成熟标签重拟合"
-                                    if strategy in MODEL_STRATEGIES else STRATEGIES[strategy]["description"]),
-               "evaluation_warmup_days": TRAIN_DAYS + VALIDATION_DAYS,
-               "holding_policy": "每日重审，仍在前五名则保留持仓；离开前五名或无信号时提交卖单，停牌或流动性不足时延后退出",
+               "algorithm_policy": (f"固定使用 {strategy} checkpoint {checkpoint['model_id']}；回测期间不重新拟合"
+                                    if strategy in MODEL_STRATEGIES else strategy_description(strategy, parameters)),
+               "evaluation_warmup_days": 0,
+               "holding_policy": "每日重审，仍在配置的候选上限内则保留持仓；离开候选范围或无信号时提交卖单，停牌或流动性不足时延后退出",
                "slot": slot, "execution": f"{NEXT_BAR[slot]}–{execution_time} VWAP",
                "execution_bar_end": execution_time,
                "first_day": min(signals), "last_day": max(signals), "days": len(signals),
-               "folds": len(folds), "top_n": TOP_N, "stats": stats, "oos_rank_ic": oos_ic,
+               "folds": len(folds), "top_n": parameters["top_n"], "stats": stats, "oos_rank_ic": oos_ic,
                "stress_tests": stress_tests,
                "audit": {"future_information": "全部买单在成交前冻结数量与现金预留；拟合仅使用测试期之前已成熟标签",
                          "survivorship": "逐日历史名单包含退市股；资料、状态或非停牌信号特征缺失时拒绝生成绩效",
@@ -526,7 +564,7 @@ def run(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame], destinatio
                                "buy_lot_shares": {"main_and_chinext": 100, "star_minimum": 200}, "sell_after_next_day": True},
                "limitations": ["历史股票池由供应商回填数据重建，不能证明过去每个信号日实际收到同版数据。",
                                "涨跌停价按历史基准价及交易规则重建，特殊无涨跌停情形可能需交易所原始记录核实。",
-                               ("回测重放逐窗口训练规则，不是当前发布模型权重的历史收益。" if strategy in MODEL_STRATEGIES
+                               ("回测冻结所选 checkpoint；仅评估其训练标签结束后的历史数据。" if strategy in MODEL_STRATEGIES
                                 else "固定规则参数未根据本次评估结果调优。"),
                                "5分钟OHLCV没有盘口；VWAP、成交参与比例和滑点仍为模拟假设。",
                                "现金分红统一预留20%税款；长期持有可能多预留，送股税及精确补扣时点未建模。",

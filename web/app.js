@@ -8,6 +8,8 @@ const requestedReport = new URLSearchParams(window.location.search).get('report'
 const rankingMeta = document.querySelector('#rankingMeta')
 const rankingContent = document.querySelector('#rankingContent')
 const rankingStrategy = document.querySelector('#rankingStrategy')
+const rankingKind = document.querySelector('#rankingKind')
+let rankingOptions = null
 const rankMarketButton = document.querySelector('#rankMarketButton')
 let rankingStrategyChosen = false
 let rankingJob = null
@@ -20,6 +22,8 @@ const sectorChart = document.querySelector('#sectorChart')
 const horizonContent = document.querySelector('#horizonContent')
 const portfolioContent = document.querySelector('#portfolioContent')
 const portfolioStrategy = document.querySelector('#portfolioStrategy')
+const portfolioKind = document.querySelector('#portfolioKind')
+let portfolioOptions = null
 let portfolioStrategyChosen = false
 let portfolioAnalyzing = false
 let currentView = {}
@@ -164,7 +168,8 @@ function showInsights(payload) {
   renderHorizon()
   if (changedReport) {
     portfolioContent.replaceChildren()
-    document.querySelector('#portfolioMeta').textContent = '默认不读取持仓；点击后按当前公开数据分析。'
+    document.querySelector('#portfolioMeta').textContent = portfolioKind.value === 'model' && !portfolioStrategy.value
+      ? '没有已训练模型，请先在控制面板训练。' : '默认不读取持仓；点击后按当前公开数据分析。'
   }
 }
 
@@ -185,23 +190,91 @@ function friendlyMissing(values) {
   }))].join('；') || '无'
 }
 
+const executionParameterDrafts = new Map()
+
+function renderExecutionParameters(prefix, select, payload) {
+  const container = document.getElementById(`${prefix}Parameters`)
+  if (!container) return
+  container.replaceChildren()
+  const item = payload?.strategies?.[select.value]
+  if (!item) return
+  const draftKey = `${prefix}:${select.value}`
+  const draft = executionParameterDrafts.get(draftKey) || {...item.parameters}
+  executionParameterDrafts.set(draftKey, draft)
+  for (const [key, spec] of Object.entries(item.parameter_schema || {})) {
+    const label = document.createElement('label')
+    label.className = 'select-control'
+    label.append(textNode('span', spec.label))
+    const input = document.createElement('input')
+    input.type = 'number'; input.min = spec.min; input.max = spec.max
+    input.step = spec.type === 'integer' ? '1' : 'any'
+    input.value = draft[key] ?? spec.default
+    input.dataset.parameter = key
+    input.required = true
+    input.addEventListener('input', () => { draft[key] = input.value })
+    label.append(input); container.append(label)
+  }
+  const reset = textNode('button', '恢复推荐默认值')
+  reset.type = 'button'
+  reset.addEventListener('click', () => {
+    executionParameterDrafts.set(draftKey, Object.fromEntries(Object.entries(item.parameter_schema).map(([key, spec]) => [key, spec.default])))
+    renderExecutionParameters(prefix, select, payload)
+  })
+  container.append(reset)
+  if (item.training_parameters && Object.keys(item.training_parameters).length) {
+    const parameters = Object.entries(item.training_parameters).map(([key, value]) => `${item.training_parameter_schema?.[key]?.label || key}：${value}`).join(' · ')
+    container.append(textNode('p', `此 checkpoint 的训练参数：${parameters}`, 'ranking-note'))
+  }
+  if (item.training_range) {
+    container.append(textNode('p', `训练集 ${item.training_range.requested_start || item.training_range.first_day || '历史版本未记录'} 至 ${item.training_range.requested_end || item.training_range.last_day} · 训练标签截至 ${item.training_range.label_end_day || '未记录'}；部署使用此 checkpoint 的冻结权重。`, 'ranking-note'))
+  }
+}
+
+function executionParameters(prefix) {
+  const parameters = {}
+  for (const input of document.querySelectorAll(`#${prefix}Parameters input[data-parameter]`)) {
+    if (!input.reportValidity()) throw Error('请修正策略超参数。')
+    parameters[input.dataset.parameter] = Number(input.value)
+  }
+  return parameters
+}
+
+function fillExecutionSelect(kind, select, payload, selected = '') {
+  const items = kind.value === 'model' ? payload.models : payload.fixed_strategies
+  select.replaceChildren()
+  for (const [id, item] of Object.entries(items || {})) select.add(new Option(item.name, id))
+  if ([...select.options].some(option => option.value === selected)) select.value = selected
+  select.disabled = !select.options.length
+  renderExecutionParameters(select === rankingStrategy ? "ranking" : "portfolio", select, payload)
+}
+
 async function loadPortfolioStrategies() {
   if (portfolioAnalyzing) return
   try {
     const payload = await requestJson('/api/portfolio-strategies')
     if (portfolioAnalyzing) return
     const selected = portfolioStrategyChosen ? portfolioStrategy.value : payload.selected
-    portfolioStrategy.replaceChildren()
-    for (const [id, strategy] of Object.entries(payload.strategies || {})) portfolioStrategy.add(new Option(strategy.name, id))
-    portfolioStrategy.value = selected
-    portfolioStrategy.disabled = false
+    portfolioOptions = payload
+    if (!portfolioStrategyChosen) portfolioKind.value = payload.selected_kind || (selected?.includes('@') ? 'model' : 'fixed')
+    fillExecutionSelect(portfolioKind, portfolioStrategy, payload, selected)
+    document.querySelector('#portfolioButton').disabled = portfolioStrategy.disabled
+    if (portfolioStrategy.disabled) document.querySelector('#portfolioMeta').textContent = '没有已训练模型，请先在控制面板训练。'
   } catch (error) {
-    portfolioStrategy.replaceChildren(new Option('沿用控制面板所选策略', ''))
+    portfolioStrategy.replaceChildren()
     portfolioStrategy.disabled = true
+    document.querySelector('#portfolioButton').disabled = true
   }
 }
+portfolioKind.addEventListener('change', () => {
+  portfolioStrategyChosen = true
+  if (portfolioOptions) fillExecutionSelect(portfolioKind, portfolioStrategy, portfolioOptions)
+  document.querySelector('#portfolioButton').disabled = !portfolioStrategy.value
+  portfolioContent.replaceChildren()
+  document.querySelector('#portfolioMeta').textContent = portfolioStrategy.value ? '请选择策略或 checkpoint 后分析持仓。' : '没有已训练模型，请先在控制面板训练。'
+})
 portfolioStrategy.addEventListener('change', () => {
   portfolioStrategyChosen = true
+  renderExecutionParameters("portfolio", portfolioStrategy, portfolioOptions)
   portfolioContent.replaceChildren()
   document.querySelector('#portfolioMeta').textContent = '策略已切换，请重新点击分析；本页选择不会修改控制面板配置。'
 })
@@ -249,19 +322,22 @@ document.querySelector('#portfolioButton').addEventListener('click', async event
   const requestedReportId = displayedReportId
   button.disabled = true
   if (!portfolioStrategyChosen) await loadPortfolioStrategies()
+  if (!portfolioStrategy.value) { button.disabled = true; return }
   if (requestedReportId !== displayedReportId) { button.disabled = false; return }
   const selectedStrategy = portfolioStrategy.value
   const strategyWasDisabled = portfolioStrategy.disabled
   portfolioStrategy.disabled = true
+  portfolioKind.disabled = true
   portfolioAnalyzing = true
   document.querySelector('#portfolioMeta').textContent = '正在分析财报、估值、技术面与所选策略，生成三组研究配置…'
   portfolioContent.replaceChildren()
   try {
-    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket, 'X-Portfolio-Strategy': selectedStrategy}})
+    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket, 'X-Portfolio-Strategy': selectedStrategy, 'X-Strategy-Parameters': JSON.stringify(executionParameters('portfolio'))}})
     const payload = await response.json()
     if (requestedReportId !== displayedReportId) return
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`)
     document.querySelector('#portfolioMeta').textContent = payload.note || ''
+    if (payload.strategy_review?.checkpoint_id) document.querySelector('#portfolioMeta').textContent += ` · checkpoint ${payload.strategy_review.checkpoint_id} · 训练 ${payload.strategy_review.checkpoint_trained_at}`
     if (!payload.available) { portfolioContent.append(textNode('p', '当前市场没有已保存持仓。', 'empty-note')); return }
     renderPositionSummary(payload)
     const list = document.createElement('div'); list.className = 'watch-grid'
@@ -278,7 +354,7 @@ document.querySelector('#portfolioButton').addEventListener('click', async event
     portfolioContent.append(list)
   } catch (error) { document.querySelector('#portfolioMeta').textContent = `持仓分析失败：${error.message}` }
   finally {
-    button.disabled = false; portfolioAnalyzing = false; portfolioStrategy.disabled = strategyWasDisabled
+    button.disabled = !portfolioStrategy.value; portfolioAnalyzing = false; portfolioStrategy.disabled = strategyWasDisabled; portfolioKind.disabled = false
     if (strategyWasDisabled) loadPortfolioStrategies()
   }
 })
@@ -382,37 +458,43 @@ async function loadRankingStrategies() {
     const payload = await requestJson('/api/ranking/strategies')
     if (rankingJob || rankingStarting) return
     const previous = rankingStrategyChosen ? rankingStrategy.value : payload.selected
-    rankingStrategy.replaceChildren()
-    for (const [kind, label] of [['fixed_rule', '固定交易策略'], ['model', '已训练因子模型']]) {
-      const group = document.createElement('optgroup'); group.label = label
-      for (const [id, strategy] of Object.entries(payload.strategies || {})) {
-        if (strategy.kind !== kind) continue
-        group.append(new Option(strategy.name + (strategy.trained_at ? ` · 训练 ${strategy.trained_at.slice(0, 10)}` : ''), id))
-      }
-      if (group.children.length) rankingStrategy.append(group)
-    }
-    if ([...rankingStrategy.options].some(option => option.value === previous)) rankingStrategy.value = previous
-    rankingStrategy.disabled = !rankingStrategy.options.length
+    rankingOptions = payload
+    if (!rankingStrategyChosen) rankingKind.value = payload.selected_kind || (previous?.includes('@') ? 'model' : 'fixed')
+    fillExecutionSelect(rankingKind, rankingStrategy, payload, previous)
     rankMarketButton.disabled = rankingStrategy.disabled
-    document.querySelector('#rankingOptionsNote').textContent = Object.entries(payload.unavailable_models || {})
-      .map(([id, reason]) => `${id === 'xgboost' ? 'XGBoost' : 'Elastic Net'}：${reason}`).join(' ')
+    document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.disabled ? '没有已训练模型，请先在控制面板训练。' : ''
     await loadRanking()
   } catch (error) {
+    rankingStrategy.replaceChildren(); rankingStrategy.disabled = true; rankMarketButton.disabled = true
     document.querySelector('#rankingOptionsNote').textContent = `可用策略暂不可读：${error.message}`
   }
 }
+rankingKind.addEventListener('change', () => {
+  rankingStrategyChosen = true
+  if (rankingOptions) fillExecutionSelect(rankingKind, rankingStrategy, rankingOptions)
+  rankMarketButton.disabled = !rankingStrategy.value
+  rankingPage = 0; rankingPayload = null; rankingContent.replaceChildren()
+  document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.value ? '' : '没有已训练模型，请先在控制面板训练。'
+  loadRanking()
+})
 
 function renderRanking(payload) {
   rankingPayload = payload
   if (!payload.available || payload.scope !== 'full_market') {
-    rankingMeta.textContent = '所选策略尚未生成全市场盘中排序。点击“开始盘中排序”获取结果。'
+    rankingMeta.textContent = '所选策略尚未生成全市场盘中策略部署。点击“开始盘中策略部署”获取结果。'
     rankingContent.replaceChildren()
     return
   }
   const quality = payload.model_quality === 'exploratory' ? '探索性模拟' : (payload.model_quality === 'fixed_rule' ? '固定规则' : '研究模型')
   const signal = new Date(payload.signal_at || payload.generated_at).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})
   const completed = new Date(payload.completed_at || payload.generated_at).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})
-  rankingMeta.textContent = `信号 ${signal} · 完成 ${completed}（北京时间） · ${quality} ${payload.strategy_name} · 全市场快照 ${payload.universe_count} 只 / 符合范围 ${payload.input_count} 只 / 有效 ${payload.valid_count} 只 / 缺失 ${payload.failed_count} 只${payload.coverage_complete ? '' : ' · 有效子集排序'}`
+  rankingMeta.textContent = `信号 ${signal} · 完成 ${completed}（北京时间） · ${quality} ${payload.strategy_name} · 全市场快照 ${payload.universe_count} 只 / 符合范围 ${payload.input_count} 只 / 有效 ${payload.valid_count} 只 / 缺失 ${payload.failed_count} 只${payload.coverage_complete ? '' : ' · 有效子集策略部署'}`
+  if (payload.strategy_parameters) {
+    const schema = rankingOptions?.strategies?.[rankingStrategy.value]?.parameter_schema || {}
+    const used = Object.entries(payload.strategy_parameters).map(([key, value]) => `${schema[key]?.label || key}=${value}`).join(' · ')
+    rankingMeta.textContent += ` · 本次结果参数：${used}`
+  }
+  if (payload.checkpoint_id) rankingMeta.textContent += ` · checkpoint ${payload.checkpoint_id}`
   const rows = payload.ranking || []
   const pageCount = Math.max(1, Math.ceil(rows.length / 50))
   rankingPage = Math.min(rankingPage, pageCount - 1)
@@ -423,7 +505,7 @@ function renderRanking(payload) {
   const body = document.createElement('tbody')
   for (const item of rows.slice(rankingPage * 50, (rankingPage + 1) * 50)) {
     const row = document.createElement('tr')
-    const status = item.entry === null ? '模型评分' : item.entry ? '已触发' : '未触发'
+    const status = payload.deployment_candidates?.includes(item.symbol) ? '部署候选' : item.entry === null ? '模型评分' : item.entry ? '已触发' : '未触发'
     for (const value of [item.rank, item.symbol, item.name, item.price, item.score, status]) row.append(textNode('td', value))
     body.append(row)
   }
@@ -460,9 +542,10 @@ function finishRankingJob() {
   rankingJob = null
   rankingStarting = false
   clearTimeout(rankingPollTimer)
-  rankingStrategy.disabled = false
-  rankMarketButton.disabled = false
-  rankMarketButton.textContent = '开始盘中排序'
+  rankingStrategy.disabled = !rankingStrategy.options.length
+  rankingKind.disabled = false
+  rankMarketButton.disabled = !rankingStrategy.value
+  rankMarketButton.textContent = '开始盘中策略部署'
 }
 
 async function pollRankingJob() {
@@ -486,14 +569,16 @@ rankMarketButton.addEventListener('click', async () => {
   if (rankingJob || rankingStarting || !rankingStrategy.value) return
   rankingStarting = true
   const strategy = rankingStrategy.value
-  rankingStrategy.disabled = true; rankMarketButton.disabled = true
-  rankMarketButton.textContent = '排序处理中…'
-  rankingMeta.textContent = '正在启动全市场盘中排序…'
+  rankingStrategy.disabled = true; rankingKind.disabled = true; rankMarketButton.disabled = true
+  rankMarketButton.textContent = '策略部署处理中…'
+  rankingMeta.textContent = '正在启动全市场盘中策略部署…'
   try {
-    const response = await fetch('/api/ranking/start', {method: 'POST', headers: {'X-Ranking-Strategy': strategy, 'X-Report-Market': 'a'}})
+    const requestedParameters = executionParameters('ranking')
+    const response = await fetch('/api/ranking/start', {method: 'POST', headers: {'X-Ranking-Strategy': strategy, 'X-Strategy-Parameters': JSON.stringify(requestedParameters), 'X-Report-Market': 'a'}})
     const state = await response.json()
-    if (response.status === 409 && state.strategy_id !== strategy) {
-      throw Error(`已有 ${state.strategy_name} 全市场排序任务正在运行，请完成后重试。`)
+    if (response.status === 409 && ((state.selection_id || state.strategy_id) !== strategy
+        || Object.entries(requestedParameters).some(([key, value]) => state.strategy_parameters?.[key] !== value))) {
+      throw Error(`已有 ${state.strategy_name} 全市场策略部署任务正在运行，请完成后重试。`)
     }
     if (!response.ok && response.status !== 409) throw Error(state.error || `HTTP ${response.status}`)
     rankingJob = state
@@ -501,11 +586,12 @@ rankMarketButton.addEventListener('click', async () => {
     rankingContent.replaceChildren(); rankingPayload = null
     await pollRankingJob()
   } catch (error) {
-    finishRankingJob(); rankingMeta.textContent = `盘中排序未启动：${error.message}`
+    finishRankingJob(); rankingMeta.textContent = `盘中策略部署未启动：${error.message}`
   }
 })
 rankingStrategy.addEventListener('change', () => {
   rankingStrategyChosen = true; rankingPage = 0; rankingPayload = null
+  renderExecutionParameters("ranking", rankingStrategy, rankingOptions)
   rankingContent.replaceChildren(); loadRanking()
 })
 

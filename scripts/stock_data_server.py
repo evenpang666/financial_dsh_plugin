@@ -1392,10 +1392,15 @@ def horizon_recommendations(candidates: dict, market: str, panorama: dict):
             "horizons": result, "note": "仅为有限候选池的研究观察名单；证据不足时留空，不代表全市场最优或个性化买入建议。"}
 
 
-def portfolio_analysis_response(market: str = "a", strategy: str = ""):
-    from portfolio_research import selected_strategy, strategy_review, build_position_summary
+def portfolio_analysis_response(market: str = "a", strategy: str = "", checkpoint_id: str = "", parameters=None):
+    from portfolio_research import strategy_review, build_position_summary
     market = normalize_market(market)
-    strategy = selected_strategy(strategy)
+    from model_checkpoints import resolve_selection
+    from factor_lab import load_settings, STORE
+    if not strategy:
+        settings = load_settings()
+        strategy, checkpoint_id = settings["strategy"], checkpoint_id or settings.get("checkpoint_id", "")
+    strategy, checkpoint_id, _ = resolve_selection(strategy, checkpoint_id, STORE)
     holdings = [item for item in portfolio_response()["holdings"] if item.get("market", "a") == market]
     if not holdings:
         return {"market": market, "available": False, "holdings": [], "note": "未保存该市场持仓，无法分析。"}
@@ -1428,7 +1433,7 @@ def portfolio_analysis_response(market: str = "a", strategy: str = ""):
                 "strategy": f"{item.get('recommendation', {}).get('conclusion', '信息不足')}；{horizon}。仅基于当前公开数据，不自动交易。"}
     with ThreadPoolExecutor(max_workers=min(4, len(holdings))) as executor:
         analyzed = list(executor.map(analyze, holdings))
-    strategy_result = strategy_review(analyzed, strategy, market)
+    strategy_result = strategy_review(analyzed, strategy, market, checkpoint_id=checkpoint_id, parameters=parameters)
     summary = build_position_summary(analyzed, panorama, strategy_result)
     # Raw quote fields are transient strategy inputs, not needed by the UI.
     for item in analyzed:
@@ -1604,7 +1609,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/portfolio":
                 return self.send_json(200, portfolio_response())
             if parsed.path == "/v1/portfolio-analysis":
-                return self.send_json(200, portfolio_analysis_response(value("market", "a"), value("strategy")))
+                return self.send_json(200, portfolio_analysis_response(value("market", "a"), value("strategy"), value("checkpoint"),
+                                                                           json.loads(value("parameters", "null"))))
+            if parsed.path == "/v1/strategy-options":
+                from model_checkpoints import execution_options
+                from factor_lab import load_settings, STORE
+                return self.send_json(200, execution_options(STORE, load_settings()))
             if parsed.path == "/v1/search":
                 limit = min(max(int(value("limit", "10")), 1), 50)
                 return self.send_json(200, stock_search_response(value("query"), limit, value("market", "a")))

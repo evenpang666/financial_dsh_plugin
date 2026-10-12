@@ -61,7 +61,7 @@ class StrategyTests(unittest.TestCase):
                              for row in samples]
                 actual, _, _ = factor_backtest.rule_strategy_signals(unlabeled, universe, "14:00", states, strategy)
                 self.assertEqual(actual, expected)
-                self.assertEqual(len(actual), 20)
+                self.assertEqual(len(actual), 140)
                 self.assertTrue(all(actual.values()))
         frame = pd.DataFrame([{"open_momentum": 0, "vwap_gap": 0, "range_position": 0, "range_width": 0.001,
                               "ma_spread": 0, "ma_spread_prev": 0, "macd_hist": 0, "macd_hist_prev": 0,
@@ -75,24 +75,25 @@ class StrategyTests(unittest.TestCase):
         inputs = replay_fixture()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            factor_lab.write_json(root / "source-manifest.json", {"requested_start": "2025-01-01", "requested_end": "2025-07-15"})
             with (patch.object(factor_lab, "BACKTESTS", root),
                   patch.object(factor_lab, "SOURCE_MANIFEST", root / "source-manifest.json"),
                   patch.object(factor_lab, "backtest_inputs", return_value=inputs) as load,
-                  patch.object(factor_lab, "load_settings", return_value={"strategy": "elastic_net", "backtest_slot": "14:00"}),
+                  patch.object(factor_lab, "load_settings", return_value={"strategy": "elastic_net", "backtest_slot": "14:00", "backtest_start": "2025-01-01", "backtest_end": "2025-07-15"}),
                   patch.object(factor_lab, "notify_backtest"),
                   patch.object(factor_models, "_XGB_DEVICE", "cpu")):
                 result = factor_lab.backtest_all_from_cache()
             load.assert_called_once()
             self.assertFalse(result["failed"])
             plan = json.loads(next((root / "plans").glob("*.json")).read_text())
-            self.assertEqual(set(plan["strategy_ids"]), set(STRATEGIES))
+            self.assertEqual(set(plan["strategy_ids"]), set(FIXED_STRATEGIES))
             self.assertEqual(plan["previous_batches_on_dataset"], 0)
-            self.assertEqual({run["strategy_id"] for run in result["completed"]}, set(STRATEGIES))
+            self.assertEqual({run["strategy_id"] for run in result["completed"]}, set(FIXED_STRATEGIES))
             periods = {(run["first_day"], run["last_day"], run["days"]) for run in result["completed"]}
             self.assertEqual(len(periods), 1)
             with patch.object(report_web_server, "BACKTEST_DIR", root):
                 runs = report_web_server.backtest_runs()
-                self.assertEqual(len(runs), len(STRATEGIES))
+                self.assertEqual(len(runs), len(FIXED_STRATEGIES))
                 for run in runs:
                     detail = report_web_server.read_backtest(run["run_id"], curve=True)
                     self.assertEqual(len(detail["curve"]), run["days"])
@@ -110,24 +111,26 @@ class StrategyTests(unittest.TestCase):
         def run(samples, bars_by_symbol, destination, **options):
             self.assertEqual(len(list((destination.parent / "plans").glob("*.json"))), 1)
             strategy = options["strategy"]
-            if strategy == "elastic_net":
-                raise RuntimeError("模拟训练失败")
+            if strategy == "momentum":
+                raise RuntimeError("模拟策略失败")
             return {"strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
                     "days": 20, "stats": {"total_return": 0, "max_drawdown": 0}}
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            factor_lab.write_json(root / "source-manifest.json", {"requested_start": "2025-01-01", "requested_end": "2025-07-15"})
             with (patch.object(factor_lab, "BACKTESTS", root),
-                  patch.object(factor_lab, "backtest_inputs", return_value=([], {}, None, None)),
-                  patch.object(factor_lab, "load_settings", return_value={"strategy": "xgboost", "backtest_slot": "14:00"}),
+                  patch.object(factor_lab, "SOURCE_MANIFEST", root / "source-manifest.json"),
+                  patch.object(factor_lab, "backtest_inputs", return_value=replay_fixture()),
+                  patch.object(factor_lab, "load_settings", return_value={"strategy": "xgboost", "backtest_slot": "14:00", "backtest_start": "2025-01-01", "backtest_end": "2025-07-15"}),
                   patch.object(factor_lab, "notify_backtest"), patch.object(factor_backtest, "run", side_effect=run) as runner):
-                with self.assertRaisesRegex(RuntimeError, f"{len(STRATEGIES) - 1} 项回测完成，1 项失败"):
+                with self.assertRaisesRegex(RuntimeError, f"{len(FIXED_STRATEGIES) - 1} 项回测完成，1 项失败"):
                     factor_lab.backtest_all_from_cache()
-            self.assertEqual(runner.call_count, len(STRATEGIES))
+            self.assertEqual(runner.call_count, len(FIXED_STRATEGIES))
             batch = json.loads(next((root / "batches").glob("*.json")).read_text())
-            self.assertEqual(len(batch["completed"]), len(STRATEGIES) - 1)
-            self.assertEqual(batch["failed"], {"elastic_net": "模拟训练失败"})
-            self.assertEqual(len(list(root.glob("*/summary.json"))), len(STRATEGIES) - 1)
+            self.assertEqual(len(batch["completed"]), len(FIXED_STRATEGIES) - 1)
+            self.assertEqual(batch["failed"], {"momentum": "模拟策略失败"})
+            self.assertEqual(len(list(root.glob("*/summary.json"))), len(FIXED_STRATEGIES) - 1)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -35,6 +36,8 @@ TOKEN_FILE = ROOT / "config" / "tushare.token"
 CHINA = timezone(timedelta(hours=8))
 TOP_N = 40
 MIN_CANDIDATES = 12
+BAOSTOCK_SOCKET_TIMEOUT = 30
+BAOSTOCK_MESSAGE_TIMEOUT = 60
 FIELDS = {
     "trade_cal": "exchange,cal_date,is_open,pretrade_date",
     "daily": "ts_code,trade_date,open,high,low,close,pre_close,vol,amount",
@@ -80,12 +83,112 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _baostock_login(bs) -> None:
+class BaoStockNetworkError(RuntimeError):
+    """A failed transport must not look like an empty or truncated vendor reply."""
+
+
+class _BoundedBaoSocket:
+    """Keep the SDK's protocol, but bound reads and reject a closed connection."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.deadline = 0.0
+        self.failure = None
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def _set_timeout(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"响应超过 {BAOSTOCK_MESSAGE_TIMEOUT} 秒")
+        self.connection.settimeout(min(BAOSTOCK_SOCKET_TIMEOUT, remaining))
+
+    def send(self, data):
+        try:
+            self._set_timeout()
+            self.connection.sendall(data)
+            return len(data)
+        except OSError as exc:
+            self.failure = exc
+            raise
+
+    def recv(self, size):
+        try:
+            self._set_timeout()
+            data = self.connection.recv(size)
+            if not data:
+                raise ConnectionError("服务器关闭了连接，响应未接收完整")
+            return data
+        except OSError as exc:
+            self.failure = exc
+            raise
+
+
+def _install_baostock_transport() -> None:
+    # These modules are loaded by bs.login's imports. Keeping the SDK's own
+    # framing/decompression avoids depending on a copied protocol implementation.
+    transport = sys.modules.get("baostock.util.socketutil")
+    context = sys.modules.get("baostock.common.context")
+    if transport is None or context is None or getattr(transport.send_msg, "_bounded", False):
+        return
+    original = transport.send_msg
+
+    def bounded_send(message):
+        connection = getattr(context, "default_socket", None)
+        if connection is None:
+            raise BaoStockNetworkError("BaoStock 连接不可用。")
+        if not isinstance(connection, _BoundedBaoSocket):
+            connection = _BoundedBaoSocket(connection)
+            context.default_socket = connection
+        connection.failure = None
+        connection.deadline = time.monotonic() + BAOSTOCK_MESSAGE_TIMEOUT
+        reply = original(message)
+        # The SDK catches socket errors and otherwise returns None. Re-raise so
+        # pagination cannot quietly publish a partial result as successful data.
+        if connection.failure is not None:
+            raise BaoStockNetworkError(f"BaoStock 网络请求失败：{connection.failure}") from connection.failure
+        if reply is None:
+            raise BaoStockNetworkError("BaoStock 未返回完整响应。")
+        return reply
+
+    bounded_send._bounded = True
+    transport.send_msg = bounded_send
+
+
+def _close_baostock_connection() -> None:
+    context = sys.modules.get("baostock.common.context")
+    connection = getattr(context, "default_socket", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+        context.default_socket = None
+
+
+def _baostock_logout(bs) -> None:
     try:
+        bs.logout()
+    except (OSError, BaoStockNetworkError):
+        pass
+    finally:
+        _close_baostock_connection()
+
+
+def _baostock_login(bs) -> None:
+    _install_baostock_transport()
+    previous_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(BAOSTOCK_SOCKET_TIMEOUT)
         login = bs.login()
-    except (OSError, UnboundLocalError) as exc:
-        raise RuntimeError("BaoStock 连接失败；请检查网络后重试，已下载的历史缓存会保留。") from exc
+    except (OSError, UnboundLocalError, BaoStockNetworkError) as exc:
+        _close_baostock_connection()
+        raise BaoStockNetworkError("BaoStock 连接失败；请检查网络后重试，已下载的历史缓存会保留。") from exc
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
     if login.error_code != "0":
+        _close_baostock_connection()
         raise RuntimeError(f"BaoStock 登录失败：{login.error_msg}")
 
 
@@ -155,7 +258,7 @@ def fetch_calendar_baostock(start: str, end: str) -> pd.DataFrame:
         first = (pd.Timestamp(start) - pd.Timedelta(days=21)).strftime("%Y-%m-%d")
         frame = _bs_rows(bs.query_trade_dates(start_date=first, end_date=end), "交易日历")
     finally:
-        bs.logout()
+        _baostock_logout(bs)
     open_days = frame.loc[frame.is_trading_day.astype(str).eq("1"), "calendar_date"].astype(str).tolist()
     if len(open_days) < 2:
         raise RuntimeError("BaoStock 交易日历缺少前一交易日。")
@@ -173,7 +276,7 @@ def fetch_stock_basic_baostock() -> pd.DataFrame:
     try:
         frame = _bs_rows(bs.query_stock_basic(), "上市资料")
     finally:
-        bs.logout()
+        _baostock_logout(bs)
     frame = frame[frame.type.astype(str).eq("1")].copy()
     frame["symbol"] = frame.code.astype(str).str.split(".").str[-1]
     frame = frame[frame.symbol.str.fullmatch(r"[036]\d{5}")]
@@ -356,7 +459,7 @@ def collect_public(start: str, end: str, raw: Path = RAW) -> tuple[list[str], st
             day_rows = day_rows.rename(columns={"symbol": "ts_code"})[["trade_date", "ts_code", "amount"]]
             _atomic_csv(day_rows, raw / "daily-public" / f"{day}.csv")
     finally:
-        bs.logout()
+        _baostock_logout(bs)
     return days, f"BaoStock historical whole-market unadjusted daily amount; {calendar_source}"
 
 
@@ -498,11 +601,15 @@ def construct_market_state(universe: pd.DataFrame, calendar: pd.DataFrame,
 
 
 def _bs_rows(result, label: str) -> pd.DataFrame:
+    if result is None:
+        raise BaoStockNetworkError(f"BaoStock {label} 未返回完整响应。")
     if result.error_code != "0":
         raise RuntimeError(f"BaoStock {label} 失败：{result.error_msg}")
     rows = []
     while result.next():
         rows.append(result.get_row_data())
+    if result.error_code != "0":
+        raise RuntimeError(f"BaoStock {label} 分页失败：{result.error_msg}")
     return pd.DataFrame(rows, columns=result.fields)
 
 
@@ -530,7 +637,7 @@ def fetch_daily_status_baostock(symbols: list[str], start: str, end: str,
             if index % 20 == 0 or index == len(symbols):
                 print(f"已核对 {index}/{len(symbols)} 只股票的逐日状态", flush=True)
     finally:
-        bs.logout()
+        _baostock_logout(bs)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -632,7 +739,7 @@ def fetch_actions_baostock(symbols: list[str], years: list[int],
             if index % 20 == 0 or index == len(symbols):
                 print(f"已核对 {index}/{len(symbols)} 只股票的公司行为", flush=True)
     finally:
-        bs.logout()
+        _baostock_logout(bs)
     if not collected:
         raise RuntimeError("没有历史候选股票。")
     source = pd.concat(collected, ignore_index=True).drop_duplicates()
@@ -855,8 +962,8 @@ def _minute_cache_complete(frame: pd.DataFrame, required_days: list[str]) -> boo
     if minute_quality_issues(frame):
         return False
     times = pd.to_datetime(frame.time, errors="coerce")
-    return all(set(times[times.dt.strftime("%Y-%m-%d").eq(day)]) == set(_minute_times(day))
-               for day in required_days)
+    observed = {day: set(group) for day, group in times.groupby(times.dt.strftime("%Y-%m-%d"))}
+    return all(observed.get(day, set()) == set(_minute_times(day)) for day in required_days)
 
 
 def strip_zero_placeholders(frame: pd.DataFrame) -> pd.DataFrame:
@@ -868,6 +975,27 @@ def strip_zero_placeholders(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.loc[~numeric.eq(0).all(axis=1)].copy()
 
 
+def _minute_history(bs, symbol: str, start: str, end: str) -> pd.DataFrame:
+    exchange = "sh" if symbol.startswith("6") else "sz"
+    for attempt in range(2):
+        try:
+            context = sys.modules.get("baostock.common.context")
+            if context is not None and getattr(context, "default_socket", None) is None:
+                _baostock_login(bs)
+            result = bs.query_history_k_data_plus(
+                f"{exchange}.{symbol}",
+                "date,time,code,open,high,low,close,volume,amount,adjustflag",
+                start_date=start, end_date=end, frequency="5", adjustflag="3")
+            return _bs_rows(result, f"{symbol} 五分钟线")
+        except BaoStockNetworkError as exc:
+            _close_baostock_connection()
+            if attempt == 1:
+                raise
+            print(f"{symbol} 分钟线连接中断或超时，正在重连后重试一次：{exc}", flush=True)
+            _baostock_login(bs)
+    raise AssertionError("unreachable")
+
+
 def _fetch_minute_chunk(items: list[tuple[str, str]], end: str,
                         bars_dir: Path, required_days: dict[str, list[str]],
                         raw: Path = RAW, daily_amounts: dict | None = None) -> tuple[int, list[str]]:
@@ -875,10 +1003,15 @@ def _fetch_minute_chunk(items: list[tuple[str, str]], end: str,
     import baostock as bs
     from factor_lab import normalized_bars, write_bars_cache
 
-    _baostock_login(bs)
     errors = []
+    session_ready = False
+    processed = 0
     try:
         for index, (symbol, start) in enumerate(items, 1):
+            processed = index
+            started = time.monotonic()
+            outcome = "下载并验收完成"
+            print(f"[分钟线 {index}/{len(items)}] {symbol}：检查缓存（{start} 至 {end}）…", flush=True)
             try:
                 path = bars_dir / f"{symbol}.csv"
                 try:
@@ -901,13 +1034,13 @@ def _fetch_minute_chunk(items: list[tuple[str, str]], end: str,
                 previous = clean_previous
                 if (required_days.get(symbol) and _minute_cache_complete(cached, required)
                         and not minute_quality_issues(cached, reference)):
+                    outcome = "使用完整缓存"
                     continue
-                exchange = "sh" if symbol.startswith("6") else "sz"
-                result = bs.query_history_k_data_plus(
-                    f"{exchange}.{symbol}",
-                    "date,time,code,open,high,low,close,volume,amount,adjustflag",
-                    start_date=start, end_date=end, frequency="5", adjustflag="3")
-                frame = _bs_rows(result, f"{symbol} 五分钟线")
+                print(f"{symbol}：正在下载历史 5 分钟线；单次响应最多等待 {BAOSTOCK_MESSAGE_TIMEOUT} 秒…", flush=True)
+                if not session_ready:
+                    _baostock_login(bs)
+                    session_ready = True
+                frame = _minute_history(bs, symbol, start, end)
                 if frame.empty and previous.empty:
                     raise RuntimeError("没有历史分钟线")
                 combined = previous
@@ -931,12 +1064,17 @@ def _fetch_minute_chunk(items: list[tuple[str, str]], end: str,
                 write_bars_cache(path, combined)
             except (RuntimeError, OSError, ValueError, KeyError) as exc:
                 errors.append(f"{symbol}: {exc}")
+                outcome = f"失败：{exc}"
+                if isinstance(exc, BaoStockNetworkError):
+                    print("分钟线网络请求重试仍失败，停止本次采集；已完成的缓存保留，下次可继续。", flush=True)
+                    break
             finally:
-                if index % 20 == 0 or index == len(items):
-                    print(f"已检查 {index}/{len(items)} 只股票的 5 分钟线；失败 {len(errors)}", flush=True)
+                print(f"已检查 {index}/{len(items)} 只股票的 5 分钟线；失败 {len(errors)}；"
+                      f"{symbol} {outcome}，耗时 {time.monotonic() - started:.1f} 秒", flush=True)
     finally:
-        bs.logout()
-    return len(items), errors
+        if session_ready:
+            _baostock_logout(bs)
+    return processed, errors
 
 
 def fetch_minutes_baostock(symbols: list[str], start: str, end: str,
@@ -1107,6 +1245,7 @@ def prepare(start: str, end: str, raw: Path = RAW, bars_dir: Path = BARS,
                 "data_schema_version": 2, "source_scope": "historical_vendor_reconstruction",
                 "created_at": datetime.now(CHINA).isoformat(timespec="seconds"),
                 "first_day": min(universe.day), "last_day": max(universe.day),
+                "requested_start": start, "requested_end": end,
                 "daily_source": daily_source, "status_source": "BaoStock unadjusted daily isST/tradestatus",
                 "listing_source": "BaoStock query_stock_basic",
                 "limit_source": "exchange-rule reconstruction from BaoStock ex-rights preclose; main-board ST 5% before 2026-07-06, 10% after; not exchange supplied exact limits",

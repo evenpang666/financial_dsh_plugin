@@ -9,52 +9,42 @@ import pandas as pd
 import factor_lab as lab
 from data_diagnostics import readable_issues
 from strategy_catalog import MODEL_STRATEGIES, RULE_FEATURES, STRATEGIES, TECHNICAL_STRATEGIES, rule_scores, validate_strategy
+from model_checkpoints import execution_options, resolve_selection
 
 STORE = lab.STORE
 
 
-def ranking_model(strategy, now):
-    model = lab.selected_model(strategy)
+def ranking_model(strategy, now, checkpoint_id):
+    model = lab.selected_model(strategy, checkpoint_id)
     if not model:
         raise ValueError("模型尚未完成有效训练，请在控制面板训练后刷新策略列表。")
     try:
         selected = datetime.fromisoformat(model["selected_at"])
         if selected.tzinfo is None:
             selected = selected.replace(tzinfo=lab.CHINA)
-        if not timedelta(0) <= now - selected <= timedelta(days=30):
-            raise ValueError("模型超过30天或训练日期异常，请重新训练。")
-        if model.get("quality") == "exploratory" and not timedelta(0) <= now.date() - pd.Timestamp(model["training"]["last_day"]).date() <= timedelta(days=7):
-            raise ValueError("探索性模型训练数据超过7天，请重新训练。")
+        if now < selected:
+            raise ValueError("checkpoint 训练日期晚于当前时间。")
     except (KeyError, TypeError) as exc:
         raise ValueError("模型训练信息不完整，请重新训练。") from exc
     return model
 
 
 def ranking_options():
-    now = lab.now_cn()
-    choices, unavailable = {}, {}
-    for strategy, definition in STRATEGIES.items():
-        if strategy not in MODEL_STRATEGIES:
-            choices[strategy] = {**definition, "kind": "fixed_rule"}
-            continue
-        try:
-            model = ranking_model(strategy, now)
-            choices[strategy] = {**definition, "kind": "model", "model_id": model["model_id"],
-                                 "trained_at": model["selected_at"], "quality": model.get("quality")}
-        except (ValueError, OSError) as exc:
-            unavailable[strategy] = str(exc)
-    selected = lab.load_settings()["strategy"]
-    return {"selected": selected if selected in choices else next(iter(choices)),
-            "strategies": choices, "unavailable_models": unavailable,
-            "scope": "full_market", "market": "a"}
+    options = execution_options(lab.STORE, lab.load_settings())
+    options["strategies"] = {key: {**item, "kind": "model" if "@" in key else "fixed_rule"}
+                             for key, item in options["strategies"].items()}
+    return {**options, "unavailable_models": {}, "scope": "full_market", "market": "a"}
 
 
-def rank_market(strategy, progress=lambda **state: None):
-    validate_strategy(strategy)
+def rank_market(strategy, progress=lambda **state: None, checkpoint_id=None, parameters=None):
+    strategy, checkpoint_id, _ = resolve_selection(strategy, checkpoint_id, lab.STORE)
+    from strategy_config import configured_parameters, validate_parameters
+    parameters = (configured_parameters(lab.load_settings(), strategy) if parameters is None
+                  else validate_parameters(strategy, parameters))
     started = lab.now_cn()
-    model = ranking_model(strategy, started) if strategy in MODEL_STRATEGIES else None
+    model = ranking_model(strategy, started, checkpoint_id) if strategy in MODEL_STRATEGIES else None
     if not lab.is_trading_time(started):
-        raise ValueError("全市场盘中排序仅在 A 股交易时段 09:35–11:30、13:00–15:00 可用。")
+        raise ValueError("全市场策略部署仅在 A 股交易时段 09:35–11:30、13:00–15:00 可用。")
     import akshare as ak
     calendar = ak.tool_trade_date_hist_sina()
     key = next((key for key in ("trade_date", "日期") if key in calendar.columns), None)
@@ -88,7 +78,7 @@ def rank_market(strategy, progress=lambda **state: None):
         def load(row):
             try:
                 item = {"holding": {"symbol": row["代码"]}, "quote": {"昨收": row.get("昨收")}}
-                record = load_signal_record(item, strategy, asof, previous[-1].isoformat())
+                record = load_signal_record(item, strategy, asof, previous[-1].isoformat(), parameters=parameters)
                 return {**record, "name": str(row["名称"]), "indicator_at": asof.isoformat()}, None
             except Exception as exc:
                 return None, {"symbol": row["代码"], "reason": readable_issues([f"策略信号不可用：{exc}"])[0]}
@@ -124,7 +114,7 @@ def rank_market(strategy, progress=lambda **state: None):
         data["entry"] = None
         features = model["features"]
     else:
-        data["score"], data["entry"] = rule_scores(data, strategy)
+        data["score"], data["entry"] = rule_scores(data, strategy, parameters)
         features = RULE_FEATURES[strategy]
     finite_scores = data.score.map(lambda value: lab.valid_number(value) is not None)
     for symbol in data.loc[~finite_scores, "symbol"]:
@@ -140,7 +130,9 @@ def rank_market(strategy, progress=lambda **state: None):
                      "entry": bool(row.entry) if model is None else None,
                      "factors": {key: round(float(row[key]), 6) for key in features},
                      **({"indicator_at": row.indicator_at} if strategy in TECHNICAL_STRATEGIES else {})})
-    note = "扫描全市场快照；范围为正常交易的沪深A股，剔除ST、退市标记、无成交及北交所股票。全部有效评分均保留；固定策略未触发入场的股票也参与评分，入场状态单独标注。"
+    selected = data if model else data[data.entry]
+    deployment = selected.head(parameters["top_n"]).symbol.tolist()
+    note = "扫描全市场快照；范围为正常交易的沪深A股，剔除ST、退市标记、无成交及北交所股票。全部有效评分均保留；经典策略未触发入场的股票也参与评分，入场状态单独标注。"
     if model:
         note += "现有模型训练股票池与全市场应用范围可能不同，扩大范围未经同口径回测验证；分数不是收益概率或买入指令。" + model.get("selection_warning", "")
     if strategy not in TECHNICAL_STRATEGIES:
@@ -150,21 +142,26 @@ def rank_market(strategy, progress=lambda **state: None):
     if failures:
         note += f"有 {len(failures)} 只符合范围的股票缺少有效评分，本次仅为有效子集排序。"
     payload = {"available": True, "id": fetched.strftime("%Y%m%d-%H%M%S-%f"), "scope": "full_market", "market": "a",
+               "strategy_parameters": parameters, "deployment_candidates": deployment,
                "strategy_id": strategy, "algorithm": strategy, "strategy_name": STRATEGIES[strategy]["name"],
                "generated_at": fetched.isoformat(timespec="seconds"), "completed_at": completed.isoformat(timespec="seconds"),
                "signal_at": asof.isoformat() if strategy in TECHNICAL_STRATEGIES else fetched.isoformat(timespec="seconds"),
                "model_quality": model.get("quality", "validated") if model else "fixed_rule",
                "model_id": model["model_id"] if model else None,
+               "checkpoint_id": model["model_id"] if model else None,
+               "checkpoint_trained_at": model["selected_at"] if model else None,
                "universe_count": total, "input_count": input_count, "excluded_count": total-input_count,
                "valid_count": len(data), "candidate_count": len(data), "failed_count": len(failures),
                "coverage_complete": len(data) == input_count, "entry_count": int(data.entry.sum()) if model is None else None,
                "ranking": rows, "failures": failures, "backtest_comparable": False, "note": note}
     lab.write_json(STORE / "rankings" / f"{payload['id']}.json", payload)
     lab.write_json(STORE / f"full-market-{strategy}.json", payload)
+    if model:
+        lab.write_json(STORE / f"full-market-{strategy}-{model['model_id']}.json", payload)
     return payload
 
 
-def run_job(strategy, job_id):
+def run_job(strategy, job_id, checkpoint_id=None):
     path = STORE / "ranking-jobs" / f"{job_id}.json"
     state = lab.read_json(path)
     def progress(**updates):
@@ -172,7 +169,7 @@ def run_job(strategy, job_id):
         state["updated_at"] = lab.now_cn().isoformat(timespec="seconds")
         lab.write_json(path, state)
     try:
-        result = rank_market(strategy, progress)
+        result = rank_market(strategy, progress, checkpoint_id, state.get("strategy_parameters"))
         progress(status="completed", message="盘中排序已完成", result=result)
     except Exception as exc:
         message = readable_issues([f"盘中排序不可用：{exc}"])[0] if any(key in str(exc) for key in ("HTTP", "Proxy", "https://", "Connection")) else str(exc)[:240]
@@ -184,7 +181,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--strategy", choices=tuple(STRATEGIES), required=True)
     parser.add_argument("--job-id", required=True)
+    parser.add_argument("--checkpoint")
     args = parser.parse_args()
     if not args.job_id.isalnum() or len(args.job_id) != 32:
         parser.error("invalid job id")
-    run_job(args.strategy, args.job_id)
+    run_job(args.strategy, args.job_id, args.checkpoint)

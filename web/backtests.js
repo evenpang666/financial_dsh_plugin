@@ -164,9 +164,11 @@ async function loadBacktestDetail(runId, target) {
     if (selectedBacktestRun !== runId || !target.isConnected) return
     const stats = payload.stats || {}
     target.replaceChildren(textNode('h3', payload.strategy_name))
-    if (payload.engine_version !== 4) target.append(textNode('p', '这是旧版引擎的历史结果。当前版本已修正区间突破阈值并新增技术指标策略；更早版本的订单预算与费用口径也有变更，请重新回测后比较。', 'ranking-note'))
+    if (payload.engine_version !== 6) target.append(textNode('p', '这是旧版引擎的历史结果。旧版经典策略可能扣除了 120 日预备期，早期模型回测可能滚动拟合；当前引擎按所选日期与参数评估，并冻结模型权重，请按各自口径比较。', 'ranking-note'))
     target.append(textNode('p', `${payload.first_day} 至 ${payload.last_day} · ${payload.days} 日 · ${payload.slot} 信号 / ${payload.execution} 成交 · ${new Date(payload.generated_at).toLocaleString('zh-CN')}`, 'insight-meta'))
+    if (payload.requested_start) target.append(textNode('p', `所选日期：${payload.requested_start} 至 ${payload.requested_end} · 候选/持仓上限：${payload.top_n} 只`, 'ranking-note'))
     if (payload.strategy_description) target.append(textNode('p', payload.strategy_description, 'ranking-note'))
+    if (payload.checkpoint_id) target.append(textNode('p', `checkpoint：${payload.checkpoint_id} · 训练时间：${payload.checkpoint_trained_at} · 训练标签截至：${payload.training_label_end} · 回测期间不重新拟合`, 'ranking-note'))
     if (payload.holding_policy) target.append(textNode('p', payload.holding_policy, 'ranking-note'))
     if (payload.audit?.selection_bias) target.append(textNode('p', payload.audit.selection_bias, 'ranking-note'))
     const metrics = [
@@ -220,7 +222,7 @@ async function loadBacktest() {
     const runs = payload.runs || []
     backtestContent.replaceChildren()
     rebuildBacktestIndex()
-    backtestMeta.textContent = runs.length ? `已保存 ${runs.length} 次回测。表格展示各策略最新结果；可切换历史记录查看净值、回撤与交易明细。` : '暂无已完成的策略回测。请在控制面板选择策略回测，或点击“回测全部策略”。'
+    backtestMeta.textContent = runs.length ? `已保存 ${runs.length} 次回测。表格展示各策略最新结果；可切换历史记录查看 checkpoint、净值、回撤与交易明细。` : '暂无已完成的策略回测。请在控制面板选择经典策略或已训练 checkpoint，或点击“回测全部经典策略”。'
     const wrapper = document.createElement('div'); wrapper.className = 'table-wrap'
     const table = document.createElement('table'); const head = document.createElement('thead'); const header = document.createElement('tr')
     for (const label of ['策略', '评估期间 / 信号', '累计收益', '最大回撤', 'Sharpe', '交易', '数据图']) header.append(textNode('th', label))
@@ -228,7 +230,7 @@ async function loadBacktest() {
     const body = document.createElement('tbody')
     const detail = document.createElement('div'); detail.className = 'backtest-detail'
     const selector = document.createElement('select'); selector.id = 'backtestRun'
-    for (const run of runs) selector.add(new Option(`${run.strategy_name} · ${run.slot} · ${new Date(run.generated_at).toLocaleString('zh-CN')}`, run.run_id))
+    for (const run of runs) selector.add(new Option(`${run.strategy_name}${run.checkpoint_id ? ` · checkpoint ${run.checkpoint_id}` : ''} · ${run.slot} · ${new Date(run.generated_at).toLocaleString('zh-CN')}`, run.run_id))
     selector.addEventListener('change', () => loadBacktestDetail(selector.value, detail))
     for (const [id, strategy] of Object.entries(payload.strategies || {})) {
       const run = runs.find(item => item.strategy_id === id)
@@ -250,7 +252,7 @@ async function loadBacktest() {
       selector.value = selectedBacktestRun
       await loadBacktestDetail(selectedBacktestRun, detail)
     }
-    const method = textNode('p', '各策略统一使用前一交易日股票池、T+1、涨跌停、费用与延后 VWAP 成交；为比较使用相同的 120 日预备期。不同日期、时点或数据版本的记录请分别比较。固定规则仅在触发条件时入场，无信号时保持现金。', 'ranking-note')
+    const method = textNode('p', '各策略统一使用前一交易日股票池、T+1、涨跌停、费用与延后 VWAP 成交；经典策略按所选日期评估，模型回测使用训练集及标签结束后的区间。不同日期、时点或数据版本的记录请分别比较。固定规则仅在触发条件时入场，无信号时保持现金。', 'ranking-note')
     method.id = 'backtestMethod'
     backtestContent.append(method)
     rebuildBacktestIndex(true)

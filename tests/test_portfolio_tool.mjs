@@ -17,10 +17,17 @@ test('portfolio review tool supports selected strategy, market, timeout and bund
     assert.ok(tool.parameters.properties.strategy.enum.includes('macd'))
     const result = await tool.execute({market: 'hk', strategy: 'macd'})
     assert.equal(result.available, true)
-    assert.match(requests[0].url, /\/v1\/portfolio-analysis\?market=hk&strategy=macd$/)
+    assert.match(requests[0].url, /\/v1\/portfolio-analysis\?market=hk&strategy=macd&checkpoint=&parameters=null$/)
     assert.ok(requests[0].options.signal instanceof AbortSignal)
     assert.equal(requests[0].options.method, undefined)
     assert.equal(requests.length, 1)
+    await tool.execute({market: 'a', strategy: 'elastic_net', checkpoint: '20261013-120000'})
+    assert.match(requests[1].url, /strategy=elastic_net&checkpoint=20261013-120000&parameters=null$/)
+    await tool.execute({market: 'a', strategy: 'momentum', parameters: {threshold: 0.01, top_n: 3}})
+    const query = new URL(requests[2].url).searchParams
+    assert.deepEqual(JSON.parse(query.get('parameters')), {threshold: 0.01, top_n: 3})
+    await tools.get('get_strategy_checkpoints').execute({})
+    assert.match(requests[3].url, /\/v1\/strategy-options$/)
     assert.ok(skills.get('portfolio-daily-review').content.includes('get_portfolio_position_review'))
   } finally { globalThis.fetch = originalFetch }
 })

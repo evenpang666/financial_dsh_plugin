@@ -158,6 +158,33 @@ class ResponsiveLayoutTests(unittest.TestCase):
         self.assertLess(self.panel.access_buttons.columns, 4)
         self.assertEqual(len(self.panel.web_buttons), 3)
 
+    def test_desktop_layout_shows_every_section_and_adapts_log_height(self):
+        for width in (1000, 1120, 1280):
+            with self.subTest(width=width):
+                self.resize(width, 800)
+                self.assert_controls_fit()
+                self.assertLessEqual(self.panel.body.winfo_reqheight(), self.panel.content_canvas.winfo_height())
+                self.assertEqual(self.panel.factor_fields.columns, 2)
+                self.assertLess(self.panel.access_section.winfo_x(), self.panel.factor_section.winfo_x())
+                self.assertLess(self.panel.access_section.winfo_y(), self.panel.maintenance_section.winfo_y())
+                for section in (self.panel.access_section, self.panel.factor_section,
+                                self.panel.maintenance_section, self.panel.log_box):
+                    self.assertLessEqual(section.winfo_y() + section.winfo_height(),
+                                         self.panel.content_canvas.winfo_height())
+        self.resize(1000, 800)
+        compact_height = self.panel.log_box.winfo_height()
+        self.resize(1000, 1000)
+        self.assertGreater(self.panel.log_box.winfo_height(), compact_height)
+
+    def test_initial_window_fits_measured_content_within_screen(self):
+        self.panel.update()
+        self.assertLessEqual(self.panel.winfo_height(), max(320, self.panel.winfo_screenheight() - 100))
+        required_height = (self.panel.header.winfo_reqheight() + self.panel.body.winfo_reqheight()
+                           + self.panel.footer.winfo_reqheight())
+        if required_height <= self.panel.winfo_screenheight() - 100:
+            self.assertGreaterEqual(self.panel.winfo_height(), required_height)
+            self.assertLessEqual(self.panel.winfo_height(), required_height + 24)
+
     def test_long_status_and_strategy_text_expand_scroll_region_without_resize(self):
         self.resize(520, 600)
         original_height = self.panel.body.winfo_height()
@@ -330,6 +357,7 @@ class BacktestPreparationTests(unittest.TestCase):
                       patch.object(control_panel.messagebox, "showinfo"),
                       patch.object(control_panel, "stream_command", side_effect=RuntimeError("数据准备失败：预热缺失")) as run,
                       patch.object(control_panel.threading, "Thread", ImmediateThread)):
+                    control_panel.write_json(control_panel.FACTOR_SETTINGS, {"strategy": "momentum"})
                     control_panel.ControlPanel.run_factor_action(panel, action, "回测中")
                 self.assertEqual(run.call_count, 1)
                 self.assertIn("factor_data_prep.py", run.call_args.args[0][1])
@@ -415,12 +443,13 @@ class BacktestPreparationTests(unittest.TestCase):
                   patch.object(control_panel.messagebox, "showinfo") as notice,
                   patch.object(control_panel, "stream_command", side_effect=run),
                   patch.object(control_panel.threading, "Thread", ImmediateThread)):
+                control_panel.write_json(control_panel.FACTOR_SETTINGS, {"strategy": "momentum"})
                 control_panel.ControlPanel.run_factor_action(Panel(), action, "回测中")
 
             notice.assert_called_once()
             self.assertEqual(commands[0], [str(control_panel.VENV_PYTHON), str(control_panel.FACTOR_PREP_SCRIPT),
                                            "--start", "2025-09-04", "--end", "2026-10-09"])
-            self.assertEqual(commands[1], [str(control_panel.VENV_PYTHON), str(control_panel.FACTOR_SCRIPT), action, "--strategy", "xgboost"])
+            self.assertEqual(commands[1], [str(control_panel.VENV_PYTHON), str(control_panel.FACTOR_SCRIPT), action, "--strategy", "momentum"])
             self.assertEqual(commands[2], (action, "completed"))
 
 

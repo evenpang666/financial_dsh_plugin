@@ -118,7 +118,9 @@ def rank_ic(frame: pd.DataFrame, scores: np.ndarray) -> dict:
             "groups": len(values)}
 
 
-def fit_estimators(train: pd.DataFrame, algorithm: str = "xgboost") -> dict:
+def fit_estimators(train: pd.DataFrame, algorithm: str = "xgboost", parameters=None) -> dict:
+    from strategy_config import validate_parameters
+    params = validate_parameters(algorithm, parameters, "training")
     if algorithm not in MODEL_STRATEGIES:
         raise ValueError(f"未知因子模型：{algorithm}")
     train = train.sort_values(["day", "slot", "symbol"]).copy()
@@ -129,8 +131,8 @@ def fit_estimators(train: pd.DataFrame, algorithm: str = "xgboost") -> dict:
 
         train["excess_target"] = train.target - train.groupby(["day", "slot"]).target.transform("mean")
         scaler = StandardScaler().fit(train[features])
-        linear = ElasticNet(alpha=max(1e-6, 0.01 * float(train.excess_target.std())),
-                            l1_ratio=0.5, max_iter=10000, random_state=42)
+        linear = ElasticNet(alpha=max(1e-6, params["alpha_scale"] * float(train.excess_target.std())),
+                            l1_ratio=params["l1_ratio"], max_iter=params["max_iter"], random_state=42)
         linear.fit(scaler.transform(train[features]), train.excess_target)
         return {"elastic_net": (scaler, linear)}
     import xgboost as xgb
@@ -140,8 +142,7 @@ def fit_estimators(train: pd.DataFrame, algorithm: str = "xgboost") -> dict:
     qid = train.groupby(["day", "slot"], sort=True).ngroup().to_numpy()
     ranker_options = dict(objective="rank:pairwise", tree_method="hist",
                           lambdarank_pair_method="mean", lambdarank_num_pair_per_sample=2,
-                          n_estimators=120, max_depth=2, learning_rate=0.04,
-                          min_child_weight=20, reg_lambda=10, subsample=0.8,
+                          **params,
                           colsample_bytree=1.0, random_state=42, n_jobs=2)
     device = xgboost_device()
     ranker = xgb.XGBRanker(**ranker_options, device=device)
@@ -163,13 +164,13 @@ def score_estimator(estimators: dict, algorithm: str, frame: pd.DataFrame) -> np
     return _predict_ranker(estimators[algorithm], frame)
 
 
-def select_algorithm(frame: pd.DataFrame, algorithm: str = "xgboost") -> tuple[str, dict, bool, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def select_algorithm(frame: pd.DataFrame, algorithm: str = "xgboost", parameters=None) -> tuple[str, dict, bool, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Evaluate the user-selected model with chronological splits."""
     train, validation, holdout = day_splits(frame)
     if "exit_day" in frame.columns:
         train = train[train.exit_day.lt(str(validation.day.min()))].copy()
         validation = validation[validation.exit_day.lt(str(holdout.day.min()))].copy()
-    estimators = fit_estimators(train, algorithm)
+    estimators = fit_estimators(train, algorithm, parameters) if parameters is not None else fit_estimators(train, algorithm)
     results = {name: {"validation": rank_ic(validation, score_estimator(estimators, name, validation)),
                       "holdout": rank_ic(holdout, score_estimator(estimators, name, holdout))}
                for name in (algorithm,)}
@@ -178,14 +179,14 @@ def select_algorithm(frame: pd.DataFrame, algorithm: str = "xgboost") -> tuple[s
     return algorithm, results, eligible, train, validation, holdout
 
 
-def fit_models(samples: list[dict], destination: Path, algorithm: str = "xgboost") -> dict:
+def fit_models(samples: list[dict], destination: Path, algorithm: str = "xgboost", parameters=None) -> dict:
     frame = sample_frame(samples)
-    chosen, results, eligible, train, validation, holdout = select_algorithm(frame, algorithm)
+    chosen, results, eligible, train, validation, holdout = select_algorithm(frame, algorithm, parameters)
     features = list(FEATURES)
 
     # Historical scores above stay untouched. The deployed model may now use
     # all labels that have matured before the present training run.
-    final_estimators = fit_estimators(frame, algorithm)
+    final_estimators = fit_estimators(frame, algorithm, parameters) if parameters is not None else fit_estimators(frame, algorithm)
     destination.mkdir(parents=True, exist_ok=True)
     if algorithm == "xgboost":
         final_estimators["xgboost"].save_model(destination / "xgboost.json")
@@ -200,7 +201,8 @@ def fit_models(samples: list[dict], destination: Path, algorithm: str = "xgboost
             "days": int(frame.day.nunique()), "samples": len(frame),
             "train_days": int(train.day.nunique()), "validation_days": int(validation.day.nunique()),
             "holdout_days": int(holdout.day.nunique()), "first_day": str(frame.day.min()),
-            "last_day": str(frame.day.max())}
+            "last_day": str(frame.day.max()),
+            "label_end_day": str(frame.exit_day.max()) if "exit_day" in frame else str(frame.day.max())}
 
 
 def predict(frame: pd.DataFrame, model: dict, model_dir: Path) -> np.ndarray:

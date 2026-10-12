@@ -23,7 +23,9 @@ from tkinter import font as tkfont, messagebox, ttk
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from strategy_catalog import MODEL_STRATEGIES, STRATEGIES
+from strategy_catalog import FIXED_STRATEGIES, MODEL_STRATEGIES, STRATEGIES, strategy_description
+from model_checkpoints import execution_options, require_checkpoint
+from strategy_config import configured_parameters, default_ranges, parameter_schema, validate_parameters, research_range, validate_range, training_boundary
 
 STRATEGY_LABELS = {value["name"]: key for key, value in STRATEGIES.items()}
 
@@ -267,9 +269,10 @@ def service_label(action: str) -> str:
 class FlowFrame(tk.Frame):
     """Wrap controls using their measured Tk sizes, including DPI/font scaling."""
 
-    def __init__(self, parent, *, gap=8, **kwargs):
+    def __init__(self, parent, *, gap=8, max_columns=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.gap = gap
+        self.max_columns = max_columns
         self.items = []
         self.columns = 0
         self.pending_layout = None
@@ -290,6 +293,8 @@ class FlowFrame(tk.Frame):
             return
         cell_width = max(widget.winfo_reqwidth() for widget in self.items)
         columns = max(1, min(len(self.items), (self.winfo_width() + self.gap) // (cell_width + self.gap)))
+        if self.max_columns is not None:
+            columns = min(columns, self.max_columns)
         if columns == self.columns:
             return
         for column in range(max(self.columns, columns)):
@@ -315,7 +320,7 @@ class ControlPanel(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("财务研究智能体")
-        width = min(1000, max(320, self.winfo_screenwidth() - 80))
+        width = min(1120, max(320, self.winfo_screenwidth() - 80))
         height = min(900, max(320, self.winfo_screenheight() - 100))
         self.geometry(f"{width}x{height}")
         self.minsize(min(520, width), min(480, height))
@@ -370,10 +375,27 @@ class ControlPanel(tk.Tk):
         self.factor_schedule_status = tk.StringVar(value="每周训练：状态检测中")
         self.factor_slot = tk.StringVar(value="14:00")
         self.strategy_choice = tk.StringVar(value=STRATEGIES["xgboost"]["name"])
+        settings = read_json(FACTOR_SETTINGS)
+        kind = settings.get("strategy_kind", "model" if settings.get("strategy", "xgboost") in MODEL_STRATEGIES else "fixed")
+        self.strategy_kind = tk.StringVar(value="多因子模型策略" if kind == "model" else "经典策略")
+        training_strategy = settings.get("training_strategy", settings.get("strategy", "xgboost"))
+        self.training_choice = tk.StringVar(value=STRATEGIES[training_strategy if training_strategy in MODEL_STRATEGIES else "xgboost"]["name"])
+        self.research_dates = {key: tk.StringVar(value=settings.get(key) or value)
+                               for key, value in default_ranges().items()}
+        self.execution_choices = {}
         self.strategy_description = tk.StringVar(value=STRATEGIES["xgboost"]["description"])
         self._build_styles()
         self._build()
         self.update_factor_status()
+        # Measure the wrapped content at the actual screen width before choosing
+        # the initial height. Later user resizes keep their chosen dimensions.
+        # Process the window manager's initial Configure event as well as idle
+        # geometry work; idle work alone still measures the provisional layout.
+        self.update()
+        height = min(max(320, self.winfo_screenheight() - 100),
+                     max(480, self.header.winfo_reqheight() + self.body.winfo_reqheight()
+                         + self.footer.winfo_reqheight() + 24))
+        self.geometry(f"{width}x{height}")
         self.protocol("WM_DELETE_WINDOW", self.close_panel)
         if VENV_PYTHON.exists():
             self.append_log("控制台已启动，正在静默启用日报智能体与 DSH Web。")
@@ -476,12 +498,18 @@ class ControlPanel(tk.Tk):
         for variable, color in ((self.factor_status, self.MUTED), (self.factor_schedule_status, "#7f95bd"), (self.strategy_description, self.MUTED)):
             self._wrapped_label(self.factor_section, textvariable=variable, bg=self.PANEL, fg=color,
                                 font=self._font(8)).pack(fill="x", padx=16, pady=(0, 6))
-        self.factor_fields = FlowFrame(self.factor_section, gap=12, bg=self.PANEL)
+        self.factor_fields = FlowFrame(self.factor_section, gap=12, max_columns=2, bg=self.PANEL)
         self.factor_fields.pack(fill="x", padx=16, pady=(4, 12))
+        kind_field = tk.Frame(self.factor_fields, bg=self.PANEL)
+        tk.Label(kind_field, text="策略类型", bg=self.PANEL, fg=self.MUTED).pack(anchor="w", pady=(0, 4))
+        self.strategy_kind_box = ttk.Combobox(kind_field, textvariable=self.strategy_kind, values=("经典策略", "多因子模型策略"), width=18, state="readonly")
+        self.strategy_kind_box.pack(fill="x")
+        self.strategy_kind_box.bind("<<ComboboxSelected>>", self.save_strategy_kind)
+        self.factor_fields.add(kind_field)
         strategy_field = tk.Frame(self.factor_fields, bg=self.PANEL)
-        tk.Label(strategy_field, text="策略 / 模型", bg=self.PANEL, fg=self.MUTED).pack(anchor="w", pady=(0, 4))
+        self._wrapped_label(strategy_field, text="经典策略 / 已训练 checkpoint", bg=self.PANEL, fg=self.MUTED).pack(fill="x", pady=(0, 4))
         self.strategy_box = ttk.Combobox(strategy_field, textvariable=self.strategy_choice,
-                                        values=tuple(STRATEGY_LABELS), width=22, state="readonly")
+                                        values=(), width=18, state="readonly")
         self.strategy_box.pack(fill="x")
         self.strategy_box.bind("<<ComboboxSelected>>", self.save_strategy)
         self.factor_fields.add(strategy_field)
@@ -492,14 +520,32 @@ class ControlPanel(tk.Tk):
         self.factor_slot_box.pack(fill="x")
         self.factor_slot_box.bind("<<ComboboxSelected>>", self.save_factor_slot)
         self.factor_fields.add(slot_field)
+        training_field = tk.Frame(self.factor_fields, bg=self.PANEL)
+        self._wrapped_label(training_field, text="训练模型（生成新 checkpoint）", bg=self.PANEL, fg=self.MUTED).pack(fill="x", pady=(0, 4))
+        self.training_box = ttk.Combobox(training_field, textvariable=self.training_choice,
+                                        values=tuple(STRATEGIES[key]["name"] for key in MODEL_STRATEGIES), width=18, state="readonly")
+        self.training_box.pack(fill="x")
+        self.training_box.bind("<<ComboboxSelected>>", self.save_training_choice)
+        self.factor_fields.add(training_field)
+        for purpose, label in (("training", "训练集收集日期"), ("backtest", "回测数据日期")):
+            date_field = tk.Frame(self.factor_fields, bg=self.PANEL)
+            tk.Label(date_field, text=f"{label}（YYYY-MM-DD）", bg=self.PANEL, fg=self.MUTED).pack(anchor="w")
+            row = tk.Frame(date_field, bg=self.PANEL)
+            row.pack(fill="x")
+            for suffix in ("start", "end"):
+                ttk.Entry(row, textvariable=self.research_dates[f"{purpose}_{suffix}"], width=12).pack(side="left", padx=(0, 6))
+            self.factor_fields.add(date_field)
         self.factor_buttons = FlowFrame(self.factor_section, bg=self.PANEL)
         self.factor_buttons.pack(fill="x", padx=16, pady=(0, 12))
         self.factor_train_button = self._button(self.factor_buttons, "一键训练", "Secondary.TButton", lambda: self.run_factor_action("train", "训练中"))
+        self.factor_buttons.add(self._button(self.factor_buttons, "配置超参数", "Secondary.TButton", self.edit_strategy_parameters))
         self.factor_buttons.add(self.factor_train_button)
-        self.factor_buttons.add(self._button(self.factor_buttons, "一键回测", "Secondary.TButton", lambda: self.run_factor_action("backtest", "回测中")))
-        self.factor_buttons.add(self._button(self.factor_buttons, "一键排序", "Primary.TButton", lambda: self.run_factor_action("rank", "获取排名中")))
-        self.factor_buttons.add(self._button(self.factor_buttons, "回测全部策略", "Secondary.TButton", lambda: self.run_factor_action("backtest-all", "回测全部策略中")))
-        self._wrapped_label(self.factor_section, text="回测使用延后 VWAP 模拟成交。", bg=self.PANEL, fg="#7f95bd",
+        self.factor_backtest_button = self._button(self.factor_buttons, "一键回测", "Secondary.TButton", lambda: self.run_factor_action("backtest", "回测中"))
+        self.factor_rank_button = self._button(self.factor_buttons, "策略部署", "Primary.TButton", lambda: self.run_factor_action("rank", "部署中"))
+        self.factor_buttons.add(self.factor_backtest_button)
+        self.factor_buttons.add(self.factor_rank_button)
+        self.factor_buttons.add(self._button(self.factor_buttons, "回测全部经典策略", "Secondary.TButton", lambda: self.run_factor_action("backtest-all", "回测全部经典策略中")))
+        self._wrapped_label(self.factor_section, text="日期包含起止日。模型回测必须晚于所选 checkpoint 的训练标签结束日。超参数按策略保存，回测与部署共用。", bg=self.PANEL, fg="#7f95bd",
                             font=self._font(8)).pack(fill="x", padx=16, pady=(0, 14))
 
         self.maintenance_section = self._section(self.body, "安装与维护")
@@ -520,7 +566,9 @@ class ControlPanel(tk.Tk):
         self.log_box = tk.Frame(self.body, bg="#070c16", highlightbackground=self.LINE, highlightthickness=1)
         log_scrollbar = ttk.Scrollbar(self.log_box, orient="vertical")
         log_scrollbar.pack(side="right", fill="y")
-        self.log_text = tk.Text(self.log_box, width=1, height=9, bg="#070c16", fg="#b8c7df", insertbackground=self.TEXT,
+        # Keep a small minimum; the weighted grid row gives the log all remaining
+        # height so controls stay visible when the window is shortened.
+        self.log_text = tk.Text(self.log_box, width=1, height=3, bg="#070c16", fg="#b8c7df", insertbackground=self.TEXT,
                                selectbackground="#29426b", relief="flat", borderwidth=0, padx=12, pady=9,
                                font=self._font(8, mono=True), wrap="word", yscrollcommand=log_scrollbar.set, state="disabled")
         self.log_text.pack(fill="both", expand=True)
@@ -536,35 +584,37 @@ class ControlPanel(tk.Tk):
         minimize_button.pack(side="right")
         self.utility_buttons.extend((refresh_button, minimize_button))
         self._layout_main(900)
-        self._layout_chrome(1000)
+        self._layout_chrome(self.winfo_width())
 
     def _layout_main(self, width):
         columns = 2 if width >= 900 else 1
-        if columns == self._main_columns:
+        padding = 18 if width < 680 else 24
+        if (columns, padding) == getattr(self, "_main_layout", None):
             return
+        self._main_layout = (columns, padding)
         self._main_columns = columns
         for column in range(2):
-            self.body.grid_columnconfigure(column, weight=1 if column < columns else 0, uniform="sections" if column < columns else "")
+            weight = (4 if column == 0 else 6) if columns == 2 else (1 if column == 0 else 0)
+            self.body.grid_columnconfigure(column, weight=weight, uniform="sections" if columns == 2 else "")
         for row in range(7):
             self.body.grid_rowconfigure(row, weight=0)
         for widget in (self.status_heading, self.status_grid, self.access_section, self.factor_section,
                        self.maintenance_section, self.log_header, self.log_box):
             widget.grid_forget()
-        padding = 18 if width < 680 else 24
         self.status_heading.grid(row=0, column=0, columnspan=columns, sticky="w", padx=padding, pady=(18, 8))
         self.status_grid.grid(row=1, column=0, columnspan=columns, sticky="ew", padx=padding, pady=(0, 14))
         if columns == 2:
             self.access_section.grid(row=2, column=0, sticky="new", padx=(padding, 7), pady=(0, 14))
-            self.factor_section.grid(row=2, column=1, sticky="new", padx=(7, padding), pady=(0, 14))
-            next_row = 3
+            self.maintenance_section.grid(row=3, column=0, sticky="new", padx=(padding, 7), pady=(0, 14))
+            self.factor_section.grid(row=2, column=1, rowspan=2, sticky="new", padx=(7, padding), pady=(0, 14))
         else:
             self.access_section.grid(row=2, column=0, sticky="ew", padx=padding, pady=(0, 14))
             self.factor_section.grid(row=3, column=0, sticky="ew", padx=padding, pady=(0, 14))
-            next_row = 4
-        self.maintenance_section.grid(row=next_row, column=0, columnspan=columns, sticky="ew", padx=padding, pady=(0, 14))
-        self.log_header.grid(row=next_row + 1, column=0, columnspan=columns, sticky="ew", padx=padding, pady=(0, 6))
-        self.log_box.grid(row=next_row + 2, column=0, columnspan=columns, sticky="nsew", padx=padding, pady=(0, 18))
-        self.body.grid_rowconfigure(next_row + 2, weight=1)
+            self.maintenance_section.grid(row=4, column=0, sticky="ew", padx=padding, pady=(0, 14))
+        log_row = 4 if columns == 2 else 5
+        self.log_header.grid(row=log_row, column=0, columnspan=columns, sticky="ew", padx=padding, pady=(0, 6))
+        self.log_box.grid(row=log_row + 1, column=0, columnspan=columns, sticky="nsew", padx=padding, pady=(0, 18))
+        self.body.grid_rowconfigure(log_row + 1, weight=1)
 
     def _layout_chrome(self, width):
         compact = width < 680
@@ -675,9 +725,14 @@ class ControlPanel(tk.Tk):
         if getattr(self, "strategy_box", None) is not None:
             self.strategy_box.configure(state="disabled" if disabled else "readonly")
         if getattr(self, "factor_train_button", None) is not None:
-            strategy = STRATEGY_LABELS.get(self.strategy_choice.get(), "xgboost")
-            if strategy not in MODEL_STRATEGIES:
+            if self.strategy_kind.get() != "多因子模型策略":
                 self.factor_train_button.configure(state="disabled")
+        if getattr(self, "training_box", None) is not None:
+            self.strategy_kind_box.configure(state="disabled" if disabled else "readonly")
+            self.training_box.configure(state="disabled" if disabled or self.strategy_kind.get() != "多因子模型策略" else "readonly")
+            if not self.strategy_choice.get():
+                self.factor_backtest_button.configure(state="disabled")
+                self.factor_rank_button.configure(state="disabled")
 
     def start_all_services(self):
         if self.busy or self.starting_services or self.closing:
@@ -859,24 +914,36 @@ class ControlPanel(tk.Tk):
         try:
             latest = read_json(FACTOR_LATEST)
             settings = read_json(FACTOR_SETTINGS)
-            strategy = settings.get("strategy", "xgboost")
-            if strategy not in STRATEGIES:
-                strategy = "xgboost"
-            self.strategy_choice.set(STRATEGIES[strategy]["name"])
-            self.strategy_description.set(STRATEGIES[strategy]["description"])
+            options = execution_options(FACTOR_STORE, settings)
+            entries = options["models"] if self.strategy_kind.get() == "多因子模型策略" else options["fixed_strategies"]
+            self.execution_choices = {entry["name"]: (entry.get("strategy_id", key), entry.get("checkpoint_id", ""))
+                                      for key, entry in entries.items()}
+            self.strategy_box.configure(values=tuple(self.execution_choices))
+            selected = next((label for label, choice in self.execution_choices.items()
+                             if choice == (settings.get("strategy"), settings.get("checkpoint_id", ""))), None)
+            self.strategy_choice.set(selected or next(iter(self.execution_choices), ""))
+            strategy, checkpoint_id = self.execution_choices.get(self.strategy_choice.get(), ("xgboost", ""))
+            self.strategy_description.set(strategy_description(strategy, configured_parameters(settings, strategy)))
+            if (hasattr(self, "research_dates") and checkpoint_id and not settings.get("backtest_start")
+                    and getattr(self, "date_checkpoint", None) != checkpoint_id):
+                self.date_checkpoint = checkpoint_id
+                model_range = require_checkpoint(strategy, checkpoint_id, FACTOR_STORE)
+                cutoff = training_boundary(model_range)
+                if cutoff:
+                    self.research_dates["backtest_start"].set(max(default_ranges()["backtest_start"],
+                        (datetime.fromisoformat(cutoff) + timedelta(days=1)).date().isoformat()))
             slot = settings.get("backtest_slot", "14:00")
             self.factor_slot.set(slot if slot in FACTOR_SLOTS else "14:00")
             if strategy not in MODEL_STRATEGIES:
-                self.factor_status.set("固定规则策略 · 无需训练，可直接回测与排序")
+                self.factor_status.set("经典策略 · 无需训练，可直接回测与策略部署")
                 self.factor_schedule_status.set("固定规则无需每周训练；切换至因子模型后恢复训练检查")
             else:
-                model = read_json(FACTOR_MODEL.with_name(f"model-{strategy}.json")) or read_json(FACTOR_MODEL)
-                artifact = FACTOR_STORE / "models" / str(model.get("model_id", "")) / f"{strategy}.json"
-                if model.get("target_version") != FACTOR_TARGET_VERSION or not artifact.is_file():
-                    self.factor_status.set("所选模型尚未训练 · 请点击一键训练")
+                model = require_checkpoint(strategy, checkpoint_id, FACTOR_STORE) if checkpoint_id else {}
+                if not model:
+                    self.factor_status.set("没有已训练模型 · 模型列表为空，训练后才能回测或策略部署")
                 else:
                     quality = "探索性模拟" if model.get("quality") == "exploratory" else "已验证"
-                    self.factor_status.set(f"{quality}：{STRATEGIES[strategy]['name']} · 最近排名：{latest.get('generated_at') or '暂无'}")
+                    self.factor_status.set(f"{quality}：checkpoint {checkpoint_id} · 训练 {model['selected_at']}")
             self._update_controls()
         except Exception:
             self.factor_status.set("因子状态暂不可读")
@@ -895,15 +962,78 @@ class ControlPanel(tk.Tk):
         except Exception as error:
             messagebox.showerror("设置失败", str(error))
 
+    def save_strategy_kind(self, _event=None):
+        kind = "model" if self.strategy_kind.get() == "多因子模型策略" else "fixed"
+        settings = read_json(FACTOR_SETTINGS)
+        strategy = STRATEGY_LABELS[self.training_choice.get()] if kind == "model" else FIXED_STRATEGIES[0]
+        write_json(FACTOR_SETTINGS, {**settings, "strategy_kind": kind, "strategy": strategy,
+                                   "training_strategy": STRATEGY_LABELS[self.training_choice.get()], "checkpoint_id": ""})
+        self.update_factor_status()
+        if self.strategy_choice.get():
+            self.save_strategy()
+
+    def save_training_choice(self, _event=None):
+        settings = read_json(FACTOR_SETTINGS)
+        write_json(FACTOR_SETTINGS, {**settings, "training_strategy": STRATEGY_LABELS[self.training_choice.get()]})
+
     def save_strategy(self, _event=None):
         try:
-            strategy = STRATEGY_LABELS[self.strategy_choice.get()]
+            if hasattr(self, "execution_choices"):
+                strategy, checkpoint_id = self.execution_choices[self.strategy_choice.get()]
+            else:
+                strategy, checkpoint_id = STRATEGY_LABELS[self.strategy_choice.get()], ""
             current = read_json(FACTOR_SETTINGS)
-            write_json(FACTOR_SETTINGS, {**current, "strategy": strategy})
+            value = {**current, "strategy": strategy}
+            if hasattr(self, "execution_choices"):
+                value["checkpoint_id"] = checkpoint_id
+            write_json(FACTOR_SETTINGS, value)
             self.update_factor_status()
-            self.append_log(f"✓ 已选择 {STRATEGIES[strategy]['name']}；训练、回测与排序使用此策略。")
+            self.append_log(f"✓ 已选择 {STRATEGIES[strategy]['name']}；训练、回测与策略部署使用此策略。")
         except Exception as error:
             messagebox.showerror("设置失败", str(error))
+
+    def edit_strategy_parameters(self):
+        settings = read_json(FACTOR_SETTINGS)
+        selected = self.execution_choices.get(self.strategy_choice.get())
+        strategy = selected[0] if selected else STRATEGY_LABELS[self.training_choice.get()]
+        training_strategy = STRATEGY_LABELS[self.training_choice.get()]
+        dialog = tk.Toplevel(self)
+        dialog.title("策略超参数 · " + STRATEGIES[strategy]["name"])
+        dialog.transient(self)
+        dialog.grab_set()
+        groups = [("execution", strategy, "回测 / 策略部署")]
+        if self.strategy_kind.get() == "多因子模型策略":
+            groups.append(("training", training_strategy, "训练新 checkpoint · " + STRATEGIES[training_strategy]["name"]))
+        values = []
+        for purpose, algorithm, title in groups:
+            box = ttk.LabelFrame(dialog, text=title, padding=12)
+            box.pack(fill="x", padx=12, pady=6)
+            params = configured_parameters(settings, algorithm, purpose)
+            for index, (key, spec) in enumerate(parameter_schema(algorithm, purpose).items()):
+                ttk.Label(box, text=spec["label"]).grid(row=index, column=0, sticky="w", padx=6, pady=3)
+                value = tk.StringVar(value=str(params[key]))
+                ttk.Entry(box, textvariable=value, width=16).grid(row=index, column=1, padx=6)
+                values.append((purpose, algorithm, key, value))
+        ttk.Label(dialog, text="模型训练参数保存在新 checkpoint 中；已训练权重保持冻结。\n比例 0.005 = 0.5%，周期单位为 5 分钟 K 线。", padding=12).pack()
+        def defaults():
+            for purpose, algorithm, key, value in values:
+                value.set(str(parameter_schema(algorithm, purpose)[key]["default"]))
+        def save():
+            try:
+                current = read_json(FACTOR_SETTINGS)
+                for purpose, algorithm, _title in groups:
+                    params = {key: value.get() for kind, model, key, value in values if kind == purpose and model == algorithm}
+                    params = validate_parameters(algorithm, params, purpose)
+                    field = "training_parameters" if purpose == "training" else "strategy_parameters"
+                    current[field] = {**current.get(field, {}), algorithm: params}
+                write_json(FACTOR_SETTINGS, current)
+                dialog.destroy()
+                self.update_factor_status()
+                self.append_log("✓ 策略超参数已保存，下次任务生效。")
+            except ValueError as error:
+                messagebox.showerror("超参数无效", str(error), parent=dialog)
+        ttk.Button(dialog, text="恢复推荐默认值", command=defaults).pack(side="left", padx=12, pady=12)
+        ttk.Button(dialog, text="保存", command=save).pack(side="right", padx=12, pady=12)
 
     def run_manual_report(self):
         if self.busy or self.closing or self.starting_services:
@@ -944,21 +1074,65 @@ class ControlPanel(tk.Tk):
         strategy = read_json(FACTOR_SETTINGS).get("strategy", "xgboost")
         if strategy not in STRATEGIES:
             strategy = "xgboost"
+        checkpoint_id = read_json(FACTOR_SETTINGS).get("checkpoint_id", "")
+        if hasattr(self, "execution_choices"):
+            if action == "train":
+                strategy = STRATEGY_LABELS[self.training_choice.get()]
+                checkpoint_id = ""
+            elif action != "backtest-all":
+                selected = self.execution_choices.get(self.strategy_choice.get())
+                if selected is None:
+                    self.status_text.set("没有已训练模型，请先训练生成 checkpoint。")
+                    return
+                strategy, checkpoint_id = selected
+        checkpoint = {}
+        if action in ("backtest", "rank"):
+            try:
+                checkpoint = require_checkpoint(strategy, checkpoint_id, FACTOR_STORE)
+            except ValueError as exc:
+                self.status_text.set(str(exc))
+                self.append_log(str(exc))
+                return
         if action == "train" and strategy not in MODEL_STRATEGIES:
-            messagebox.showinfo("固定规则策略", "此策略无需训练，可直接回测与排序。")
+            messagebox.showinfo("经典策略", "此策略无需训练，可直接回测与策略部署。")
             return
-        needs_preparation = action in ("backtest", "backtest-all") and backtest_data_missing()
+        task_settings = read_json(FACTOR_SETTINGS)
+        date_args = []
+        if hasattr(self, "research_dates"):
+            try:
+                task_settings.update({key: value.get().strip() for key, value in self.research_dates.items()})
+                purpose = "training" if action == "train" else "backtest"
+                if action != "rank":
+                    start, end = research_range(task_settings, purpose, checkpoint if action == "backtest" else None)
+                    date_args = ["--start", start, "--end", end]
+                params = configured_parameters(task_settings, strategy, "training" if action == "train" else "execution")
+                write_json(FACTOR_SETTINGS, task_settings)
+            except ValueError as error:
+                self.status_text.set(str(error))
+                messagebox.showerror("策略配置无效", str(error))
+                return
+        needs_preparation = action in ("backtest", "backtest-all", "train") and backtest_data_missing()
+        if date_args and action != "rank":
+            manifest = read_json(FACTOR_MANIFEST)
+            covered_start = manifest.get("requested_start", manifest.get("first_day", "9999-12-31"))
+            covered_end = manifest.get("requested_end", manifest.get("last_day", "0001-01-01"))
+            needs_preparation = needs_preparation or start < covered_start or end > covered_end
         if needs_preparation:
-            start, end = backtest_preparation_dates()
+            if not date_args:
+                start, end = backtest_preparation_dates()
+            manifest = read_json(FACTOR_MANIFEST)
+            if manifest.get("validated"):
+                start = min(start, manifest.get("requested_start", manifest.get("first_day", start)))
+                end = max(end, manifest.get("requested_end", manifest.get("last_day", end)))
             messagebox.showinfo(
-                "缺少回测数据",
-                "回测需要逐日历史股票池、交易状态（含红股上市日）、首次入池前的预热分钟线和已验收的来源清单。\n"
-                f"将自动下载并验收 {start} 至 {end} 的历史数据；完成后继续回测。\n"
+                "准备历史数据",
+                "策略研究需要逐日历史股票池、交易状态（含红股上市日）、首次入池前的预热分钟线和已验收的来源清单。\n"
+                f"将自动下载并验收 {start} 至 {end} 的历史数据；完成后继续策略任务。\n"
                 "首次下载可能耗时较长，进度会显示在运行日志中。",
             )
         self.factor_busy = True
-        self.set_busy(True, "准备回测数据" if needs_preparation else operation)
-        self.status_text.set("正在下载并验收回测数据，详情见运行日志…" if needs_preparation
+        self.set_busy(True, "准备历史数据" if needs_preparation else operation)
+        self.status_text.set("正在下载并验收历史数据，详情见运行日志…" if needs_preparation
                              else f"{operation}，详情见运行日志…")
 
         def worker():
@@ -972,11 +1146,16 @@ class ControlPanel(tk.Tk):
                         [str(VENV_PYTHON), str(FACTOR_PREP_SCRIPT), "--start", start, "--end", end],
                         on_output, on_process,
                     )
-                    self.after(0, lambda: self.append_log("✓ 回测历史数据已下载并通过验收，开始回测。"))
+                    self.after(0, lambda: self.append_log("✓ 历史数据已下载并通过验收，继续策略任务。"))
                     self.after(0, lambda: self.set_busy(True, operation))
                     self.after(0, lambda: self.status_text.set(f"{operation}，详情见运行日志…"))
                 self.after(0, lambda: self.append_log(f"> {VENV_PYTHON.name} factor_lab.py {action} --strategy {strategy}"))
-                output = stream_command([str(VENV_PYTHON), str(FACTOR_SCRIPT), action, "--strategy", strategy],
+                command = [str(VENV_PYTHON), str(FACTOR_SCRIPT), action, "--strategy", strategy] + date_args
+                if hasattr(self, "research_dates") and action != "backtest-all":
+                    command += ["--parameters", json.dumps(params)]
+                if checkpoint_id and action in ("backtest", "rank"):
+                    command += ["--checkpoint", checkpoint_id]
+                output = stream_command(command,
                                         on_output, on_process)
                 self.after(0, lambda: self.factor_action_done(action, output))
             except Exception as exc:
@@ -991,6 +1170,11 @@ class ControlPanel(tk.Tk):
         if self.closing:
             return
         self.set_busy(False)
+        if action == "train":
+            model = read_json(FACTOR_MODEL)
+            if model.get("model_id") and model.get("algorithm") in MODEL_STRATEGIES:
+                settings = read_json(FACTOR_SETTINGS)
+                write_json(FACTOR_SETTINGS, {**settings, "strategy_kind": "model", "strategy": model["algorithm"], "checkpoint_id": model["model_id"]})
         self.update_factor_status()
         self.status_text.set(output.splitlines()[-1] if output else "操作完成。")
         if action == "train":

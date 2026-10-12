@@ -31,7 +31,8 @@ class ReportWebServerTests(unittest.TestCase):
             handler.do_GET()
         payload = handler.send_json.call_args.args[1]
         self.assertEqual(payload["selected"], "momentum")
-        self.assertEqual(set(payload["strategies"]), set(report_web.STRATEGIES))
+        self.assertEqual(set(payload["fixed_strategies"]), set(report_web.STRATEGIES) - {"xgboost", "elastic_net"})
+        self.assertEqual(payload["models"], {})
         self.assertNotIn("portfolio", payload)
 
     def test_portfolio_review_forwards_selected_strategy_and_rejects_invalid_choice(self):
@@ -95,6 +96,30 @@ class ReportWebServerTests(unittest.TestCase):
             worker.assert_called_once()
             with self.assertRaises(ValueError):
                 report_web.start_ranking_job("xgboost")
+
+    def test_deployment_parameters_are_validated_and_frozen_in_job(self):
+        import intraday_ranking
+        with (tempfile.TemporaryDirectory() as directory,
+              patch.object(report_web, "PROJECT_ROOT", Path(directory)),
+              patch.object(report_web, "ACTIVE_RANKING_JOB", ""),
+              patch.object(intraday_ranking, "ranking_options", return_value={"strategies": {"momentum": {}}}),
+              patch.object(report_web.threading, "Thread") as worker):
+            with self.assertRaises(ValueError):
+                report_web.start_ranking_job("momentum", {"top_n": 0})
+            worker.assert_not_called()
+            state, created = report_web.start_ranking_job("momentum", {"threshold": .01, "top_n": 3})
+            self.assertTrue(created)
+            self.assertEqual(state["strategy_parameters"], {"threshold": .01, "top_n": 3})
+            persisted = report_web.ranking_job(state["job_id"])
+            self.assertEqual(persisted["strategy_parameters"], state["strategy_parameters"])
+
+    def test_portfolio_invalid_parameters_fail_before_forwarding_request(self):
+        for raw in ('{"top_n":0}', '[]', '{invalid'):
+            handler = self.handler("/api/portfolio-analysis", {"X-Portfolio-Strategy": "momentum", "X-Strategy-Parameters": raw})
+            with patch.object(report_web, "urlopen") as request:
+                handler.do_POST()
+            request.assert_not_called()
+            self.assertEqual(handler.send_json.call_args.args[0], 400)
 
     def test_ranking_worker_timeout_reports_failure_and_releases_single_job(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(report_web, "PROJECT_ROOT", Path(directory)), patch.object(report_web, "ACTIVE_RANKING_JOB", "a"*32):

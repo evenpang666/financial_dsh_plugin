@@ -3,8 +3,8 @@
 MODEL_STRATEGIES = ("xgboost", "elastic_net")
 TECHNICAL_STRATEGIES = ("ma_crossover", "macd", "rsi_rebound", "bollinger_reversion", "donchian_breakout")
 STRATEGIES = {
-    "xgboost": {"name": "XGBoost 因子模型", "description": "仅训练 XGBoost；按预测分数排序，滚动窗口只使用已成熟标签。"},
-    "elastic_net": {"name": "Elastic Net 因子模型", "description": "仅训练 Elastic Net；按预测分数排序，滚动窗口只使用已成熟标签。"},
+    "xgboost": {"name": "XGBoost 因子模型", "description": "训练保存独立 checkpoint；回测和部署使用所选版本的冻结权重。"},
+    "elastic_net": {"name": "Elastic Net 因子模型", "description": "训练保存独立 checkpoint；回测和部署使用所选版本的冻结权重。"},
     "mean_reversion": {"name": "VWAP 均值回归", "description": "价格低于截至信号时点的日内 VWAP 至少 0.5% 时做多，偏离越大排名越高。"},
     "momentum": {"name": "盘中动量", "description": "相对当日开盘涨幅至少 0.5% 时做多，涨幅越大排名越高。"},
     "breakout": {"name": "日内区间突破", "description": "价格处于截至信号时点日内区间顶部 5%，日内振幅至少 1% 且开盘以来上涨时做多。"},
@@ -32,25 +32,44 @@ def validate_strategy(strategy: str) -> str:
     return strategy
 
 
-def rule_scores(frame, strategy: str):
+def strategy_description(strategy, parameters=None):
+    """Describe actual rules so custom parameters never retain default wording."""
+    from strategy_config import validate_parameters
+    p = validate_parameters(strategy, parameters)
+    descriptions = {
+        "mean_reversion": lambda: f"价格低于信号时点日内 VWAP 至少 {p['deviation']:.2%} 时做多。",
+        "momentum": lambda: f"相对当日开盘涨幅至少 {p['threshold']:.2%} 时做多。",
+        "breakout": lambda: f"价格处于日内区间顶部 {p['range_top']:.2%}，振幅至少 {p['min_range']:.2%} 且开盘以来上涨时做多。",
+        "ma_crossover": lambda: f"5 分钟 SMA({p['fast_period']}) 在信号 K 线上穿 SMA({p['slow_period']}) 时做多。",
+        "macd": lambda: f"5 分钟 MACD({p['fast_period']},{p['slow_period']},{p['signal_period']}) 的 DIF 在信号 K 线上穿 DEA 时做多。",
+        "rsi_rebound": lambda: f"5 分钟 Wilder RSI({p['period']}) 从 {p['oversold']:g} 以下回升至此阈值时做多。",
+        "bollinger_reversion": lambda: f"5 分钟收盘价从布林带({p['period']},{p['std_dev']:g})下轨外回到带内时做多。",
+        "donchian_breakout": lambda: f"5 分钟收盘价上穿此前 {p['period']} 根 K 线最高价时做多，通道排除信号 K 线。",
+    }
+    return (descriptions[strategy]() if strategy in descriptions else STRATEGIES[strategy]['description']) + f" 候选上限 {p['top_n']} 只。"
+
+
+def rule_scores(frame, strategy: str, parameters=None):
     """Return scores and entry mask using signal-time features only."""
     validate_strategy(strategy)
+    from strategy_config import validate_parameters
+    params = validate_parameters(strategy, parameters)
     if strategy == "mean_reversion":
-        return -frame.vwap_gap, frame.vwap_gap.le(-0.005)
+        return -frame.vwap_gap, frame.vwap_gap.le(-params["deviation"])
     if strategy == "momentum":
-        return frame.open_momentum, frame.open_momentum.ge(0.005)
+        return frame.open_momentum, frame.open_momentum.ge(params["threshold"])
     if strategy == "breakout":
         # range_position is centered at zero: [-0.5, 0.5].
         return (frame.range_position + frame.open_momentum,
-                frame.range_position.ge(0.45) & frame.range_width.ge(0.01) & frame.open_momentum.gt(0))
+                frame.range_position.ge(0.5 - params["range_top"]) & frame.range_width.ge(params["min_range"]) & frame.open_momentum.gt(0))
     if strategy == "ma_crossover":
         return frame.ma_spread, frame.ma_spread.gt(1e-10) & frame.ma_spread_prev.le(1e-10)
     if strategy == "macd":
         return frame.macd_hist, frame.macd_hist.gt(1e-10) & frame.macd_hist_prev.le(1e-10)
     if strategy == "rsi_rebound":
-        return frame.rsi - frame.rsi_prev, frame.rsi_prev.lt(30) & frame.rsi.ge(30)
+        return frame.rsi - frame.rsi_prev, frame.rsi_prev.lt(params["oversold"]) & frame.rsi.ge(params["oversold"])
     if strategy == "bollinger_reversion":
-        return frame.bollinger_z - frame.bollinger_z_prev, frame.bollinger_z_prev.lt(-2) & frame.bollinger_z.ge(-2) & frame.bollinger_z.le(2)
+        return frame.bollinger_z - frame.bollinger_z_prev, frame.bollinger_z_prev.lt(-params["std_dev"]) & frame.bollinger_z.ge(-params["std_dev"]) & frame.bollinger_z.le(params["std_dev"])
     if strategy == "donchian_breakout":
         return frame.donchian_gap, frame.donchian_gap.gt(0) & frame.donchian_gap_prev.le(0)
     raise ValueError("因子模型需要先训练，不能使用固定规则评分。")

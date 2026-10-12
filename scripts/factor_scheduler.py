@@ -21,6 +21,7 @@ def due(now: datetime, model: dict, state: dict, settings: dict) -> bool:
     strategy = settings.get("strategy", "xgboost")
     if strategy not in factor_lab.MODEL_STRATEGIES:
         return False
+    strategy = settings.get("training_strategy", strategy)
     if not settings["weekly_training_enabled"] or now.weekday() >= 5 or (now.hour, now.minute) < (12, 0):
         return False
     week = now.isocalendar()[:2]
@@ -38,11 +39,12 @@ def due(now: datetime, model: dict, state: dict, settings: dict) -> bool:
 def run_once(now: datetime | None = None) -> bool:
     now = now or factor_lab.now_cn()
     settings = factor_lab.load_settings()
-    if not due(now, factor_lab.selected_model(), factor_lab.read_json(STATE), settings):
+    strategy = settings.get("training_strategy", settings["strategy"])
+    if not due(now, factor_lab.selected_model(strategy), factor_lab.read_json(STATE), settings):
         return False
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    factor_lab.write_json(STATE, {"last_attempt_date": now.date().isoformat(), "started_at": now.isoformat(), "strategy": settings["strategy"]})
-    command = [sys.executable, str(Path(__file__).with_name("factor_lab.py")), "train", "--strategy", settings["strategy"]]
+    factor_lab.write_json(STATE, {"last_attempt_date": now.date().isoformat(), "started_at": now.isoformat(), "strategy": strategy})
+    command = [sys.executable, str(Path(__file__).with_name("factor_lab.py")), "train", "--strategy", strategy]
     with LOG.open("a", encoding="utf-8") as output:
         output.write(f"\n[{now.isoformat()}] Weekly training started\n")
         output.flush()

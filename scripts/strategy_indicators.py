@@ -28,21 +28,28 @@ def _seeded_average(series, period, alpha):
     return result
 
 
-def _window_indicators(window):
+def _window_indicators(window, parameters=None):
+    from strategy_config import validate_parameters
+    supplied = parameters or {}
+    params = {key: validate_parameters(key, supplied.get(key)) for key in
+              ("ma_crossover", "macd", "rsi_rebound", "bollinger_reversion", "donchian_breakout")}
+    ma_params, macd = params["ma_crossover"], params["macd"]
+    rsi_period = params["rsi_rebound"]["period"]
+    band_period = params["bollinger_reversion"]["period"]
     close = window.close.astype(float)
-    fast, slow = close.rolling(5).mean(), close.rolling(20).mean()
+    fast, slow = close.rolling(ma_params["fast_period"]).mean(), close.rolling(ma_params["slow_period"]).mean()
     ma = fast / slow - 1
-    dif = _seeded_average(close, 12, 2 / 13) - _seeded_average(close, 26, 2 / 27)
-    hist = (dif - _seeded_average(dif, 9, 2 / 10)) / close
+    dif = _seeded_average(close, macd["fast_period"], 2 / (macd["fast_period"] + 1)) - _seeded_average(close, macd["slow_period"], 2 / (macd["slow_period"] + 1))
+    hist = (dif - _seeded_average(dif, macd["signal_period"], 2 / (macd["signal_period"] + 1))) / close
     delta = close.diff()
-    gain = _seeded_average(delta.clip(lower=0), 14, 1 / 14)
-    loss = _seeded_average(-delta.clip(upper=0), 14, 1 / 14)
+    gain = _seeded_average(delta.clip(lower=0), rsi_period, 1 / rsi_period)
+    loss = _seeded_average(-delta.clip(upper=0), rsi_period, 1 / rsi_period)
     rsi = 100 * gain / (gain + loss)
     rsi = rsi.mask((gain + loss).le(close.abs() * 1e-12), 50)
-    deviation = close.rolling(20).std(ddof=0)
-    z = ((close - slow) / deviation.replace(0, np.nan)).mask(deviation.eq(0), 0)
+    deviation = close.rolling(band_period).std(ddof=0)
+    z = ((close - close.rolling(band_period).mean()) / deviation.replace(0, np.nan)).mask(deviation.eq(0), 0)
     # Shifting high excludes the current bar and makes a breakout possible.
-    channel = window.high.astype(float).shift(1).rolling(20).max()
+    channel = window.high.astype(float).shift(1).rolling(params["donchian_breakout"]["period"]).max()
     gap = close / channel - 1
     result = pd.DataFrame({"ma_spread": ma, "macd_hist": hist, "rsi": rsi,
                            "bollinger_z": z, "donchian_gap": gap})
@@ -51,7 +58,7 @@ def _window_indicators(window):
     return result
 
 
-def indicator_frame(bars, market_state=None):
+def indicator_frame(bars, market_state=None, parameters=None):
     """Return indicators at each bar using only prices and events known then.
 
     Each day initializes EMA/RSI using the previous observed session (48 bars
@@ -78,7 +85,7 @@ def indicator_frame(bars, market_state=None):
                     if warmup[["open", "high", "low", "close"]].le(0).any().any():
                         raise RuntimeError(f"{day} 公司行为调整后价格无效，不能生成技术指标。")
         window = group.reset_index(drop=True) if warmup.empty else pd.concat([warmup, group], ignore_index=True)
-        values = _window_indicators(window).iloc[-len(group):]
+        values = _window_indicators(window, parameters).iloc[-len(group):]
         result.loc[group.index, :] = values[list(INDICATOR_NAMES)].to_numpy()
         previous, previous_day = group, day
     return result

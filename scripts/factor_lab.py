@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +20,9 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import requests
 from factor_models import EXECUTION_BAR, NEXT_BAR
-from strategy_catalog import MODEL_STRATEGIES, TECHNICAL_STRATEGIES, RULE_FEATURES, STRATEGIES, rule_scores, validate_strategy
+from strategy_catalog import FIXED_STRATEGIES, MODEL_STRATEGIES, TECHNICAL_STRATEGIES, RULE_FEATURES, STRATEGIES, rule_scores, validate_strategy, strategy_description
+from model_checkpoints import migrate_legacy_checkpoints, require_checkpoint
+from strategy_config import configured_parameters, default_ranges, research_range, ensure_range_coverage
 from strategy_indicators import INDICATOR_NAMES, indicator_frame
 
 
@@ -50,6 +53,8 @@ EM_MINUTE_UNAVAILABLE = threading.Event()
 SINA_MINUTE_UNAVAILABLE = threading.Event()
 SINA_REQUEST_GATE = threading.Lock()
 _STRATEGY_OVERRIDE: str | None = None
+_CHECKPOINT_OVERRIDE: str | None = None
+_SETTINGS_OVERRIDE: dict = {}
 
 
 def now_cn() -> datetime:
@@ -84,12 +89,17 @@ def file_sha256(path: Path) -> str:
 
 
 def load_settings() -> dict:
-    supplied = read_json(SETTINGS)
+    supplied = {**read_json(SETTINGS), **_SETTINGS_OVERRIDE}
     slot = supplied.get("backtest_slot", "14:00")
     if slot not in NEXT_BAR:
         raise ValueError(f"回测时点无效：{slot}；可选 {', '.join(NEXT_BAR)}")
     strategy = validate_strategy(_STRATEGY_OVERRIDE or supplied.get("strategy", "xgboost"))
-    return {"backtest_slot": slot, "strategy": strategy,
+    checkpoint_id = _CHECKPOINT_OVERRIDE
+    if checkpoint_id is None:
+        checkpoint_id = supplied.get("checkpoint_id", "") if strategy in MODEL_STRATEGIES and strategy == supplied.get("strategy", "xgboost") else ""
+    return {**supplied, "backtest_slot": slot, "strategy": strategy,
+            "checkpoint_id": checkpoint_id,
+            "training_strategy": supplied.get("training_strategy", strategy),
             "weekly_training_enabled": bool(supplied.get("weekly_training_enabled", True))}
 
 
@@ -101,10 +111,12 @@ def save_settings(slot: str, weekly_training_enabled: bool = True) -> dict:
     return value
 
 
-def selected_model(strategy: str | None = None) -> dict:
+def selected_model(strategy: str | None = None, checkpoint_id: str | None = None) -> dict:
     strategy = strategy or load_settings()["strategy"]
     if strategy not in MODEL_STRATEGIES:
         return {}
+    if checkpoint_id is not None:
+        return require_checkpoint(strategy, checkpoint_id, STORE)
     model = read_json(MODEL.with_name(f"model-{strategy}.json")) or read_json(MODEL)
     artifact = MODELS / str(model.get("model_id", "")) / f"{strategy}.json"
     if (model.get("target_version") == ML_TARGET_VERSION and artifact.is_file()
@@ -116,7 +128,7 @@ def selected_model(strategy: str | None = None) -> dict:
 def train_rule_notice() -> dict | None:
     strategy = load_settings()["strategy"]
     if strategy not in MODEL_STRATEGIES:
-        log(f"{STRATEGIES[strategy]['name']} 使用固定规则，无需训练；可直接回测或排序。")
+        log(f"{STRATEGIES[strategy]['name']} 使用固定规则，无需训练；可直接回测或部署。")
         return {"strategy": strategy, "requires_training": False}
     return None
 
@@ -333,12 +345,12 @@ def backfill_baostock(universe: list[dict], start: datetime, end: datetime) -> d
 
 
 def history_samples(symbol: str, bars: pd.DataFrame,
-                    market_state: pd.DataFrame | None = None) -> list[dict]:
+                    market_state: pd.DataFrame | None = None, parameters=None) -> list[dict]:
     if bars.empty:
         return []
     frame = bars.sort_values("time", kind="stable").reset_index(drop=True).copy()
     indicator_state = None if market_state is None else market_state[market_state.symbol.eq(symbol)]
-    frame = pd.concat([frame, indicator_frame(frame, indicator_state)], axis=1)
+    frame = pd.concat([frame, indicator_frame(frame, indicator_state, parameters)], axis=1)
     frame["day"] = frame["time"].dt.strftime("%Y-%m-%d")
     frame["clock"] = frame["time"].dt.strftime("%H:%M")
     # Candidate features must not depend on whether this day *later* completes.
@@ -466,8 +478,9 @@ def train() -> dict:
             raise RuntimeError("当前快照没有足够的成交额/市值数据，且没有历史候选池；请在交易时段或收盘后重试训练。")
     STORE.mkdir(parents=True, exist_ok=True)
     BARS.mkdir(parents=True, exist_ok=True)
-    start, end = now_cn() - timedelta(days=400), now_cn()
-    log(f"[2/5] 回填近400日5分钟行情：共 {len(universe)} 只；BaoStock 串行访问并增量缓存。")
+    first, last = research_range(load_settings(), "training")
+    start, end = datetime.fromisoformat(first), datetime.fromisoformat(last) + timedelta(days=1)
+    log(f"[2/5] 回填 {first} 至 {last} 的5分钟行情：共 {len(universe)} 只；BaoStock 串行访问并增量缓存。")
     try:
         backfill = backfill_baostock(universe, start, end - timedelta(days=1))
         log(f"  BaoStock 回填完成：{backfill['filled']} 只；失败 {len(backfill['failures'])} 只")
@@ -499,25 +512,33 @@ def publish_training(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame
                      spot_source: str, minute_source: str,
                      point_in_time: bool = False) -> dict:
     from factor_models import fit_models
+    migrate_legacy_checkpoints(STORE)
 
     log(f"[4/5] 准备 {len(samples)} 条盘中样本，并仅使用已完成次日交易的收益标签...")
-    if len(failed) >= len(universe) - MIN_STOCKS + 1:
+    if failed and len(failed) >= len(universe) - MIN_STOCKS + 1:
         log(f"  {len(failed)}/{len(universe)} 只股票取数失败；首条失败：{failed[0]}")
     universe_method = (method + "；逐日全市场成交额历史名单"
                        if point_in_time else
                        method + "；这是受限候选池，不代表全A股，也有存续偏差")
-    model_id = now_cn().strftime("%Y%m%d-%H%M%S-%f")
+    model_id = now_cn().strftime("%Y%m%d-%H%M%S-%f") + "_" + uuid.uuid4().hex[:8]
     strategy = load_settings()["strategy"]
     log(f"[5/5] 仅训练 {STRATEGIES[strategy]['name']}，按时间划分评估...")
-    ml = fit_models(samples, MODELS / model_id, strategy)
+    settings = load_settings()
+    first, last = research_range(settings, "training")
+    samples = [row for row in samples if first <= row["day"] <= last
+               and row.get("exit_day") and row["exit_day"] <= last]
+    if not samples:
+        raise RuntimeError("所选训练日期内没有已成熟的样本，请先准备该区间的历史数据。")
+    params = configured_parameters(settings, strategy, "training")
+    ml = fit_models(samples, MODELS / model_id, strategy, params)
     slot = load_settings()["backtest_slot"]
-    log("  模型训练已完成；滚动回测需单独运行，其绩效不代表当前发布模型权重。")
+    log("  模型训练已完成；已保存独立 checkpoint，可选择此版本回测和部署。")
     holdout_ics = [entry.get("holdout", {}).get("rank_ic") for entry in ml["algorithms"].values()]
     holdout_warning = (" 所选模型的留出期 Rank IC 非正，尚无稳定样本外证据。"
                        if holdout_ics and all(value is not None and value <= 0 for value in holdout_ics) else "")
     validation_warning = (" 所选模型的验证期未达到正向门槛，不代表有效预测。"
                           if not ml.get("validation_eligible", True) else "")
-    model = {"model_id": model_id, "selected_at": now_cn().isoformat(timespec="seconds"),
+    model = {"model_id": model_id, "selected_at": now_cn().isoformat(timespec="microseconds"),
              "market": "a", "target": "信号后预留一根完整5分钟K线，再按下一根K线VWAP买入至次日同一窗口VWAP卖出的价格变化",
              "universe_method": universe_method,
              "universe_policy": ("previous_day_turnover_top40" if point_in_time else "runtime_snapshot"),
@@ -527,10 +548,16 @@ def publish_training(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame
              "backtest": None, "backtest_slot": slot,
              "data_sources": {"spot": spot_source, "minute": minute_source},
              "failed_symbols": failed,
-             "selection_warning": "机器学习模型仅供模拟研究；滚动回测评估的是逐窗口训练规则，并非当前发布模型权重的独立绩效。"
+             "selection_warning": "机器学习模型仅供模拟研究；checkpoint 回测冻结此版本权重，仅评估训练标签结束后的数据。"
                                   + validation_warning + holdout_warning,
-             "training": {"days": ml["days"], "last_day": ml["last_day"],
+             "training_parameters": params,
+             "training": {"requested_start": first, "requested_end": last,
+                          "first_day": ml.get("first_day", min(row["day"] for row in samples)),
+                          "days": ml["days"], "last_day": ml["last_day"],
+                          "label_end_day": ml.get("label_end_day", ml["last_day"]),
                           "samples": ml["samples"], "holdout_days": ml["holdout_days"]}}
+    model["artifact_sha256"] = file_sha256(MODELS / model_id / f"{strategy}.json")
+    write_json(MODELS / model_id / "checkpoint.json", model)
     write_json(MODEL, model)
     write_json(MODEL.with_name(f"model-{strategy}.json"), model)
     write_json(LATEST, {})
@@ -561,7 +588,7 @@ def cached_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], list[dict]]:
 
 
 def _pit_symbol_inputs(symbol: str, path: Path, first_day: str, last_day: str,
-                       cutoff_day: str, state: pd.DataFrame) -> tuple[str, pd.DataFrame, list[dict]]:
+                       cutoff_day: str, state: pd.DataFrame, parameters=None) -> tuple[str, pd.DataFrame, list[dict]]:
     bars = normalized_bars(pd.read_csv(path))
     study = bars[(bars.time.dt.strftime("%Y-%m-%d") <= last_day)
                  & (bars.time.dt.strftime("%Y-%m-%d") < cutoff_day)].copy()
@@ -569,7 +596,7 @@ def _pit_symbol_inputs(symbol: str, path: Path, first_day: str, last_day: str,
     warmup_day = warmup.time.dt.strftime("%Y-%m-%d").max() if not warmup.empty else None
     bars = study[(study.time.dt.strftime("%Y-%m-%d") >= first_day)
                  | (study.time.dt.strftime("%Y-%m-%d") == warmup_day)].copy()
-    return symbol, bars, history_samples(symbol, bars, state)
+    return symbol, bars, history_samples(symbol, bars, state, parameters)
 
 
 def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
@@ -603,10 +630,11 @@ def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame
         path = BARS / f"{symbol}.csv"
         if not path.exists() or file_sha256(path) != manifest["bars"][symbol]:
             raise RuntimeError(f"历史股票池 {symbol} 的分钟线与验收清单不一致。")
+    indicator_parameters = {key: configured_parameters(load_settings(), key) for key in TECHNICAL_STRATEGIES}
     with ProcessPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(_pit_symbol_inputs, symbol, BARS / f"{symbol}.csv",
                                    first_day, last_day, cutoff_day,
-                                   market_state[market_state.symbol.eq(symbol)])
+                                   market_state[market_state.symbol.eq(symbol)], indicator_parameters)
                    for symbol in sorted(symbols)]
         for index, future in enumerate(as_completed(futures), 1):
             symbol, bars, stock_samples = future.result()
@@ -622,13 +650,15 @@ def train_pit_from_cache() -> dict:
     notice = train_rule_notice()
     if notice is not None:
         return notice
+    first, last = research_range(load_settings(), "training")
+    ensure_range_coverage(read_json(SOURCE_MANIFEST), first, last)
     samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
     provenance = read_json(SOURCE_MANIFEST)
     eligible = universe_history.merge(market_state[["day", "symbol", "is_st", "is_suspended"]],
                                       on=["day", "symbol"], how="left")
     eligible = eligible[~eligible.is_st & ~eligible.is_suspended][["day", "symbol"]]
     filtered = pd.DataFrame(samples).merge(eligible, on=["day", "symbol"], how="inner")
-    final_day = max(universe_history.day)
+    final_day = max(universe_history.loc[universe_history.day.between(first, last), "day"])
     today = universe_history[universe_history.day.eq(final_day)]
     current = [{"symbol": symbol} for symbol in today.symbol]
     return publish_training(filtered.to_dict("records"), bars_by_symbol, current, [],
@@ -695,9 +725,17 @@ def backtest_from_cache(all_strategies: bool = False) -> dict:
     """Load validated inputs once; replay each requested strategy independently."""
     from factor_backtest import run as run_backtest, _prices
 
-    samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
     settings = load_settings()
-    strategies = list(STRATEGIES) if all_strategies else [settings["strategy"]]
+    strategies = list(FIXED_STRATEGIES) if all_strategies else [settings["strategy"]]
+    checkpoint = require_checkpoint(settings["strategy"], settings.get("checkpoint_id"), STORE) if not all_strategies else {}
+    first, last = research_range(settings, "backtest", checkpoint or None)
+    ensure_range_coverage(read_json(SOURCE_MANIFEST), first, last)
+    samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
+    universe_history = universe_history[universe_history.day.between(first, last)].copy()
+    if universe_history.day.nunique() < 2:
+        raise RuntimeError("所选回测区间需要至少两个有历史数据的交易日。")
+    samples = [row for row in samples if first <= row["day"] <= last]
+    market_state = market_state[market_state.day.between(first, last)].copy()
     batch = now_cn().strftime("%Y%m%d-%H%M%S-%f")
     completed, failed = [], {}
     manifest = read_json(SOURCE_MANIFEST)
@@ -705,11 +743,13 @@ def backtest_from_cache(all_strategies: bool = False) -> dict:
     data_hash = hashlib.sha256(json.dumps(input_identity, sort_keys=True).encode()).hexdigest()
     prior_plans = [read_json(path) for path in (BACKTESTS / "plans").glob("*.json")]
     plan = {"batch_id": batch, "registered_at": now_cn().isoformat(timespec="seconds"),
-            "strategy_ids": strategies, "slot": settings["backtest_slot"], "data_hash": data_hash,
+            "requested_start": first, "requested_end": last,
+            "strategy_parameters": {key: configured_parameters(settings, key) for key in strategies},
+            "strategy_ids": strategies, "checkpoint_id": checkpoint.get("model_id"), "slot": settings["backtest_slot"], "data_hash": data_hash,
             "previous_batches_on_dataset": sum(item.get("data_hash") == data_hash for item in prior_plans),
             "definitions": {key: STRATEGIES[key] for key in strategies},
             "implementation_hashes": {name: file_sha256(Path(__file__).with_name(name))
-                                      for name in ("factor_lab.py", "factor_backtest.py", "factor_models.py", "strategy_catalog.py", "strategy_indicators.py")},
+                                      for name in ("factor_lab.py", "factor_backtest.py", "factor_models.py", "strategy_catalog.py", "strategy_indicators.py", "strategy_config.py")},
             "evaluation_status": "exploratory_no_multiple_testing_adjustment"}
     # Register all requested models/rules BEFORE any outcomes are visible.
     write_json(BACKTESTS / "plans" / f"{batch}.json", plan)
@@ -721,8 +761,11 @@ def backtest_from_cache(all_strategies: bool = False) -> dict:
         try:
             summary = run_backtest(samples, bars_by_symbol, BACKTESTS / identifier,
                                    slot=settings["backtest_slot"], strategy=strategy,
+                                   parameters=configured_parameters(settings, strategy),
+                                   start=first, end=last,
                                    universe_history=universe_history, market_state=market_state,
-                                   source_manifest=manifest, market=market)
+                                   source_manifest=manifest, market=market,
+                                   checkpoint=checkpoint or None, model_dir=MODELS / checkpoint["model_id"] if checkpoint else None)
             summary.update({"batch_id": batch, "run_id": identifier,
                             "research_plan": plan,
                             "generated_at": now_cn().isoformat(timespec="seconds")})
@@ -756,7 +799,7 @@ def live_factors(row: pd.Series) -> dict | None:
     return factor_values(price, opening, prev_close, high, low, vwap)
 
 
-def live_technical_factors(symbol: str, moment: datetime, previous_day: str, reference_close: float) -> dict:
+def live_technical_factors(symbol: str, moment: datetime, previous_day: str, reference_close: float, parameters=None) -> dict:
     """Use completed bars, keep live caching separate from accepted replay inputs."""
     from factor_data_prep import _minute_cache_complete, minute_quality_issues
     asof = pd.Timestamp(moment).tz_localize(None).floor("5min")
@@ -784,7 +827,7 @@ def live_technical_factors(symbol: str, moment: datetime, previous_day: str, ref
         raise RuntimeError(f"{symbol} 缺少有效除权口径昨收价。")
     event = pd.DataFrame([{"day": asof.strftime("%Y-%m-%d"), "cash_dividend": 0,
                            "split_ratio": float(previous.iloc[-1].close) / reference_close}])
-    indicators = indicator_frame(combined, event)
+    indicators = indicator_frame(combined, event, parameters)
     values = indicators.iloc[-1].to_dict()
     write_bars_cache(path, combined)
     return {**values, "indicator_at": asof.isoformat(sep=" ")}
@@ -798,10 +841,10 @@ def is_trading_time(moment: datetime) -> bool:
 def rank() -> dict:
     strategy = load_settings()["strategy"]
     is_model = strategy in MODEL_STRATEGIES
-    model = selected_model(strategy) if is_model else {
-        "model_id": strategy, "algorithm": strategy, "features": list(RULE_FEATURES[strategy]),
+    model = selected_model(strategy, load_settings().get("checkpoint_id", "")) if is_model else {
+        "model_id": None, "algorithm": strategy, "features": list(RULE_FEATURES[strategy]),
         "universe_policy": "previous_day_turnover_top40", "universe_method": "前一交易日成交额前40名",
-        "selection_warning": STRATEGIES[strategy]["description"], "quality": "fixed_rule",
+        "selection_warning": strategy_description(strategy, configured_parameters(load_settings(), strategy)), "quality": "fixed_rule",
     }
     if not model:
         raise RuntimeError("所选因子模型尚未训练，请先点击“一键训练”。")
@@ -816,10 +859,8 @@ def rank() -> dict:
     calendar_key = next((key for key in ("trade_date", "日期") if key in calendar.columns), None)
     if calendar_key is None or started.date() not in set(pd.to_datetime(calendar[calendar_key], errors="coerce").dt.date.dropna()):
         raise RuntimeError("交易日历未确认今天为 A 股交易日；本次不发布排名。")
-    if is_model and (started - datetime.fromisoformat(model["selected_at"])).days > 30:
-        raise RuntimeError("因子模型已超过30天，请重新点击“一键训练”。")
-    if model.get("quality") == "exploratory" and (started.date() - pd.Timestamp(model["training"]["last_day"]).date()).days > 7:
-        raise RuntimeError("探索性模型的训练数据已超过7天；请重新点击“一键训练”。")
+    if is_model and started < datetime.fromisoformat(model["selected_at"]):
+        raise RuntimeError("checkpoint 训练日期晚于当前时间。")
     log("[1/3] 获取点击时刻的 A 股行情快照...")
     frame = spot_frame()
     fetched = now_cn()
@@ -846,7 +887,8 @@ def rank() -> dict:
         factors = live_factors(row)
         if factors and strategy in TECHNICAL_STRATEGIES:
             try:
-                factors.update(live_technical_factors(str(row["代码"]), fetched, previous_day, row.get("昨收")))
+                factors.update(live_technical_factors(str(row["代码"]), fetched, previous_day, row.get("昨收"),
+                                                       {strategy: configured_parameters(load_settings(), strategy)}))
                 if any(valid_number(factors.get(key)) is None for key in RULE_FEATURES[strategy]):
                     raise RuntimeError("技术指标预热不足")
             except (RuntimeError, ValueError, OSError) as exc:
@@ -872,11 +914,11 @@ def rank() -> dict:
     if is_model:
         data["score"] = predict(data, model, MODELS / model["model_id"])
     else:
-        data["score"], entries = rule_scores(data, strategy)
+        data["score"], entries = rule_scores(data, strategy, configured_parameters(load_settings(), strategy))
         data = data[entries].copy()
     data = data.sort_values("score", ascending=False)
     ranking = []
-    for position, (_, row) in enumerate(data.head(20).iterrows(), 1):
+    for position, (_, row) in enumerate(data.head(max(20, configured_parameters(load_settings(), strategy)["top_n"])).iterrows(), 1):
         ranking.append({"rank": position, "symbol": row["symbol"], "name": row["name"],
                         "price": round(float(row["price"]), 3), "score": round(float(row["score"]), 4),
                         "factors": {key: round(float(row[key]), 5) for key in model["features"]},
@@ -886,10 +928,14 @@ def rank() -> dict:
         slot_warning += f" 技术指标截至 {records[0]['indicator_at']} 的已完成 5 分钟 K 线。"
     payload = {"id": fetched.strftime("%Y%m%d-%H%M%S-%f"), "market": "a", "generated_at": fetched.isoformat(timespec="seconds"),
                "model_id": model["model_id"], "model_quality": model.get("quality", "validated"),
+               "checkpoint_id": model["model_id"] if is_model else None,
+               "checkpoint_trained_at": model.get("selected_at") if is_model else None,
+               "strategy_parameters": configured_parameters(load_settings(), strategy),
                "algorithm": strategy, "strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
                "available": True, "backtest_slot": backtest_slot,
                "backtest_comparable": False,
                "candidate_count": len(data), "ranking": ranking,
+               "deployment_candidates": data.head(configured_parameters(load_settings(), strategy)["top_n"]).symbol.tolist(),
                "factors": [{"key": key, "name": "盘中时点" if key == "minute_of_day" else FACTOR_NAMES.get(key, INDICATOR_NAMES.get(key, key))}
                            for key in model["features"]],
                "indicator_failures": indicator_failures,
@@ -910,7 +956,15 @@ def rank() -> dict:
 
 
 def status() -> dict:
-    model, latest = selected_model(), read_json(LATEST)
+    settings = load_settings()
+    try:
+        model = require_checkpoint(settings["strategy"], settings.get("checkpoint_id", ""), STORE)
+    except ValueError:
+        model = {}
+    latest = read_json(LATEST)
+    if (latest.get("strategy_id") != settings["strategy"]
+            or (latest.get("checkpoint_id") or "") != settings.get("checkpoint_id", "")):
+        latest = {}
     return {"trained_at": model.get("selected_at"), "model_id": model.get("model_id"),
             "selected_at": model.get("selected_at"), "quality": model.get("quality"),
             "algorithm": model.get("algorithm"), "target_version": model.get("target_version"),
@@ -922,10 +976,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="A股策略训练、回测和即时排名")
     parser.add_argument("action", choices=("train", "train-cached", "backtest", "backtest-all", "rank", "status"))
     parser.add_argument("--strategy", choices=tuple(STRATEGIES), help="本次任务的策略；默认读取控制面板设置")
+    parser.add_argument("--checkpoint", help="回测和部署使用的已训练 checkpoint ID")
+    parser.add_argument("--start", help="本次训练或回测的起始日期 YYYY-MM-DD")
+    parser.add_argument("--end", help="本次训练或回测的结束日期 YYYY-MM-DD")
+    parser.add_argument("--parameters", help="本次策略的超参数 JSON 对象")
     args = parser.parse_args()
-    global _STRATEGY_OVERRIDE
+    global _STRATEGY_OVERRIDE, _CHECKPOINT_OVERRIDE, _SETTINGS_OVERRIDE
     _STRATEGY_OVERRIDE = args.strategy
+    _CHECKPOINT_OVERRIDE = args.checkpoint
     try:
+        purpose = "training" if args.action in ("train", "train-cached") else "backtest"
+        _SETTINGS_OVERRIDE = {}
+        if args.start:
+            _SETTINGS_OVERRIDE[f"{purpose}_start"] = args.start
+        if args.end:
+            _SETTINGS_OVERRIDE[f"{purpose}_end"] = args.end
+        if args.parameters:
+            key = "training_parameters" if purpose == "training" else "strategy_parameters"
+            selected = args.strategy or read_json(SETTINGS).get("strategy", "xgboost")
+            _SETTINGS_OVERRIDE[key] = {**read_json(SETTINGS).get(key, {}), selected: json.loads(args.parameters)}
+            configured_parameters(load_settings(), selected, "training" if purpose == "training" else "execution")
         result = {"train": train, "train-cached": train_from_cache, "backtest": backtest_from_cache,
                   "backtest-all": backtest_all_from_cache, "rank": rank, "status": status}[args.action]()
         if args.action == "status":

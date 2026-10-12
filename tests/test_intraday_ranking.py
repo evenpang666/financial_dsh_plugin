@@ -50,16 +50,16 @@ class IntradayRankingTests(unittest.TestCase):
         self.assertTrue(result["available"])
 
     def test_model_scores_beyond_training_pool_without_training(self):
-        model = {"model_id": "test", "features": ["open_momentum"], "quality": "exploratory", "universe": [{"symbol": "600000"}]}
-        with patch.object(ranking, "ranking_model", return_value=model), patch("factor_models.predict", return_value=np.arange(65)) as predict:
-            result = self.run_ranking("elastic_net")
+        model = {"model_id": "test", "selected_at": self.moment.isoformat(), "features": ["open_momentum"], "quality": "exploratory", "universe": [{"symbol": "600000"}]}
+        with patch.object(ranking, "resolve_selection", return_value=("elastic_net", "test", model)), patch.object(ranking, "ranking_model", return_value=model), patch("factor_models.predict", return_value=np.arange(65)) as predict:
+            result = self.run_ranking("elastic_net", checkpoint_id="test")
         self.assertEqual(len(predict.call_args.args[0]), 65)
         self.assertEqual(len(result["ranking"]), 65)
         self.assertTrue(all(row["entry"] is None for row in result["ranking"]))
         self.assertIn("未经同口径回测验证", result["note"])
 
     def test_minute_strategy_shares_holding_loader_and_counts_failure(self):
-        def load(item, strategy, asof, previous):
+        def load(item, strategy, asof, previous, parameters=None):
             symbol = item["holding"]["symbol"]
             self.assertEqual(strategy, "ma_crossover")
             self.assertEqual(asof, pd.Timestamp("2026-10-12 10:30"))
@@ -76,15 +76,19 @@ class IntradayRankingTests(unittest.TestCase):
         self.assertIn("有效子集排序", result["note"])
         self.assertEqual(result["signal_at"], "2026-10-12T10:30:00")
 
-    def test_only_fresh_trained_models_enter_menu(self):
-        fresh = {"model_id": "test", "selected_at": self.moment.isoformat(), "quality": "exploratory", "training": {"last_day": "2026-10-09"}}
-        stale = {**fresh, "selected_at": (self.moment-timedelta(days=31)).isoformat()}
-        with patch.object(lab, "now_cn", return_value=self.moment), patch.object(lab, "load_settings", return_value={"strategy": "xgboost"}), patch.object(lab, "selected_model", side_effect=lambda strategy: fresh if strategy == "elastic_net" else stale):
+    def test_existing_trained_checkpoints_remain_selectable_regardless_of_age(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(lab, "STORE", Path(directory)), patch.object(lab, "load_settings", return_value={"strategy": "xgboost"}):
+            for algorithm in ("xgboost", "elastic_net"):
+                artifact = Path(directory) / "models" / algorithm
+                artifact.mkdir(parents=True)
+                lab.write_json(artifact / f"{algorithm}.json", {})
+                lab.write_json(artifact / "checkpoint.json", {"model_id": algorithm, "algorithm": algorithm,
+                    "target_version": lab.ML_TARGET_VERSION, "features": ["open_momentum"],
+                    "selected_at": (self.moment - timedelta(days=31)).isoformat(), "training": {"last_day": "2026-09-09"}})
             menu = ranking.ranking_options()
-        self.assertNotIn("xgboost", menu["strategies"])
-        self.assertIn("elastic_net", menu["strategies"])
-        self.assertEqual(len(menu["strategies"]), 9)
-        self.assertIn("30天", menu["unavailable_models"]["xgboost"])
+        self.assertIn("xgboost@xgboost", menu["models"])
+        self.assertIn("elastic_net@elastic_net", menu["models"])
+        self.assertEqual(len(menu["strategies"]), 10)
 
     def test_preopen_and_nontrading_day_do_not_fetch_snapshot(self):
         for moment in (self.moment.replace(hour=9, minute=20), self.moment+timedelta(days=1)):

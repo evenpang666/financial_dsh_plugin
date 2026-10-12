@@ -1,5 +1,73 @@
 {
   "strategy": "xgboost",
   "backtest_slot": "14:00",
-  "weekly_training_enabled": true
+  "weekly_training_enabled": true,
+  "strategy_kind": "model",
+  "training_strategy": "xgboost",
+  "checkpoint_id": "",
+  "training_start": "",
+  "training_end": "",
+  "backtest_start": "",
+  "backtest_end": "",
+  "strategy_parameters": {
+    "xgboost": {
+      "top_n": 5
+    },
+    "elastic_net": {
+      "top_n": 5
+    },
+    "mean_reversion": {
+      "top_n": 5,
+      "deviation": 0.005
+    },
+    "momentum": {
+      "top_n": 5,
+      "threshold": 0.005
+    },
+    "breakout": {
+      "top_n": 5,
+      "range_top": 0.05,
+      "min_range": 0.01
+    },
+    "ma_crossover": {
+      "top_n": 5,
+      "fast_period": 5,
+      "slow_period": 20
+    },
+    "macd": {
+      "top_n": 5,
+      "fast_period": 12,
+      "slow_period": 26,
+      "signal_period": 9
+    },
+    "rsi_rebound": {
+      "top_n": 5,
+      "period": 14,
+      "oversold": 30.0
+    },
+    "bollinger_reversion": {
+      "top_n": 5,
+      "period": 20,
+      "std_dev": 2.0
+    },
+    "donchian_breakout": {
+      "top_n": 5,
+      "period": 20
+    }
+  },
+  "training_parameters": {
+    "xgboost": {
+      "n_estimators": 120,
+      "max_depth": 2,
+      "learning_rate": 0.04,
+      "min_child_weight": 20.0,
+      "reg_lambda": 10.0,
+      "subsample": 0.8
+    },
+    "elastic_net": {
+      "alpha_scale": 0.01,
+      "l1_ratio": 0.5,
+      "max_iter": 10000
+    }
+  }
 }

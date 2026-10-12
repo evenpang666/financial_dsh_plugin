@@ -167,3 +167,7 @@ button:disabled { cursor:default; opacity:.6; }
   .report-page { width:100%; }
   .report-layout { display:block; }
 }
+
+.strategy-parameters { display:flex; flex-wrap:wrap; align-items:end; gap:12px; margin:16px 0; }
+.strategy-parameters input { width:150px; padding:8px; border:1px solid var(--border, #d4dce3); border-radius:8px; background:var(--surface, white); color:inherit; }
+.strategy-parameters p { flex-basis:100%; margin:0; }

@@ -88,7 +88,7 @@ class StrategyReviewTests(unittest.TestCase):
 
     def test_selected_fixed_strategy_uses_held_pool_and_keeps_non_entry_distinct(self):
         items = [holding("600519"), holding("000858")]
-        def record(item, strategy, asof, previous, deadline=None):
+        def record(item, strategy, asof, previous, deadline=None, parameters=None):
             return {"symbol": item["holding"]["symbol"], "price": 10, "as_of": asof.isoformat(),
                     "open_momentum": .02 if item["holding"]["symbol"] == "600519" else -.01}
         with self.calendar(), patch.object(research, "load_signal_record", side_effect=record):
@@ -118,9 +118,9 @@ class StrategyReviewTests(unittest.TestCase):
         with self.calendar(), patch.object(factor_lab, "selected_model", return_value=model) as chosen, \
                 patch.object(research, "load_signal_record", return_value={"symbol": "600519", "price": 10, "as_of": "2026-09-14T14:30:00"}), \
                 patch("factor_models.predict", return_value=[.2]) as predict:
-            result = research.strategy_review([holding("600519")], "elastic_net", "a", NOW)
+            result = research.strategy_review([holding("600519")], "elastic_net", "a", NOW, checkpoint_id="test")
         self.assertTrue(result["available"])
-        chosen.assert_called_once_with("elastic_net")
+        chosen.assert_called_once_with("elastic_net", "test")
         self.assertEqual(predict.call_args.args[1]["model_id"], "test")
 
     def test_future_bars_cannot_change_signal_and_stale_cache_is_not_reused(self):
