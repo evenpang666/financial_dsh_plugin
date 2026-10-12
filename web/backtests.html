@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="独立的策略回测结果、历史记录、净值曲线与交易明细">
+  <title>策略回测结果 · 财务研究智能体</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="/backtests" aria-label="策略回测首页"><span>策略回测</span></a>
+    <div class="topbar-meta"><a class="topbar-link" href="/">双时点日报</a><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
+  </header>
+  <main class="report-page backtest-page">
+    <section id="pageTop" class="intro" aria-labelledby="pageTitle">
+      <p class="eyebrow">STRATEGY BACKTESTS</p>
+      <div class="intro-heading">
+        <div><h1 id="pageTitle">策略回测结果</h1><p>比较策略表现，查看历史记录与模拟交易明细。</p></div>
+        <div class="actions"><button id="refreshButton" type="button">刷新结果</button></div>
+      </div>
+    </section>
+    <div class="report-layout">
+    <aside class="report-index" aria-label="回测索引列">
+      <details id="backtestIndexPanel" class="index-panel" open>
+        <summary>回测索引<span>展开 / 收起</span></summary>
+        <nav id="backtestIndex" aria-label="回测章节">
+          <a href="#pageTop" data-index-target><span>01</span>页面概览</a>
+          <div id="backtestIndexSections"></div>
+          <a href="#pageTop" class="index-top-link">↑ 返回顶部</a>
+        </nav>
+      </details>
+    </aside>
+    <div class="report-content">
+    <section id="backtestResults" class="ranking-shell" aria-labelledby="backtestTitle">
+      <div class="ranking-heading"><div><p class="eyebrow">PERFORMANCE & HISTORY</p><h2 id="backtestTitle">策略表现与数据图</h2><p id="backtestMeta">正在读取策略回测结果…</p></div><span class="ranking-badge">A 股 · 模拟研究</span></div>
+      <div id="backtestContent" class="backtest-content" aria-live="polite"></div>
+    </section>
+    </div>
+    </div>
+  </main>
+  <footer><span>仅限本机与局域网内访问</span><span>DSH Finance Agent</span></footer>
+  <script src="/backtests.js" defer></script>
+</body>
+</html>

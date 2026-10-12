@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -16,16 +17,25 @@ spec.loader.exec_module(daily_push)
 
 
 class DailyPushTests(unittest.TestCase):
-    def test_backtest_summary_is_appended_to_a_share_report(self):
-        summary = {"available": True, "generated_at": "2026-10-11T10:00:00+08:00",
-                   "first_day": "2026-01-01", "last_day": "2026-10-10", "days": 100,
-                   "slot": "10:30", "execution": "10:35",
-                   "stats": {"total_return": 0.12, "max_drawdown": -0.08, "trades": 50, "costs": 1000},
-                   "oos_rank_ic": {"rank_ic": 0.04}}
-        with patch("report_web_server.latest_backtest", return_value=summary):
-            result = daily_push.with_backtest_section("# A股日报")
-        self.assertIn("10:30 信号，10:35 模拟成交", result)
-        self.assertIn("样本外 Rank IC 0.0400", result)
+    def test_reports_archive_and_push_without_backtests_for_both_markets_and_sessions(self):
+        for market in ("a", "hk"):
+            for session in ("morning", "afternoon"):
+                with self.subTest(market=market, session=session), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    markdown = "# 日报\n\n## 市场全景\n研究内容\n\n## 策略回测摘要\n历史绩效\n\n## 数据缺失\n保留说明"
+                    with (patch.object(daily_push, "STATE_FILE", root / "state.json"),
+                          patch.object(daily_push, "REPORT_DIR", root / "reports"),
+                          patch.object(daily_push, "get_json", return_value={"is_trading_day": True, "markdown": markdown}),
+                          patch.object(daily_push, "notify_report_site"),
+                          patch("report_web_server.latest_backtest", side_effect=AssertionError("日报不应读取回测")),
+                          patch.object(daily_push, "post_webhook") as post):
+                        daily_push.run_once({"data_service_url": "http://test", "market": market, "webhook_url": "http://hook"}, force=True, session=session)
+                    archived = next((root / "reports").glob("*.md")).read_text()
+                    self.assertNotIn("策略回测摘要", archived)
+                    self.assertNotIn("历史绩效", archived)
+                    self.assertIn("研究内容", archived)
+                    self.assertIn("保留说明", archived)
+                    self.assertEqual(post.call_args.args[2], archived)
 
     def test_default_schedule_is_0920(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -75,7 +85,7 @@ class DailyPushTests(unittest.TestCase):
             self.assertTrue(daily_push.run_once(config, force=True))
             self.assertEqual(post.call_args.args[:2], ("http://hook", "generic"))
             self.assertIn("# report", post.call_args.args[2])
-            self.assertIn("## AI 因子滚动回测", post.call_args.args[2])
+            self.assertNotIn("## 策略回测摘要", post.call_args.args[2])
             notify.assert_called_once()
             open_page.assert_called_once()
             self.assertTrue(any((Path(directory) / "reports").glob("*.md")))
@@ -127,6 +137,67 @@ class DailyPushTests(unittest.TestCase):
              patch.object(daily_push, "notify_report_site", side_effect=URLError("site offline")):
             self.assertTrue(daily_push.run_once(config, force=True))
             self.assertTrue(any((Path(directory) / "reports").glob("*.md")))
+
+    def test_manual_generation_refreshes_existing_report_without_push_or_schedule_state_changes(self):
+        today = datetime.now(daily_push.CHINA_TZ).date().isoformat()
+        config = {"enabled": False, "data_service_url": "http://test", "candidate_limit": 5,
+                  "market": "a", "webhook_url": "http://hook", "auto_open_report": False}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); state = root / "state.json"
+            state.write_text(json.dumps({"last_success_date": today, "completed": {f"{today}:a:morning": {"pushed": True}}}))
+            before = state.read_bytes()
+            with (patch.object(daily_push, "STATE_FILE", state), patch.object(daily_push, "REPORT_DIR", root / "reports"),
+                  patch.object(daily_push, "get_json", side_effect=[{"is_trading_day": True, "markdown": "# first"}, {"is_trading_day": True, "markdown": "# refreshed"}]) as get,
+                  patch.object(daily_push, "notify_report_site") as notify,
+                  patch.object(daily_push, "post_webhook") as post, patch.object(daily_push, "open_report_page") as page):
+                self.assertTrue(daily_push.run_once(config, manual=True))
+                self.assertTrue(daily_push.run_once(config, manual=True))
+            self.assertEqual(get.call_count, 2)
+            self.assertEqual(notify.call_count, 2)
+            self.assertEqual(state.read_bytes(), before)
+            post.assert_not_called(); page.assert_not_called()
+            self.assertIn("# refreshed", (root / "reports" / f"{today}-a-morning.md").read_text())
+
+    def test_manual_generation_does_not_suppress_next_scheduled_report(self):
+        config = {"enabled": True, "data_service_url": "http://test", "candidate_limit": 5,
+                  "market": "hk", "webhook_url": "http://hook"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (patch.object(daily_push, "STATE_FILE", root / "state.json"), patch.object(daily_push, "REPORT_DIR", root / "reports"),
+                  patch.object(daily_push, "get_json", return_value={"is_trading_day": True, "markdown": "# 港股报告"}) as get,
+                  patch.object(daily_push, "notify_report_site"), patch.object(daily_push, "post_webhook") as post):
+                self.assertTrue(daily_push.run_once(config, session="afternoon", manual=True))
+                self.assertFalse((root / "state.json").exists())
+                self.assertTrue(daily_push.run_once(config, session="afternoon"))
+            self.assertEqual(get.call_count, 2)
+            post.assert_called_once()
+
+    def test_manual_non_trading_day_or_data_failure_preserves_previous_report(self):
+        config = {"enabled": True, "data_service_url": "http://test", "market": "hk"}
+        today = datetime.now(daily_push.CHINA_TZ).date().isoformat()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); reports = root / "reports"; reports.mkdir()
+            target = reports / f"{today}-hk-morning.md"; target.write_text("existing report")
+            with (patch.object(daily_push, "STATE_FILE", root / "state.json"), patch.object(daily_push, "REPORT_DIR", reports),
+                  patch.object(daily_push, "get_json", return_value={"is_trading_day": False}),
+                  patch.object(daily_push, "notify_report_site") as notify):
+                self.assertFalse(daily_push.run_once(config, manual=True))
+                notify.assert_not_called()
+            with (patch.object(daily_push, "STATE_FILE", root / "state.json"), patch.object(daily_push, "REPORT_DIR", reports),
+                  patch.object(daily_push, "get_json", side_effect=URLError("offline"))):
+                with self.assertRaises(URLError):
+                    daily_push.run_once(config, manual=True)
+            self.assertEqual(target.read_text(), "existing report")
+
+    def test_manual_cli_selects_current_session(self):
+        config = {"enabled": False}
+        with (patch.object(sys, "argv", ["daily_push.py", "--manual"]),
+              patch.object(daily_push, "load_config", return_value=config),
+              patch.object(daily_push, "session_for_now", return_value="afternoon"),
+              patch.object(daily_push, "run_once") as run, patch.object(daily_push, "run_daemon") as daemon):
+            self.assertEqual(daily_push.main(), 0)
+        run.assert_called_once_with(config, force=False, session="afternoon", manual=True)
+        daemon.assert_not_called()
 
 
 if __name__ == "__main__":

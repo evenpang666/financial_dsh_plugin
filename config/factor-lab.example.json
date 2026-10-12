@@ -1,4 +1,5 @@
 {
+  "strategy": "xgboost",
   "backtest_slot": "14:00",
   "weekly_training_enabled": true
 }

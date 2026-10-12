@@ -11,7 +11,7 @@ const OUTPUT = {
 }
 
 const DESCRIPTIONS = {
-  'portfolio-daily-review': 'Review locally saved A-share or Hong Kong stock holdings on their respective trading days using evidence, risk limits, and research-only action labels.',
+  'portfolio-daily-review': '按需分析已保存持仓，生成研究建议1、所选交易策略配置2及综合复核3，解释分歧、配置分母、现金、时点及缺失证据；不执行交易。',
   'market-event-briefing': 'Summarize daily or weekly market events with source dates, explicit uncertainty, and relevance to A-share or Hong Kong stock research.',
   'daily-stock-candidate-screen': 'Create a research candidate list from current evidence; never present it as a personalized buy list or trading order.',
   'a-share-research': '在用户要求研究、比较或复盘A股标的时使用；以工具事实为依据，输出可追溯的研究报告和非交易性动作建议。',
@@ -79,6 +79,15 @@ export function apply(ctx, config = {}) {
     description: 'Read the locally saved research portfolio. It contains only user-supplied symbols, optional cost basis, shares, and notes; it has no broker connection.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     execute: () => call('/v1/portfolio'),
+  })
+  register({
+    name: 'get_portfolio_position_review',
+    description: '按需读取当前市场的已保存持仓，比较个股研究配置1、指定策略在持仓池上的入场排序配置2和综合结果3。权重基于假设研究预算，非账户仓位。工具不调用LLM、不执行交易或写入日报；智能体需进一步解释证据差异。',
+    parameters: { type: 'object', properties: {
+      market: { type: 'string', enum: ['a', 'hk'] },
+      strategy: { type: 'string', enum: ['xgboost', 'elastic_net', 'mean_reversion', 'momentum', 'breakout', 'ma_crossover', 'macd', 'rsi_rebound', 'bollinger_reversion', 'donchian_breakout'], description: '不传时沿用控制面板设置；当前策略仅支持A股。' },
+    }, additionalProperties: false },
+    execute: ({market: selectedMarket = 'a', strategy = ''}) => call(`/v1/portfolio-analysis?${marketParam(selectedMarket)}&strategy=${encodeURIComponent(strategy)}`, {timeoutMs: 180000}),
   })
   register({
     name: 'set_portfolio',

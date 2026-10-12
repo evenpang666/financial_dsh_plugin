@@ -19,6 +19,8 @@ from urllib.request import Request, urlopen
 import pandas as pd
 import requests
 from factor_models import EXECUTION_BAR, NEXT_BAR
+from strategy_catalog import MODEL_STRATEGIES, TECHNICAL_STRATEGIES, RULE_FEATURES, STRATEGIES, rule_scores, validate_strategy
+from strategy_indicators import INDICATOR_NAMES, indicator_frame
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +49,7 @@ ML_TARGET_VERSION = 3
 EM_MINUTE_UNAVAILABLE = threading.Event()
 SINA_MINUTE_UNAVAILABLE = threading.Event()
 SINA_REQUEST_GATE = threading.Lock()
+_STRATEGY_OVERRIDE: str | None = None
 
 
 def now_cn() -> datetime:
@@ -85,16 +88,37 @@ def load_settings() -> dict:
     slot = supplied.get("backtest_slot", "14:00")
     if slot not in NEXT_BAR:
         raise ValueError(f"回测时点无效：{slot}；可选 {', '.join(NEXT_BAR)}")
-    return {"backtest_slot": slot,
+    strategy = validate_strategy(_STRATEGY_OVERRIDE or supplied.get("strategy", "xgboost"))
+    return {"backtest_slot": slot, "strategy": strategy,
             "weekly_training_enabled": bool(supplied.get("weekly_training_enabled", True))}
 
 
 def save_settings(slot: str, weekly_training_enabled: bool = True) -> dict:
     if slot not in NEXT_BAR:
         raise ValueError(f"回测时点无效：{slot}")
-    value = {"backtest_slot": slot, "weekly_training_enabled": bool(weekly_training_enabled)}
+    value = {**read_json(SETTINGS), "backtest_slot": slot, "weekly_training_enabled": bool(weekly_training_enabled)}
     write_json(SETTINGS, value)
     return value
+
+
+def selected_model(strategy: str | None = None) -> dict:
+    strategy = strategy or load_settings()["strategy"]
+    if strategy not in MODEL_STRATEGIES:
+        return {}
+    model = read_json(MODEL.with_name(f"model-{strategy}.json")) or read_json(MODEL)
+    artifact = MODELS / str(model.get("model_id", "")) / f"{strategy}.json"
+    if (model.get("target_version") == ML_TARGET_VERSION and artifact.is_file()
+            and (model.get("algorithm") == strategy or strategy in model.get("algorithms", {}))):
+        return {**model, "algorithm": strategy}
+    return {}
+
+
+def train_rule_notice() -> dict | None:
+    strategy = load_settings()["strategy"]
+    if strategy not in MODEL_STRATEGIES:
+        log(f"{STRATEGIES[strategy]['name']} 使用固定规则，无需训练；可直接回测或排序。")
+        return {"strategy": strategy, "requires_training": False}
+    return None
 
 
 def write_bars_cache(path: Path, frame: pd.DataFrame):
@@ -312,7 +336,9 @@ def history_samples(symbol: str, bars: pd.DataFrame,
                     market_state: pd.DataFrame | None = None) -> list[dict]:
     if bars.empty:
         return []
-    frame = bars.copy()
+    frame = bars.sort_values("time", kind="stable").reset_index(drop=True).copy()
+    indicator_state = None if market_state is None else market_state[market_state.symbol.eq(symbol)]
+    frame = pd.concat([frame, indicator_frame(frame, indicator_state)], axis=1)
     frame["day"] = frame["time"].dt.strftime("%Y-%m-%d")
     frame["clock"] = frame["time"].dt.strftime("%H:%M")
     # Candidate features must not depend on whether this day *later* completes.
@@ -369,7 +395,8 @@ def history_samples(symbol: str, bars: pd.DataFrame,
                           if exit_price and exit_event is not None else exit_price)
             samples.append({"symbol": symbol, "day": day, "slot": slot,
                             "target": (exit_value / entry_price - 1 if entry_price and exit_value else None),
-                            "exit_day": exit_day, **factors})
+                            "exit_day": exit_day, **factors,
+                            **{key: float(earlier.iloc[-1][key]) for key in INDICATOR_NAMES}})
     return samples
 
 
@@ -399,6 +426,9 @@ def inferred_vwap(amount, volume, reference) -> float | None:
 
 
 def train() -> dict:
+    notice = train_rule_notice()
+    if notice is not None:
+        return notice
     if read_json(SOURCE_MANIFEST).get("validated"):
         return train_pit_from_cache()
     log("[1/5] 获取 A 股行情并选择40只候选股票...")
@@ -476,15 +506,16 @@ def publish_training(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame
     universe_method = (method + "；逐日全市场成交额历史名单"
                        if point_in_time else
                        method + "；这是受限候选池，不代表全A股，也有存续偏差")
-    model_id = now_cn().strftime("%Y%m%d-%H%M%S")
-    log("[5/5] 训练 XGBoost 排序模型与 Elastic Net，并按验证期 Rank IC 选择...")
-    ml = fit_models(samples, MODELS / model_id)
+    model_id = now_cn().strftime("%Y%m%d-%H%M%S-%f")
+    strategy = load_settings()["strategy"]
+    log(f"[5/5] 仅训练 {STRATEGIES[strategy]['name']}，按时间划分评估...")
+    ml = fit_models(samples, MODELS / model_id, strategy)
     slot = load_settings()["backtest_slot"]
     log("  模型训练已完成；滚动回测需单独运行，其绩效不代表当前发布模型权重。")
     holdout_ics = [entry.get("holdout", {}).get("rank_ic") for entry in ml["algorithms"].values()]
-    holdout_warning = (" 本次两种算法的留出期 Rank IC 均为负，尚无稳定样本外证据。"
+    holdout_warning = (" 所选模型的留出期 Rank IC 非正，尚无稳定样本外证据。"
                        if holdout_ics and all(value is not None and value <= 0 for value in holdout_ics) else "")
-    validation_warning = (" 两种算法的验证期均未达到正向门槛，仅按较高 Rank IC 排序，不代表有效预测。"
+    validation_warning = (" 所选模型的验证期未达到正向门槛，不代表有效预测。"
                           if not ml.get("validation_eligible", True) else "")
     model = {"model_id": model_id, "selected_at": now_cn().isoformat(timespec="seconds"),
              "market": "a", "target": "信号后预留一根完整5分钟K线，再按下一根K线VWAP买入至次日同一窗口VWAP卖出的价格变化",
@@ -501,6 +532,7 @@ def publish_training(samples: list[dict], bars_by_symbol: dict[str, pd.DataFrame
              "training": {"days": ml["days"], "last_day": ml["last_day"],
                           "samples": ml["samples"], "holdout_days": ml["holdout_days"]}}
     write_json(MODEL, model)
+    write_json(MODEL.with_name(f"model-{strategy}.json"), model)
     write_json(LATEST, {})
     log(f"训练并发布完成：{model_id}；当前排序算法 {ml['algorithm']}；训练覆盖 {ml['days']} 个交易日。")
     return model
@@ -547,9 +579,13 @@ def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame
         universe_history = pd.read_csv(UNIVERSE_HISTORY, dtype={"symbol": str})
         market_state = pd.read_csv(MARKET_STATE, dtype={"symbol": str})
     except (OSError, ValueError) as exc:
-        raise RuntimeError("缺少 universe-history.csv 或 market-state.csv；新版回测要求逐日时点数据。") from exc
+        raise RuntimeError("缺少 universe-history.csv 或 market-state.csv；请先按 README 5.5 运行 scripts/factor_data_prep.py 准备并验收历史数据，再回测。") from exc
     universe_history, market_state = validate_context(universe_history, market_state)
     manifest = read_json(SOURCE_MANIFEST)
+    if manifest.get("data_schema_version") != 2:
+        raise RuntimeError("历史数据格式需升级，请重新运行 factor_data_prep.py 验收交易状态与红股上市日期。")
+    if manifest.get("feature_warmup_validated") is not True:
+        raise RuntimeError("历史数据尚未验收首次入池前的预热分钟线，请运行 factor_data_prep.py 自动补齐并重新验收。")
     if not manifest.get("validated") or manifest.get("source_scope") != "historical_vendor_reconstruction":
         raise RuntimeError("缺少通过验收的数据来源清单；请先运行 factor_data_prep.py。")
     for name, digest in manifest.get("files", {}).items():
@@ -583,6 +619,9 @@ def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame
 
 def train_pit_from_cache() -> dict:
     """Fit a live model from the same changing historical pool as the replay."""
+    notice = train_rule_notice()
+    if notice is not None:
+        return notice
     samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
     provenance = read_json(SOURCE_MANIFEST)
     eligible = universe_history.merge(market_state[["day", "symbol", "is_st", "is_suspended"]],
@@ -634,24 +673,79 @@ def today_pit_universe(moment: datetime) -> set[str]:
 
 def train_from_cache() -> dict:
     """Retrain a previously snapshotted candidate pool without network calls."""
+    notice = train_rule_notice()
+    if notice is not None:
+        return notice
     samples, bars_by_symbol, universe = cached_inputs()
     return publish_training(samples, bars_by_symbol, universe, [],
                             "沿用上次训练的候选池（本地缓存）", "本地候选池快照", "本地5分钟线缓存")
 
 
-def backtest_from_cache() -> dict:
-    """Re-run the research backtest without downloading or publishing a model."""
-    from factor_backtest import run as run_backtest
+def notify_backtest():
+    try:
+        request = Request("http://127.0.0.1:8766/api/publish-backtest", data=b"{}", method="POST",
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=4):
+            pass
+    except OSError:
+        pass
+
+
+def backtest_from_cache(all_strategies: bool = False) -> dict:
+    """Load validated inputs once; replay each requested strategy independently."""
+    from factor_backtest import run as run_backtest, _prices
 
     samples, bars_by_symbol, universe_history, market_state = backtest_inputs()
-    identifier = now_cn().strftime("%Y%m%d-%H%M%S")
-    summary = run_backtest(samples, bars_by_symbol, BACKTESTS / identifier,
-                           slot=load_settings()["backtest_slot"],
-                           universe_history=universe_history, market_state=market_state,
-                           source_manifest=read_json(SOURCE_MANIFEST))
-    log(f"回测完成：{summary['days']} 日；收益 {summary['stats']['total_return']:.2%}；"
-        f"最大回撤 {summary['stats']['max_drawdown']:.2%}；详情：{BACKTESTS / identifier}")
-    return summary
+    settings = load_settings()
+    strategies = list(STRATEGIES) if all_strategies else [settings["strategy"]]
+    batch = now_cn().strftime("%Y%m%d-%H%M%S-%f")
+    completed, failed = [], {}
+    manifest = read_json(SOURCE_MANIFEST)
+    input_identity = {key: manifest.get(key, {}) for key in ("files", "bars")}
+    data_hash = hashlib.sha256(json.dumps(input_identity, sort_keys=True).encode()).hexdigest()
+    prior_plans = [read_json(path) for path in (BACKTESTS / "plans").glob("*.json")]
+    plan = {"batch_id": batch, "registered_at": now_cn().isoformat(timespec="seconds"),
+            "strategy_ids": strategies, "slot": settings["backtest_slot"], "data_hash": data_hash,
+            "previous_batches_on_dataset": sum(item.get("data_hash") == data_hash for item in prior_plans),
+            "definitions": {key: STRATEGIES[key] for key in strategies},
+            "implementation_hashes": {name: file_sha256(Path(__file__).with_name(name))
+                                      for name in ("factor_lab.py", "factor_backtest.py", "factor_models.py", "strategy_catalog.py", "strategy_indicators.py")},
+            "evaluation_status": "exploratory_no_multiple_testing_adjustment"}
+    # Register all requested models/rules BEFORE any outcomes are visible.
+    write_json(BACKTESTS / "plans" / f"{batch}.json", plan)
+    log("准备各策略共用的信号、成交和收盘价格…")
+    market = _prices(bars_by_symbol, settings["backtest_slot"], EXECUTION_BAR[settings["backtest_slot"]])
+    for strategy in strategies:
+        identifier = f"{batch}-{strategy}"
+        log(f"开始回测：{STRATEGIES[strategy]['name']}")
+        try:
+            summary = run_backtest(samples, bars_by_symbol, BACKTESTS / identifier,
+                                   slot=settings["backtest_slot"], strategy=strategy,
+                                   universe_history=universe_history, market_state=market_state,
+                                   source_manifest=manifest, market=market)
+            summary.update({"batch_id": batch, "run_id": identifier,
+                            "research_plan": plan,
+                            "generated_at": now_cn().isoformat(timespec="seconds")})
+            write_json(BACKTESTS / identifier / "summary.json", summary)
+            completed.append(summary)
+            log(f"{STRATEGIES[strategy]['name']} 回测完成：{summary['days']} 日；收益 {summary['stats']['total_return']:.2%}；"
+                f"最大回撤 {summary['stats']['max_drawdown']:.2%}；详情：{BACKTESTS / identifier}")
+            notify_backtest()
+        except Exception as exc:
+            failed[strategy] = str(exc)
+            log(f"{STRATEGIES[strategy]['name']} 回测失败：{exc}")
+    if all_strategies:
+        result = {"batch_id": batch, "completed": completed, "failed": failed}
+        write_json(BACKTESTS / "batches" / f"{batch}.json", result)
+    else:
+        result = completed[0] if completed else {}
+    if failed:
+        raise RuntimeError(f"{len(completed)} 项回测完成，{len(failed)} 项失败：" + "；".join(f"{key}: {value}" for key, value in failed.items()))
+    return result
+
+
+def backtest_all_from_cache() -> dict:
+    return backtest_from_cache(all_strategies=True)
 
 
 def live_factors(row: pd.Series) -> dict | None:
@@ -662,16 +756,56 @@ def live_factors(row: pd.Series) -> dict | None:
     return factor_values(price, opening, prev_close, high, low, vwap)
 
 
+def live_technical_factors(symbol: str, moment: datetime, previous_day: str, reference_close: float) -> dict:
+    """Use completed bars, keep live caching separate from accepted replay inputs."""
+    from factor_data_prep import _minute_cache_complete, minute_quality_issues
+    asof = pd.Timestamp(moment).tz_localize(None).floor("5min")
+    if asof.strftime("%H:%M") == "13:00":
+        asof = asof.replace(hour=11, minute=30)
+    path = STORE / "live-bars" / f"{symbol}.csv"
+    cached = []
+    for candidate in (BARS / f"{symbol}.csv", path):
+        if candidate.is_file():
+            cached.append(normalized_bars(pd.read_csv(candidate)))
+    combined = normalized_bars(pd.concat(cached, ignore_index=True)) if cached else pd.DataFrame()
+    if combined.empty or asof not in set(combined.time):
+        fresh = fetch_bars(symbol, moment - timedelta(days=7), moment)
+        combined = fresh if combined.empty else normalized_bars(pd.concat([combined, fresh], ignore_index=True))
+    combined = combined[combined.time.le(asof)].copy()
+    dates = combined.time.dt.strftime("%Y-%m-%d")
+    combined = combined[dates.isin([previous_day, asof.strftime("%Y-%m-%d")])].copy()
+    if minute_quality_issues(combined) or not _minute_cache_complete(combined, [previous_day]):
+        raise RuntimeError(f"{symbol} 缺少 {previous_day} 完整预热行情或价量校验失败。")
+    if asof not in set(combined.time):
+        raise RuntimeError(f"{symbol} 未取得截至 {asof} 的已完成 5 分钟 K 线。")
+    previous = combined[combined.time.dt.strftime("%Y-%m-%d").eq(previous_day)]
+    reference_close = valid_number(reference_close)
+    if not reference_close or reference_close <= 0:
+        raise RuntimeError(f"{symbol} 缺少有效除权口径昨收价。")
+    event = pd.DataFrame([{"day": asof.strftime("%Y-%m-%d"), "cash_dividend": 0,
+                           "split_ratio": float(previous.iloc[-1].close) / reference_close}])
+    indicators = indicator_frame(combined, event)
+    values = indicators.iloc[-1].to_dict()
+    write_bars_cache(path, combined)
+    return {**values, "indicator_at": asof.isoformat(sep=" ")}
+
+
 def is_trading_time(moment: datetime) -> bool:
     clock = moment.strftime("%H:%M")
     return moment.weekday() < 5 and ("09:35" <= clock <= "11:30" or "13:00" <= clock < "15:00")
 
 
 def rank() -> dict:
-    model = read_json(MODEL)
+    strategy = load_settings()["strategy"]
+    is_model = strategy in MODEL_STRATEGIES
+    model = selected_model(strategy) if is_model else {
+        "model_id": strategy, "algorithm": strategy, "features": list(RULE_FEATURES[strategy]),
+        "universe_policy": "previous_day_turnover_top40", "universe_method": "前一交易日成交额前40名",
+        "selection_warning": STRATEGIES[strategy]["description"], "quality": "fixed_rule",
+    }
     if not model:
-        raise RuntimeError("尚无已发布模型，请先点击“一键训练”。")
-    if model.get("algorithm") not in ("xgboost", "elastic_net") or model.get("target_version") != ML_TARGET_VERSION:
+        raise RuntimeError("所选因子模型尚未训练，请先点击“一键训练”。")
+    if is_model and model.get("target_version") != ML_TARGET_VERSION:
         raise RuntimeError("旧版非 AI 因子模型或当日收盘模型已停用；请重新点击“一键训练”。")
     started = now_cn()
     if not is_trading_time(started):
@@ -682,7 +816,7 @@ def rank() -> dict:
     calendar_key = next((key for key in ("trade_date", "日期") if key in calendar.columns), None)
     if calendar_key is None or started.date() not in set(pd.to_datetime(calendar[calendar_key], errors="coerce").dt.date.dropna()):
         raise RuntimeError("交易日历未确认今天为 A 股交易日；本次不发布排名。")
-    if (started - datetime.fromisoformat(model["selected_at"])).days > 30:
+    if is_model and (started - datetime.fromisoformat(model["selected_at"])).days > 30:
         raise RuntimeError("因子模型已超过30天，请重新点击“一键训练”。")
     if model.get("quality") == "exploratory" and (started.date() - pd.Timestamp(model["training"]["last_day"]).date()).days > 7:
         raise RuntimeError("探索性模型的训练数据已超过7天；请重新点击“一键训练”。")
@@ -701,36 +835,66 @@ def rank() -> dict:
         for column in ("成交量", "成交额"):
             if column in frame.columns:
                 frame = frame[pd.to_numeric(frame[column], errors="coerce").gt(0)]
-    records = []
-    for _, row in frame.iterrows():
+    previous_day = None
+    if strategy in TECHNICAL_STRATEGIES:
+        previous = sorted(day for day in pd.to_datetime(calendar[calendar_key]).dt.date if day < fetched.date())
+        if not previous:
+            raise RuntimeError("交易日历未提供技术策略所需的前一交易日。")
+        previous_day = previous[-1].isoformat()
+    records, indicator_failures = [], []
+    for index, (_, row) in enumerate(frame.iterrows(), 1):
         factors = live_factors(row)
+        if factors and strategy in TECHNICAL_STRATEGIES:
+            try:
+                factors.update(live_technical_factors(str(row["代码"]), fetched, previous_day, row.get("昨收")))
+                if any(valid_number(factors.get(key)) is None for key in RULE_FEATURES[strategy]):
+                    raise RuntimeError("技术指标预热不足")
+            except (RuntimeError, ValueError, OSError) as exc:
+                indicator_failures.append(f"{row['代码']}: {exc}")
+                log(f"  技术指标行情未就绪：{row['代码']}：{exc}")
+                continue
         if factors:
             records.append({"symbol": str(row["代码"]), "name": str(row["名称"]),
                             "price": valid_number(row["最新价"]), **factors})
+        if strategy in TECHNICAL_STRATEGIES and (index % 10 == 0 or index == len(frame)):
+            log(f"  已准备 {index}/{len(frame)} 只股票的已完成 5 分钟线；有效 {len(records)} 只")
+    completed = now_cn()
+    if completed.date() != fetched.date() or not is_trading_time(completed):
+        raise RuntimeError("行情准备跨过交易时段，请重新点击排序；本次不发布排名。")
     if len(records) < MIN_STOCKS:
-        raise RuntimeError(f"当前仅 {len(records)} 只候选有完整有效行情，至少需要 {MIN_STOCKS} 只。")
+        raise RuntimeError(f"当前仅 {len(records)} 只候选有完整有效行情，至少需要 {MIN_STOCKS} 只。"
+                           + (f"技术指标数据失败例如 {indicator_failures[:3]}。" if indicator_failures else ""))
     data = pd.DataFrame(records)
-    log(f"[2/3] 在 {len(data)} 只有效候选中用模型 {model['model_id']} 排序...")
+    log(f"[2/3] 在 {len(data)} 只有效候选中用 {STRATEGIES[strategy]['name']} 排序...")
     from factor_models import minute_of_day, predict
     backtest_slot = load_settings()["backtest_slot"]
     data["minute_of_day"] = minute_of_day(fetched.strftime("%H:%M"))
-    data["score"] = predict(data, model, MODELS / model["model_id"])
+    if is_model:
+        data["score"] = predict(data, model, MODELS / model["model_id"])
+    else:
+        data["score"], entries = rule_scores(data, strategy)
+        data = data[entries].copy()
     data = data.sort_values("score", ascending=False)
     ranking = []
     for position, (_, row) in enumerate(data.head(20).iterrows(), 1):
         ranking.append({"rank": position, "symbol": row["symbol"], "name": row["name"],
                         "price": round(float(row["price"]), 3), "score": round(float(row["score"]), 4),
-                        "factors": {key: round(float(row[key]), 5) for key in model["features"]}})
+                        "factors": {key: round(float(row[key]), 5) for key in model["features"]},
+                        **({"indicator_at": row["indicator_at"]} if strategy in TECHNICAL_STRATEGIES else {})})
     slot_warning = " 实时快照缺少逐股报价时间戳，无法证明与所选5分钟K线收盘时点一致；本次排名不与回测直接对应。"
+    if strategy in TECHNICAL_STRATEGIES:
+        slot_warning += f" 技术指标截至 {records[0]['indicator_at']} 的已完成 5 分钟 K 线。"
     payload = {"id": fetched.strftime("%Y%m%d-%H%M%S-%f"), "market": "a", "generated_at": fetched.isoformat(timespec="seconds"),
                "model_id": model["model_id"], "model_quality": model.get("quality", "validated"),
-               "algorithm": model["algorithm"], "backtest_slot": backtest_slot,
+               "algorithm": strategy, "strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
+               "available": True, "backtest_slot": backtest_slot,
                "backtest_comparable": False,
                "candidate_count": len(data), "ranking": ranking,
-               "factors": [{"key": key, "name": "盘中时点" if key == "minute_of_day" else FACTOR_NAMES.get(key, key)}
+               "factors": [{"key": key, "name": "盘中时点" if key == "minute_of_day" else FACTOR_NAMES.get(key, INDICATOR_NAMES.get(key, key))}
                            for key in model["features"]],
+               "indicator_failures": indicator_failures,
                "universe_method": model["universe_method"],
-               "note": ("预测目标为预留一根完整5分钟K线后下一根K线VWAP至次日同一窗口VWAP；排名是研究结果，不是收益概率或买入指令。"
+               "note": ("统一研究持有期为预留一根完整5分钟K线后下一根K线VWAP至次日同一窗口VWAP；排名仅供模拟研究。"
                         + model.get("selection_warning", "") + slot_warning)}
     write_json(STORE / "rankings" / f"{payload['id']}.json", payload)
     write_json(LATEST, payload)
@@ -746,21 +910,24 @@ def rank() -> dict:
 
 
 def status() -> dict:
-    model, latest = read_json(MODEL), read_json(LATEST)
+    model, latest = selected_model(), read_json(LATEST)
     return {"trained_at": model.get("selected_at"), "model_id": model.get("model_id"),
             "selected_at": model.get("selected_at"), "quality": model.get("quality"),
             "algorithm": model.get("algorithm"), "target_version": model.get("target_version"),
-            "backtest_slot": load_settings()["backtest_slot"],
+            "backtest_slot": load_settings()["backtest_slot"], "strategy": load_settings()["strategy"],
             "latest_ranking_at": latest.get("generated_at"), "latest_count": latest.get("candidate_count")}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="A股盘中 AI 因子训练、回测和即时排名")
-    parser.add_argument("action", choices=("train", "train-cached", "backtest", "rank", "status"))
+    parser = argparse.ArgumentParser(description="A股策略训练、回测和即时排名")
+    parser.add_argument("action", choices=("train", "train-cached", "backtest", "backtest-all", "rank", "status"))
+    parser.add_argument("--strategy", choices=tuple(STRATEGIES), help="本次任务的策略；默认读取控制面板设置")
     args = parser.parse_args()
+    global _STRATEGY_OVERRIDE
+    _STRATEGY_OVERRIDE = args.strategy
     try:
         result = {"train": train, "train-cached": train_from_cache, "backtest": backtest_from_cache,
-                  "rank": rank, "status": status}[args.action]()
+                  "backtest-all": backtest_all_from_cache, "rank": rank, "status": status}[args.action]()
         if args.action == "status":
             log(json.dumps(result, ensure_ascii=False))
         return 0

@@ -22,24 +22,8 @@ STATE_FILE = PROJECT_ROOT / "data" / "daily-push-state.json"
 REPORT_DIR = PROJECT_ROOT / "data" / "reports"
 CHINA_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
-
-def with_backtest_section(markdown: str) -> str:
-    from report_web_server import latest_backtest
-
-    report = latest_backtest()
-    if not report.get("available"):
-        return markdown + "\n\n## AI 因子滚动回测\n\n尚无符合新版历史时点数据要求的回测结果。"
-    stats = report["stats"]
-    rank_ic = report.get("oos_rank_ic", {}).get("rank_ic")
-    rank_ic_text = f"{rank_ic:.4f}" if isinstance(rank_ic, (int, float)) else "暂无"
-    return markdown + "\n\n" + "\n".join([
-        "## AI 因子滚动回测",
-        "",
-        f"生成时间：{report['generated_at']}；区间：{report.get('first_day', '未知')} 至 {report.get('last_day', '未知')}（{report.get('days', '未知')} 个交易日）。",
-        f"{report['slot']} 信号，{report.get('execution', '下一根5分钟K线')} 模拟成交；累计收益 {stats.get('total_return', 0):.2%}，最大回撤 {stats.get('max_drawdown', 0):.2%}，样本外 Rank IC {rank_ic_text}。",
-        f"模拟交易 {stats.get('trades', 0)} 笔，显式费用 {stats.get('costs', 0):,.2f} 元，估计滑点 {stats.get('slippage_costs', 0):,.2f} 元。",
-        "股票池按历史已知时点筛选；价格、滑点和成交参与率均为模拟，仅供研究。",
-    ])
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from report_content import without_backtest_section
 
 
 def log(message: str):
@@ -134,7 +118,12 @@ def save_state(payload: dict):
 def archive_report(report_id: str, markdown: str) -> Path:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     target = REPORT_DIR / f"{report_id}.md"
-    target.write_text(markdown, encoding="utf-8")
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(markdown, encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return target
 
 
@@ -157,8 +146,8 @@ def session_for_now(config: dict, now: datetime | None = None) -> str:
     return "afternoon" if now >= boundary else "morning"
 
 
-def run_once(config: dict, force: bool = False, session: str = "morning") -> bool:
-    if not config.get("enabled", True):
+def run_once(config: dict, force: bool = False, session: str = "morning", manual: bool = False) -> bool:
+    if not manual and not config.get("enabled", True):
         log("推送已在配置中禁用。")
         return False
     session = str(session or "morning").strip().lower()
@@ -173,7 +162,7 @@ def run_once(config: dict, force: bool = False, session: str = "morning") -> boo
     state_key = f"{today}:{selected_market}:{session}"
     completed = state.get("completed", {}) if isinstance(state.get("completed"), dict) else {}
     legacy_done = session == "morning" and state.get("last_success_date") == today
-    if not force and (completed.get(state_key) or legacy_done):
+    if not force and not manual and (completed.get(state_key) or legacy_done):
         log(f"今日{phase_name}已成功生成，跳过重复推送。")
         return False
     base_url = str(config["data_service_url"]).rstrip("/")
@@ -185,8 +174,7 @@ def run_once(config: dict, force: bool = False, session: str = "morning") -> boo
     markdown = str(report.get("markdown", "")).strip()
     if not markdown:
         raise RuntimeError("数据服务未返回简报正文。")
-    if selected_market == "a":
-        markdown = with_backtest_section(markdown)
+    markdown = without_backtest_section(markdown)
     report_id = f"{today}-{selected_market}-{session}"
     report_path = archive_report(report_id, markdown)
     try:
@@ -201,16 +189,17 @@ def run_once(config: dict, force: bool = False, session: str = "morning") -> boo
             log(f"已在主机默认浏览器中打开{phase_name}。")
         except (OSError, RuntimeError) as exc:
             log(f"无法自动打开{phase_name}页面：{exc}")
-    webhook_url = str(config.get("webhook_url", "")).strip()
+    webhook_url = "" if manual else str(config.get("webhook_url", "")).strip()
     if webhook_url:
         post_webhook(webhook_url, str(config.get("webhook_type", "generic")), markdown)
         destination = "环境变量 Webhook" if os.getenv("FINANCE_AGENT_WEBHOOK_URL", "").strip() else str(config.get("webhook_type", "generic")) + " Webhook"
         log(f"{phase_name}已推送至{destination}。")
     else:
-        log(f"未配置 Webhook；{phase_name}仅归档到本地。")
-    completed[state_key] = {"report_path": str(report_path), "pushed": bool(webhook_url), "completed_at": datetime.now(CHINA_TZ).isoformat()}
-    state.update({"completed": completed, "last_success_date": today if session == "morning" else state.get("last_success_date")})
-    save_state(state)
+        log(f"手动{phase_name}已归档到本地。" if manual else f"未配置 Webhook；{phase_name}仅归档到本地。")
+    if not manual:
+        completed[state_key] = {"report_path": str(report_path), "pushed": bool(webhook_url), "completed_at": datetime.now(CHINA_TZ).isoformat()}
+        state.update({"completed": completed, "last_success_date": today if session == "morning" else state.get("last_success_date")})
+        save_state(state)
     log(f"{phase_name}已生成：{report_path}")
     return True
 
@@ -269,13 +258,14 @@ def main():
     parser = argparse.ArgumentParser(description="A股/港股交易日双时点研究简报推送")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--once", action="store_true", help="立即检查交易日并执行一次")
+    parser.add_argument("--manual", action="store_true", help="手动重新生成本地日报；不执行远程推送，不改变定时任务完成状态")
     parser.add_argument("--session", choices=["morning", "afternoon"], help="指定日报1或日报2；省略时按当前时间选择")
     parser.add_argument("--force", action="store_true", help="忽略当天已成功状态，重新执行")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
-        if args.once:
-            run_once(config, force=args.force, session=args.session or session_for_now(config))
+        if args.once or args.manual:
+            run_once(config, force=args.force, session=args.session or session_for_now(config), manual=args.manual)
         else:
             run_daemon(args.config)
     except Exception as exc:

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from strategy_catalog import MODEL_STRATEGIES
 
 FEATURES = ("open_momentum", "gap", "range_position", "range_width", "vwap_gap", "minute_of_day")
 NEXT_BAR = {"09:35": "09:40", "10:30": "10:35", "11:30": "13:05",
@@ -16,6 +19,54 @@ NEXT_BAR = {"09:35": "09:40", "10:30": "10:35", "11:30": "13:05",
 EXECUTION_BAR = {"09:35": "09:45", "10:30": "10:40", "11:30": "13:10",
                  "13:30": "13:40", "14:00": "14:10", "14:30": "14:40", "14:50": "15:00"}
 MIN_ML_DAYS = 60
+_XGB_DEVICE: str | None = None
+
+
+def xgboost_device() -> str:
+    """Check that CUDA works at runtime; a CUDA-enabled wheel alone is insufficient."""
+    global _XGB_DEVICE
+    if _XGB_DEVICE is not None:
+        return _XGB_DEVICE
+    import xgboost as xgb
+
+    device = "cpu"
+    if xgb.build_info().get("USE_CUDA", False):
+        try:
+            probe = xgb.DMatrix(np.array([[0], [1], [2], [3]], dtype=np.float32),
+                                label=np.array([0, 1, 0, 1], dtype=np.float32))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                booster = xgb.train({"tree_method": "hist", "device": "cuda", "nthread": 1},
+                                    probe, num_boost_round=1)
+            actual = json.loads(booster.save_config())["learner"]["generic_param"]["device"]
+            if actual.startswith("cuda"):
+                device = "cuda"
+        except xgb.core.XGBoostError:
+            pass
+    _XGB_DEVICE = device
+    print(f"XGBoost 计算设备：{'CUDA' if device == 'cuda' else 'CPU（CUDA 不可用）'}", flush=True)
+    return device
+
+
+def _fallback_to_cpu(error: Exception) -> None:
+    global _XGB_DEVICE
+    _XGB_DEVICE = "cpu"
+    print(f"XGBoost CUDA 运行失败，改用 CPU：{str(error).splitlines()[0][:240]}", flush=True)
+
+
+def _predict_ranker(ranker, frame: pd.DataFrame, features=FEATURES) -> np.ndarray:
+    import xgboost as xgb
+
+    values = frame[list(features)]
+    try:
+        return ranker.predict(values)
+    except xgb.core.XGBoostError as error:
+        if xgboost_device() != "cuda":
+            raise
+        _fallback_to_cpu(error)
+        ranker.set_params(device="cpu")
+        ranker.get_booster().set_param({"device": "cpu"})
+        return ranker.predict(values)
 
 
 def minute_of_day(slot: str) -> int:
@@ -67,70 +118,83 @@ def rank_ic(frame: pd.DataFrame, scores: np.ndarray) -> dict:
             "groups": len(values)}
 
 
-def fit_estimators(train: pd.DataFrame) -> dict:
-    from sklearn.linear_model import ElasticNet
-    from sklearn.preprocessing import StandardScaler
-    import xgboost as xgb
-
+def fit_estimators(train: pd.DataFrame, algorithm: str = "xgboost") -> dict:
+    if algorithm not in MODEL_STRATEGIES:
+        raise ValueError(f"未知因子模型：{algorithm}")
     train = train.sort_values(["day", "slot", "symbol"]).copy()
     features = list(FEATURES)
-    train["excess_target"] = train.target - train.groupby(["day", "slot"]).target.transform("mean")
-    scaler = StandardScaler().fit(train[features])
-    linear = ElasticNet(alpha=max(1e-6, 0.01 * float(train.excess_target.std())),
-                        l1_ratio=0.5, max_iter=10000, random_state=42)
-    linear.fit(scaler.transform(train[features]), train.excess_target)
+    if algorithm == "elastic_net":
+        from sklearn.linear_model import ElasticNet
+        from sklearn.preprocessing import StandardScaler
+
+        train["excess_target"] = train.target - train.groupby(["day", "slot"]).target.transform("mean")
+        scaler = StandardScaler().fit(train[features])
+        linear = ElasticNet(alpha=max(1e-6, 0.01 * float(train.excess_target.std())),
+                            l1_ratio=0.5, max_iter=10000, random_state=42)
+        linear.fit(scaler.transform(train[features]), train.excess_target)
+        return {"elastic_net": (scaler, linear)}
+    import xgboost as xgb
+
     train["relevance"] = train.groupby(["day", "slot"]).target.transform(
         lambda series: np.minimum((series.rank(pct=True) * 5).astype(int), 4))
     qid = train.groupby(["day", "slot"], sort=True).ngroup().to_numpy()
-    ranker = xgb.XGBRanker(objective="rank:pairwise", tree_method="hist",
-                           lambdarank_pair_method="mean", lambdarank_num_pair_per_sample=2,
-                           n_estimators=120, max_depth=2, learning_rate=0.04,
-                           min_child_weight=20, reg_lambda=10, subsample=0.8,
-                           colsample_bytree=1.0, random_state=42, n_jobs=2)
-    ranker.fit(train[features], train.relevance, qid=qid)
-    return {"elastic_net": (scaler, linear), "xgboost": ranker}
+    ranker_options = dict(objective="rank:pairwise", tree_method="hist",
+                          lambdarank_pair_method="mean", lambdarank_num_pair_per_sample=2,
+                          n_estimators=120, max_depth=2, learning_rate=0.04,
+                          min_child_weight=20, reg_lambda=10, subsample=0.8,
+                          colsample_bytree=1.0, random_state=42, n_jobs=2)
+    device = xgboost_device()
+    ranker = xgb.XGBRanker(**ranker_options, device=device)
+    try:
+        ranker.fit(train[features], train.relevance, qid=qid)
+    except xgb.core.XGBoostError as error:
+        if device != "cuda":
+            raise
+        _fallback_to_cpu(error)
+        ranker = xgb.XGBRanker(**ranker_options, device="cpu")
+        ranker.fit(train[features], train.relevance, qid=qid)
+    return {"xgboost": ranker}
 
 
 def score_estimator(estimators: dict, algorithm: str, frame: pd.DataFrame) -> np.ndarray:
     if algorithm == "elastic_net":
         scaler, linear = estimators[algorithm]
         return linear.predict(scaler.transform(frame[list(FEATURES)]))
-    return estimators[algorithm].predict(frame[list(FEATURES)])
+    return _predict_ranker(estimators[algorithm], frame)
 
 
-def select_algorithm(frame: pd.DataFrame) -> tuple[str, dict, bool, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Use one chronological selection policy for deployment and replay."""
+def select_algorithm(frame: pd.DataFrame, algorithm: str = "xgboost") -> tuple[str, dict, bool, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Evaluate the user-selected model with chronological splits."""
     train, validation, holdout = day_splits(frame)
     if "exit_day" in frame.columns:
         train = train[train.exit_day.lt(str(validation.day.min()))].copy()
         validation = validation[validation.exit_day.lt(str(holdout.day.min()))].copy()
-    estimators = fit_estimators(train)
+    estimators = fit_estimators(train, algorithm)
     results = {name: {"validation": rank_ic(validation, score_estimator(estimators, name, validation)),
                       "holdout": rank_ic(holdout, score_estimator(estimators, name, holdout))}
-               for name in ("elastic_net", "xgboost")}
-    eligible = [(name, result) for name, result in results.items()
-                if result["validation"]["rank_ic"] > 0 and result["validation"]["positive_share"] >= 0.5]
-    pool = eligible or list(results.items())
-    chosen = max(pool, key=lambda item: item[1]["validation"]["rank_ic"])[0]
-    return chosen, results, bool(eligible), train, validation, holdout
+               for name in (algorithm,)}
+    metric = results[algorithm]["validation"]
+    eligible = metric["rank_ic"] > 0 and metric["positive_share"] >= 0.5
+    return algorithm, results, eligible, train, validation, holdout
 
 
-def fit_models(samples: list[dict], destination: Path) -> dict:
+def fit_models(samples: list[dict], destination: Path, algorithm: str = "xgboost") -> dict:
     frame = sample_frame(samples)
-    chosen, results, eligible, train, validation, holdout = select_algorithm(frame)
+    chosen, results, eligible, train, validation, holdout = select_algorithm(frame, algorithm)
     features = list(FEATURES)
 
     # Historical scores above stay untouched. The deployed model may now use
     # all labels that have matured before the present training run.
-    final_estimators = fit_estimators(frame)
+    final_estimators = fit_estimators(frame, algorithm)
     destination.mkdir(parents=True, exist_ok=True)
-    scaler, linear = final_estimators["elastic_net"]
-    ranker = final_estimators["xgboost"]
-    ranker.save_model(destination / "xgboost.json")
-    linear_state = {"features": features, "coef": linear.coef_.tolist(),
-                    "intercept": float(linear.intercept_), "mean": scaler.mean_.tolist(),
-                    "scale": scaler.scale_.tolist()}
-    (destination / "elastic_net.json").write_text(json.dumps(linear_state, ensure_ascii=False, indent=2), encoding="utf-8")
+    if algorithm == "xgboost":
+        final_estimators["xgboost"].save_model(destination / "xgboost.json")
+    else:
+        scaler, linear = final_estimators["elastic_net"]
+        linear_state = {"features": features, "coef": linear.coef_.tolist(),
+                        "intercept": float(linear.intercept_), "mean": scaler.mean_.tolist(),
+                        "scale": scaler.scale_.tolist()}
+        (destination / "elastic_net.json").write_text(json.dumps(linear_state, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"algorithm": chosen, "validation_eligible": eligible,
             "algorithms": results, "features": features,
             "days": int(frame.day.nunique()), "samples": len(frame),
@@ -147,7 +211,16 @@ def predict(frame: pd.DataFrame, model: dict, model_dir: Path) -> np.ndarray:
         return values @ np.array(state["coef"]) + state["intercept"]
     if model["algorithm"] == "xgboost":
         import xgboost as xgb
-        ranker = xgb.XGBRanker()
+        device = xgboost_device()
+        ranker = xgb.XGBRanker(device=device)
         ranker.load_model(bytearray((model_dir / "xgboost.json").read_bytes()))
-        return ranker.predict(frame[features])
+        try:
+            ranker.get_booster().set_param({"device": device})
+        except xgb.core.XGBoostError as error:
+            if device != "cuda":
+                raise
+            _fallback_to_cpu(error)
+            ranker.set_params(device="cpu")
+            ranker.get_booster().set_param({"device": "cpu"})
+        return _predict_ranker(ranker, frame, features)
     raise RuntimeError("未知的机器学习模型类型。")

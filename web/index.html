@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="本地股票双时点日报">
-  <title>股票双时点日报与盘中因子排名</title>
+  <title>股票双时点日报与全市场盘中排序</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -15,10 +15,10 @@
       <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 28" fill="none"><path d="M5 19.5 10.1 14l3.6 3.1L23 7.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M18 7.5h5v5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       <span>股票双时点日报</span>
     </a>
-    <div class="topbar-meta"><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
+    <div class="topbar-meta"><a class="topbar-link" href="/backtests">策略回测</a><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
   </header>
-  <main>
-    <section class="intro" aria-labelledby="pageTitle">
+  <main class="report-page">
+    <section id="pageTop" class="intro" aria-labelledby="pageTitle">
       <p class="eyebrow">MARKET INTELLIGENCE</p>
       <div class="intro-heading">
         <div><h1 id="pageTitle">双时点日报</h1><p id="updatedAt">正在连接本地日报服务</p></div>
@@ -28,36 +28,67 @@
         </div>
       </div>
     </section>
-    <section class="insight-grid" aria-label="日报数据看板">
+    <div class="report-layout">
+    <aside class="report-index" aria-label="日报索引列">
+      <details id="reportIndexPanel" class="index-panel" open>
+        <summary>日报索引<span>展开 / 收起</span></summary>
+        <nav id="reportIndex" aria-label="日报章节">
+          <a href="#dailyOverview" data-index-target><span>01</span>本期速览</a>
+          <a href="#marketVisuals" data-index-target><span>02</span>市场分布与风险</a>
+          <a href="#globalVisuals" data-index-target><span>03</span>全球指数与板块</a>
+          <a href="#candidateVisuals" data-index-target><span>04</span>候选股对比</a>
+          <a href="#horizonVisuals" data-index-target><span>05</span>分周期观察名单</a>
+          <a href="#eventVisuals" data-index-target><span>06</span>事件线索</a>
+          <a href="#reviewVisuals" data-index-target><span>07</span>盘中复盘</a>
+          <a href="#reportDetails" data-index-target><span>08</span>完整研究正文</a>
+          <div id="reportHeadingIndex" class="index-subsections"></div>
+          <a href="#researchTools" data-index-target><span>09</span>持仓与盘中排序</a>
+          <a href="#pageTop" class="index-top-link">↑ 返回顶部</a>
+        </nav>
+      </details>
+    </aside>
+    <div class="report-content">
+    <section id="dailyOverview" class="daily-overview" aria-label="本期速览"><p class="empty-note">选择日报后展示本期摘要。</p></section>
+    <section id="marketVisuals" class="insight-grid" aria-label="市场分布与风险">
+      <div class="insight-card"><p class="eyebrow">MARKET BREADTH</p><h2>市场涨跌分布</h2><p class="insight-meta">全市场有效样本，含平盘；红涨绿跌</p><div id="breadthVisual"></div></div>
+      <div class="insight-card"><p class="eyebrow">RISK & SENTIMENT</p><h2>市场风险与情绪</h2><p class="insight-meta">风险分越高风险越高；宽度与情绪分越高越偏强</p><div id="riskVisual"></div></div>
+    </section>
+    <section id="globalVisuals" class="insight-grid" aria-label="日报数据看板">
       <div class="insight-card"><p class="eyebrow">GLOBAL MARKETS</p><h2>全球市场与大盘</h2><p id="globalMeta" class="insight-meta">等待日报数据</p><div id="globalChart" class="bar-chart"></div><div id="marketBreadth" class="breadth-summary"></div></div>
       <div class="insight-card"><p class="eyebrow">SECTOR PULSE</p><h2>重点板块</h2><p id="sectorMeta" class="insight-meta">半导体 · 存储 · 光通信</p><div id="sectorChart" class="bar-chart"></div></div>
     </section>
-    <section class="insight-card horizon-shell" aria-labelledby="horizonTitle">
+    <section id="candidateVisuals" class="insight-card" aria-labelledby="candidateTitle"><p class="eyebrow">CANDIDATE COMPARISON</p><h2 id="candidateTitle">候选股多周期对比</h2><p class="insight-meta">1 / 5 / 20 日累计涨跌幅；颜色深浅使用同一刻度，候选池不代表全市场</p><div id="candidateVisual"></div></section>
+    <section id="horizonVisuals" class="insight-card horizon-shell" aria-labelledby="horizonTitle">
       <div class="section-heading"><div><p class="eyebrow">RESEARCH WATCHLIST</p><h2 id="horizonTitle">分周期股票观察名单</h2><p id="horizonMeta" class="insight-meta">请先选择一份日报</p></div><div class="segmented" role="group" aria-label="推荐周期"><button type="button" data-horizon="long" aria-pressed="true">中长线</button><button type="button" data-horizon="short" aria-pressed="false">短线</button><button type="button" data-horizon="ultra_short" aria-pressed="false">超短线</button></div></div>
       <div id="horizonContent" aria-live="polite"></div>
     </section>
-    <section class="insight-card portfolio-shell" aria-labelledby="portfolioTitle">
-      <div class="section-heading"><div><p class="eyebrow">ON-DEMAND PORTFOLIO</p><h2 id="portfolioTitle">持仓分析</h2><p id="portfolioMeta" class="insight-meta">默认不读取持仓；点击后按当前公开数据分析。</p></div><button id="portfolioButton" type="button">分析我的持仓</button></div>
-      <div id="portfolioContent" aria-live="polite"></div>
-    </section>
-    <section class="ranking-shell" aria-labelledby="rankingTitle">
-      <div class="ranking-heading"><div><p class="eyebrow">INTRADAY FACTOR RESEARCH</p><h2 id="rankingTitle">最新 AI 因子排名</h2><p id="rankingMeta">尚未生成排名。请在控制面板依次点击“一键训练”“一键排序”。</p></div><span class="ranking-badge">A 股 · 下一交易日目标</span></div>
-      <div id="rankingContent" class="ranking-content" aria-live="polite"></div>
-    </section>
-    <section class="ranking-shell" aria-labelledby="backtestTitle">
-      <div class="ranking-heading"><div><p class="eyebrow">AI FACTOR BACKTEST</p><h2 id="backtestTitle">AI 因子滚动回测</h2><p id="backtestMeta">正在读取最新回测结果…</p></div><span class="ranking-badge">A 股 · 模拟研究</span></div>
-      <div id="backtestContent" class="backtest-content" aria-live="polite"></div>
-    </section>
-    <section class="report-shell" aria-live="polite">
-      <div class="report-topline" aria-hidden="true"><span></span><span></span><span></span></div>
+    <section id="eventVisuals" class="insight-card" aria-labelledby="eventTitle"><p class="eyebrow">EVENT RADAR</p><h2 id="eventTitle">本期事件线索</h2><p id="eventMeta" class="insight-meta">按归档日期排列；标题与可能影响路径仍需复核原文</p><div id="eventVisual"></div></section>
+    <section id="reviewVisuals" class="insight-card" aria-labelledby="reviewTitle"><p class="eyebrow">INTRADAY REVIEW</p><h2 id="reviewTitle">上午 → 下午一致性复盘</h2><p class="insight-meta">两次快照的价格变化，不能视为持仓收益或策略胜率</p><div id="reviewVisual"></div></section>
+    <section id="reportDetails" class="report-shell" aria-live="polite">
+      <div class="report-topline"><strong>完整研究正文</strong><span class="detail-hint">证据、方法与数据来源</span></div>
       <div id="statusCard" class="status-card">
-        <div class="status-icon" aria-hidden="true"><svg viewBox="0 0 28 28" fill="none"><path d="M14 6v8l5 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="14" cy="14" r="9" stroke="currentColor" stroke-width="1.8"/></svg></div>
         <div><p class="status-kicker">WAITING FOR DATA</p><h2>尚无可展示的日报</h2><p>交易日 09:20 与 14:30 生成后，此页面会展示日报1、日报2及一致性复盘。</p></div>
       </div>
       <article id="report" class="report" hidden></article>
     </section>
+    <details id="researchTools" class="research-tools"><summary>研究工具 · 持仓与盘中排序</summary><p class="ranking-note">以下为当前研究工具结果，时间可能与所选归档日报不同。</p>
+    <section class="insight-card portfolio-shell" aria-labelledby="portfolioTitle">
+      <div class="section-heading"><div><p class="eyebrow">ON-DEMAND PORTFOLIO</p><h2 id="portfolioTitle">持仓分析与仓位总结</h2><p id="portfolioMeta" class="insight-meta">默认不读取持仓；点击后对照个股研究与所选策略。</p></div><div class="portfolio-actions"><label class="select-control" for="portfolioStrategy"><span>对照策略 · 默认沿用控制面板</span><select id="portfolioStrategy" disabled><option value="">正在读取策略…</option></select></label><button id="portfolioButton" type="button">分析我的持仓</button></div></div>
+      <div id="portfolioContent" aria-live="polite"></div>
+    </section>
+    <section class="ranking-shell" aria-labelledby="rankingTitle">
+      <div class="ranking-heading"><div><p class="eyebrow">INTRADAY MARKET RANKING</p><h2 id="rankingTitle">全市场盘中排序</h2><p id="rankingMeta" role="status">选择固定交易策略或已训练的因子模型，点击排序获取当前盘中结果。</p></div><span class="ranking-badge">沪深 A 股 · 盘中研究</span></div>
+      <div class="ranking-actions"><label class="select-control" for="rankingStrategy"><span>排序策略 / 模型</span><select id="rankingStrategy" disabled><option>正在读取可用策略…</option></select></label><button id="rankMarketButton" type="button" disabled>开始盘中排序</button></div>
+      <p id="rankingOptionsNote" class="ranking-note"></p>
+      <p class="ranking-note">扫描全市场沪深 A 股，排除 ST、退市标记和无成交股票；缺失数据会单独计数。技术指标策略需要逐股分钟线，可在后台查看处理进度。</p>
+      <div id="rankingContent" class="ranking-content" aria-live="polite"></div>
+    </section>
+    </details>
+    </div>
+    </div>
   </main>
   <footer><span>仅限本机与局域网内访问</span><span>DSH Finance Agent</span></footer>
+  <script src="/report-visuals.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

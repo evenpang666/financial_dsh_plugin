@@ -40,6 +40,52 @@ spec.loader.exec_module(server)
 
 
 class FinanceFeatureTests(unittest.TestCase):
+    def test_popularity_reads_only_rank_api_without_quote_enrichment(self):
+        response = types.SimpleNamespace(raise_for_status=lambda: None,
+            json=lambda: {"data": [{"sc": "SZ000858", "rk": 2}, {"sc": "SH600519", "rk": 1}]})
+        with (patch.object(server.requests, "post", return_value=response) as post,
+              patch.object(server.ak, "stock_hot_rank_em", create=True, side_effect=AssertionError("不应调用行情补全"))):
+            result = server.social_sentiment_response({"score": 30, "limit_up_count": 2, "limit_down_count": 5}, "a")
+        self.assertEqual([row["代码"] for row in result["hot_stocks"]], ["600519", "000858"])
+        self.assertEqual(post.call_args.kwargs["timeout"], (5, 10))
+        self.assertEqual(len(result["unavailable"]), 0)
+
+    def test_popularity_proxy_failure_keeps_price_proxy_and_short_diagnostics(self):
+        with patch.object(server.requests, "post", side_effect=server.requests.exceptions.ProxyError("HTTPSConnectionPool Unable to connect to proxy https://long.invalid")):
+            result = server.social_sentiment_response({"score": 30, "limit_up_count": 2, "limit_down_count": 5}, "a")
+        self.assertEqual(result["score"], 32)
+        self.assertEqual(result["hot_stocks"], [])
+        self.assertIn("代理", result["unavailable"][0])
+        self.assertNotIn("HTTPSConnectionPool", result["unavailable"][0])
+
+    def test_portfolio_shares_one_panorama_failure_and_keeps_three_comparison_columns(self):
+        holdings = [{"symbol": "600519"}, {"symbol": "000858"}]
+        analysis = {"name": "测试标的", "as_of": "2026-10-12", "quote": {"quote": {"最新价": 10}},
+                    "recommendation": {"conclusion": "建议持有观察", "score_components": {"valid_signal_count": 4}},
+                    "unavailable": ["市场全景：东方财富人气榜不可用：HTTPSConnectionPool ProxyError"]}
+        with (patch.object(server, "portfolio_response", return_value={"holdings": holdings}),
+              patch.object(server, "market_panorama_response", side_effect=RuntimeError("offline")) as panorama,
+              patch.object(server, "analyze_stock_response", return_value=analysis) as analyze,
+              patch("portfolio_research.strategy_review", return_value={"available": False, "rows": {}})):
+            result = server.portfolio_analysis_response("a", "momentum")
+        panorama.assert_called_once()
+        self.assertTrue(all(call.args[2] is not None for call in analyze.call_args_list))
+        self.assertEqual(len(result["position_summary"]["rows"]), 2)
+        self.assertIn("suggestion3", result["position_summary"]["rows"][0])
+        self.assertNotIn("HTTPSConnectionPool", str(result["holdings"]))
+    def test_daily_digest_includes_flats_and_summarizes_missing_sources(self):
+        lines = server.daily_digest_markdown(
+            {"market_breadth": {"advancing": 20, "declining": 30, "unchanged": 50}},
+            {"ranking": []}, {"events": []}, ["全球指数不可用：long diagnostic URL"],
+        )
+        digest = "\n".join(lines)
+        self.assertIn("上涨占比 20.0%", digest)
+        self.assertIn("含平盘", digest)
+        self.assertIn("全球指数不可用", digest)
+        self.assertNotIn("long diagnostic URL", digest)
+        self.assertIn("采用默认输入", digest)
+        self.assertIn("暂不计算上涨占比", "\n".join(server.daily_digest_markdown({}, {}, {}, [])))
+
     def setUp(self):
         self._data_tmp = tempfile.TemporaryDirectory()
         root = Path(self._data_tmp.name)
@@ -47,8 +93,11 @@ class FinanceFeatureTests(unittest.TestCase):
         self._reflection_patch = patch.object(server, "REFLECTION_FILE", root / "reflections.json")
         self._snapshot_patch.start()
         self._reflection_patch.start()
+        self._attention_http_patch = patch.object(server.requests, "post", side_effect=RuntimeError("测试关注榜未接入"))
+        self._attention_http_patch.start()
 
     def tearDown(self):
+        self._attention_http_patch.stop()
         self._reflection_patch.stop()
         self._snapshot_patch.stop()
         self._data_tmp.cleanup()
@@ -72,6 +121,7 @@ class FinanceFeatureTests(unittest.TestCase):
         self.assertFalse(result["has_holdings"])
         self.assertIn("市场全景", result["markdown"])
         self.assertIn("热门股票推荐排行", result["markdown"])
+        self.assertIn("## 本期速览", result["markdown"])
         self.assertNotIn("已持仓股票", result["markdown"])
         analyze.assert_not_called()
 

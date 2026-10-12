@@ -23,6 +23,14 @@ class WeeklySchedulerTests(unittest.TestCase):
         self.assertFalse(factor_scheduler.due(monday + timedelta(days=5), {}, {}, settings))
         self.assertFalse(factor_scheduler.due(monday, {}, {}, {"weekly_training_enabled": False}))
 
+    def test_rules_skip_training_and_switching_models_checks_new_model(self):
+        moment = datetime(2026, 10, 12, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+        self.assertFalse(factor_scheduler.due(moment, {}, {}, {"weekly_training_enabled": True, "strategy": "mean_reversion"}))
+        model = {"selected_at": moment.isoformat(), "target_version": factor_scheduler.factor_lab.ML_TARGET_VERSION,
+                 "algorithm": "xgboost"}
+        state = {"last_attempt_date": moment.date().isoformat(), "strategy": "xgboost"}
+        self.assertTrue(factor_scheduler.due(moment, model, state, {"weekly_training_enabled": True, "strategy": "elastic_net"}))
+
 
 if __name__ == "__main__":
     unittest.main()

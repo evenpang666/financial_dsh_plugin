@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import importlib
 import math
+import logging
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +20,10 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import pandas as pd
+import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from data_diagnostics import readable_issues
 
 try:
     import akshare as ak
@@ -497,6 +503,29 @@ def market_breadth_response(frame=None, market: str = "a"):
     }
 
 
+def popularity_rank_response():
+    """Read attention ranks without AKShare's optional push2 quote enrichment."""
+    response = requests.post("https://emappdata.eastmoney.com/stockrank/getAllCurrentList", json={
+        "appId": "appId01", "globalId": "786e4c21-70dc-435a-93bb-38",
+        "marketType": "", "pageNo": 1, "pageSize": 100,
+    }, timeout=(5, 10))
+    response.raise_for_status()
+    rows = response.json().get("data")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("关注排名接口未返回记录")
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = normalize_a_symbol(str(row.get("sc", "")).upper().removeprefix("SH").removeprefix("SZ").removeprefix("BJ"))
+        rank = safe_float(row.get("rk"))
+        if symbol and rank is not None and rank > 0:
+            result.append({"代码": symbol, "当前排名": int(rank), "股票名称": row.get("name") or row.get("sName")})
+    if not result:
+        raise ValueError("关注排名缺少有效代码或排名")
+    return sorted(result, key=lambda row: row["当前排名"])[:10]
+
+
 def social_sentiment_response(breadth=None, market: str = "a"):
     """Build a conservative attention proxy and disclose its market-specific limits."""
     market = normalize_market(market)
@@ -504,11 +533,10 @@ def social_sentiment_response(breadth=None, market: str = "a"):
     hot_stocks, unavailable = [], []
     if market == "a":
         try:
-            frame = ak.stock_hot_rank_em().copy()
-            for item in frame.head(10).to_dict("records"):
-                hot_stocks.append(clean_record({key: value for key, value in item.items() if key in ("代码", "股票代码", "名称", "股票名称", "最新价", "涨跌幅", "当前排名", "排名")}))
+            hot_stocks = popularity_rank_response()
         except Exception as exc:
-            unavailable.append(f"东方财富人气榜不可用：{exc}")
+            logging.getLogger(__name__).warning("东方财富关注排名获取失败：%s", exc)
+            unavailable.extend(readable_issues([f"东方财富人气榜不可用：{exc}"]))
     else:
         unavailable.append("港股关注榜尚未接入；情绪分仅使用港股价格宽度代理。")
     score = int(round(max(0, min(100,
@@ -518,7 +546,7 @@ def social_sentiment_response(breadth=None, market: str = "a"):
     label = "亢奋" if score >= 75 else ("偏乐观" if score >= 58 else ("中性" if score >= 42 else ("偏谨慎" if score >= 25 else "恐慌")))
     return {
         "market": market,
-        "source": "东方财富人气榜 via AKShare + 全市场价格情绪代理" if hot_stocks else f"{market_label(market)}价格情绪代理",
+        "source": "东方财富关注排名（不依赖行情补全）+ 全市场价格情绪代理" if hot_stocks else f"{market_label(market)}价格情绪代理",
         "as_of": str(date.today()), "score": score, "label": label, "hot_stocks": hot_stocks,
         "unavailable": unavailable,
         "note": "当前分数主要反映市场参与和涨跌分布，不等同于对社交媒体文本做情感识别；人气榜仅表示关注度。",
@@ -1364,20 +1392,26 @@ def horizon_recommendations(candidates: dict, market: str, panorama: dict):
             "horizons": result, "note": "仅为有限候选池的研究观察名单；证据不足时留空，不代表全市场最优或个性化买入建议。"}
 
 
-def portfolio_analysis_response(market: str = "a"):
+def portfolio_analysis_response(market: str = "a", strategy: str = ""):
+    from portfolio_research import selected_strategy, strategy_review, build_position_summary
     market = normalize_market(market)
+    strategy = selected_strategy(strategy)
     holdings = [item for item in portfolio_response()["holdings"] if item.get("market", "a") == market]
     if not holdings:
         return {"market": market, "available": False, "holdings": [], "note": "未保存该市场持仓，无法分析。"}
     try:
         panorama = market_panorama_response(market)
-    except Exception:
-        panorama = None
+    except Exception as error:
+        logging.getLogger(__name__).warning("持仓市场全景获取失败：%s", error)
+        # A missing shared panorama must not trigger another fetch per holding.
+        panorama = {"unavailable": readable_issues([f"市场全景不可用：{error}"]),
+                    "market_state": {"risk_level": "未知"}, "market_breadth": {"label": "数据不足"}}
     def analyze(holding):
         try:
             item = analyze_stock_response(holding["symbol"], 30, panorama, market, False)
         except Exception as exc:
-            return {"holding": holding, "analysis": {"unavailable": [str(exc)]}, "suitable_horizon": "待补充数据",
+            logging.getLogger(__name__).warning("持仓个股分析 %s: %s", holding["symbol"], exc)
+            return {"holding": holding, "price": None, "quote": {}, "analysis": {"unavailable": readable_issues([f"个股分析不可用：{exc}"])}, "suitable_horizon": "待补充数据",
                     "strategy": "数据源暂不可用，保持原策略并人工复核，不据此调整仓位。"}
         components = item.get("recommendation", {}).get("score_components", {})
         long_score = components.get("long_fundamental_valuation_score")
@@ -1388,13 +1422,41 @@ def portfolio_analysis_response(market: str = "a"):
             horizon = "短线跟踪"
         else:
             horizon = "暂缓加仓，复核基本面与趋势"
-        compact = {key: item.get(key) for key in ("name", "latest_report_period", "short_term", "long_term", "recommendation", "valuation", "unavailable")}
-        return {"holding": holding, "analysis": compact, "suitable_horizon": horizon,
+        compact = {key: item.get(key) for key in ("name", "as_of", "latest_report_period", "short_term", "long_term", "recommendation", "valuation", "market_context")}
+        compact["unavailable"] = readable_issues(item.get("unavailable", []))
+        return {"holding": holding, "price": report_item_price(item), "quote": item.get("quote", {}).get("quote", {}), "analysis": compact, "suitable_horizon": horizon,
                 "strategy": f"{item.get('recommendation', {}).get('conclusion', '信息不足')}；{horizon}。仅基于当前公开数据，不自动交易。"}
     with ThreadPoolExecutor(max_workers=min(4, len(holdings))) as executor:
         analyzed = list(executor.map(analyze, holdings))
+    strategy_result = strategy_review(analyzed, strategy, market)
+    summary = build_position_summary(analyzed, panorama, strategy_result)
+    # Raw quote fields are transient strategy inputs, not needed by the UI.
+    for item in analyzed:
+        item.pop("quote", None)
     return {"market": market, "available": True, "as_of": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(timespec="seconds"),
-            "holdings": analyzed, "note": "请结合实际成本、仓位、风险承受能力和最新公告调整策略。"}
+            "holdings": analyzed, "strategy_review": strategy_result, "position_summary": summary,
+            "note": "配置权重用于假设研究预算，不是实际账户仓位；现金和总资产未提供，不计算交易数量。"}
+
+
+def daily_digest_markdown(panorama: dict, candidates: dict, weekly: dict, warnings: list) -> list[str]:
+    """Give text archives the same factual overview as the visual report."""
+    breadth = panorama.get("market_breadth", {})
+    counts = [safe_float(breadth.get(key)) for key in ("advancing", "declining", "unchanged")]
+    if (all(value is not None and value >= 0 for value in counts[:2])
+            and (counts[2] is None or counts[2] >= 0) and sum(value or 0 for value in counts) > 0):
+        total = sum(value or 0 for value in counts)
+        scope = "有效样本（含平盘）" if counts[2] is not None else "涨跌样本（平盘未取得）"
+        breadth_note = f"上涨占比 {counts[0] / total:.1%}，共 {int(total)} 只{scope}。"
+    else:
+        breadth_note = "市场涨跌分布未取得，暂不计算上涨占比。"
+    warning_labels = list(dict.fromkeys(str(item).split("：", 1)[0] for item in warnings))
+    return [
+        "## 本期速览", "",
+        f"- 市场：{panorama.get('market_state', {}).get('summary', '数据不足')} {breadth_note}",
+        f"- 研究范围：{len(candidates.get('ranking', []))} 只候选；最近一周归档 {len(weekly.get('events', []))} 条事件线索。候选池与新闻档案均非全市场完整覆盖。",
+        "- 数据状态：" + ("；".join(warning_labels) + "。部分评分可能采用默认输入，请结合缺失项阅读。" if warning_labels else "仍需逐项核对各来源的行情时间与财报期。"),
+        "- 阅读顺序：市场分布与风险 → 多周期候选对比 → 事件原文核验 → 下午一致性复盘。网页图表仅使用本期归档数据。", "",
+    ]
 
 
 def daily_report_response(candidate_limit: int = 5, market: str = "a", session: str = "morning"):
@@ -1447,6 +1509,7 @@ def daily_report_response(candidate_limit: int = 5, market: str = "a", session: 
     phase_title = "开盘前" if session == "morning" else "收盘前"
     lines = [
         f"# {market_label(market)}{report_number}｜{phase_title}研究简报", "", f"数据日期：{date.today()}（{timing}）", "",
+        *daily_digest_markdown(panorama, candidates, weekly, report_warnings),
         "## 市场全景", "",
         f"- 市场状态：{panorama.get('market_state', {}).get('summary', '数据不足')}",
         f"- 风险等级：{panorama.get('market_state', {}).get('risk_level', '未知')}；参考仓位：{panorama.get('market_state', {}).get('reference_position', '待评估')}",
@@ -1477,8 +1540,8 @@ def daily_report_response(candidate_limit: int = 5, market: str = "a", session: 
     lines.extend([f"- {event.get('date') or '日期待核验'}【{event.get('theme', '综合事件')}】{event['title']}；可能路径：{event.get('possible_impact_path', '待核验')}" for event in weekly["events"][:10]] or ["- 暂无可得事件。"])
     weekly_titles = {event["title"] for event in weekly["events"]}
     month_only = [event for event in monthly["events"] if event["title"] not in weekly_titles]
-    lines.extend(["", "## 最近一月其他重要事件线索", ""])
-    lines.extend([f"- {event.get('date') or '日期待核验'}【{event.get('theme', '综合事件')}】{event['title']}；可能路径：{event.get('possible_impact_path', '待核验')}" for event in month_only[:10]] or ["- 当前本地90日滚动档案尚无一周窗口之外的事件。"])
+    lines.extend(["", "## 最近一月其他重要事件线索", "", "以下为月度档案中未在上述周度列表展示的线索，日期仍可能位于本周；不代表上月事件。", ""])
+    lines.extend([f"- {event.get('date') or '日期待核验'}【{event.get('theme', '综合事件')}】{event['title']}；可能路径：{event.get('possible_impact_path', '待核验')}" for event in month_only[:10]] or ["- 当前月度档案暂无额外线索。"])
     lines.extend(["", "## 热门股票推荐排行", "", "| 排名 | 代码 | 名称 | 评分 | 市场校准 | 买入倾向 | 卖出倾向 | 1日 | 5日 | 20日 | PE(TTM) | 买卖建议 | 推荐理由与风险 |", "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"])
     for item in candidates["ranking"]:
         lines.append("| " + " | ".join(markdown_cell(value) for value in [
@@ -1512,7 +1575,9 @@ def daily_report_response(candidate_limit: int = 5, market: str = "a", session: 
         payload["intraday_review"] = review
         lines.extend(intraday_review_markdown(review))
     if report_warnings:
-        lines.extend(["", "## 数据缺失", ""] + [f"- {warning}" for warning in report_warnings])
+        # Keep raw diagnostics in the snapshot; the report needs readable missing-source labels.
+        labels = list(dict.fromkeys(str(warning).split("：", 1)[0] for warning in report_warnings))
+        lines.extend(["", "## 数据缺失", ""] + [f"- {label}；对应图表或分析可能不完整。" for label in labels])
     payload["markdown"] = "\n".join(lines)
     payload["snapshot_path"] = str(save_report_snapshot(payload))
     return payload
@@ -1539,7 +1604,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/portfolio":
                 return self.send_json(200, portfolio_response())
             if parsed.path == "/v1/portfolio-analysis":
-                return self.send_json(200, portfolio_analysis_response(value("market", "a")))
+                return self.send_json(200, portfolio_analysis_response(value("market", "a"), value("strategy")))
             if parsed.path == "/v1/search":
                 limit = min(max(int(value("limit", "10")), 1), 50)
                 return self.send_json(200, stock_search_response(value("query"), limit, value("market", "a")))

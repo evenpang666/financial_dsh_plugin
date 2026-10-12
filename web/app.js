@@ -7,16 +7,114 @@ const refreshButton = document.querySelector('#refreshButton')
 const requestedReport = new URLSearchParams(window.location.search).get('report') || ''
 const rankingMeta = document.querySelector('#rankingMeta')
 const rankingContent = document.querySelector('#rankingContent')
-const backtestMeta = document.querySelector('#backtestMeta')
-const backtestContent = document.querySelector('#backtestContent')
+const rankingStrategy = document.querySelector('#rankingStrategy')
+const rankMarketButton = document.querySelector('#rankMarketButton')
+let rankingStrategyChosen = false
+let rankingJob = null
+let rankingStarting = false
+let rankingPollTimer = 0
+let rankingPayload = null
+let rankingPage = 0
 const globalChart = document.querySelector('#globalChart')
 const sectorChart = document.querySelector('#sectorChart')
 const horizonContent = document.querySelector('#horizonContent')
 const portfolioContent = document.querySelector('#portfolioContent')
+const portfolioStrategy = document.querySelector('#portfolioStrategy')
+let portfolioStrategyChosen = false
+let portfolioAnalyzing = false
 let currentView = {}
 let currentMarket = 'a'
 let selectedHorizon = 'long'
 let displayedReportId = ''
+const reportIndex = document.querySelector('#reportIndex')
+const reportIndexPanel = document.querySelector('#reportIndexPanel')
+const indexBreakpoint = window.matchMedia('(max-width: 1000px)')
+let indexTargets = []
+let indexFrame = 0
+let initialSectionApplied = false
+
+function jumpToSection(target) {
+  if (!target) return
+  if (target.tagName === 'DETAILS') target.open = true
+  if (indexBreakpoint.matches) reportIndexPanel.open = false
+  requestAnimationFrame(() => {
+    target.scrollIntoView({behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'start'})
+    if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1')
+    target.focus({preventScroll: true})
+    scheduleIndexPosition()
+  })
+}
+
+function updateIndexPosition() {
+  indexFrame = 0
+  const topbarBottom = document.querySelector('.topbar').getBoundingClientRect().bottom
+  const navigationBoundary = indexBreakpoint.matches
+    ? Math.max(topbarBottom, reportIndexPanel.querySelector('summary').getBoundingClientRect().bottom) + 20
+    : topbarBottom + 32
+  const anchorOffset = indexTargets[0] ? parseFloat(getComputedStyle(indexTargets[0].target).scrollMarginTop) || 0 : 0
+  const boundary = Math.max(navigationBoundary, anchorOffset + 2)
+  let current = indexTargets[0]
+  for (const item of indexTargets) {
+    if (item.target.getClientRects().length && item.target.getBoundingClientRect().top <= boundary) current = item
+  }
+  for (const item of indexTargets) {
+    if (item === current) item.link.setAttribute('aria-current', 'location')
+    else item.link.removeAttribute('aria-current')
+  }
+  if (current && reportIndexPanel.open && !indexBreakpoint.matches) {
+    const linkRect = current.link.getBoundingClientRect(), navRect = reportIndex.getBoundingClientRect()
+    if (linkRect.top < navRect.top) reportIndex.scrollTop -= navRect.top - linkRect.top + 8
+    else if (linkRect.bottom > navRect.bottom) reportIndex.scrollTop += linkRect.bottom - navRect.bottom + 8
+  }
+}
+
+function scheduleIndexPosition() {
+  if (!indexFrame) indexFrame = requestAnimationFrame(updateIndexPosition)
+}
+
+function rebuildReportIndex() {
+  const headingIndex = document.querySelector('#reportHeadingIndex')
+  const previousScroll = reportIndex.scrollTop
+  headingIndex.replaceChildren()
+  if (!reportElement.hidden) {
+    for (const [index, heading] of [...reportElement.querySelectorAll('h2, h3')].entries()) {
+      heading.id = `report-heading-${index + 1}`
+      const link = textNode('a', heading.textContent, heading.tagName === 'H3' ? 'index-subheading' : '')
+      link.href = `#${heading.id}`
+      link.setAttribute('data-index-target', '')
+      headingIndex.append(link)
+    }
+  }
+  indexTargets = [...reportIndex.querySelectorAll('[data-index-target]')]
+    .map(link => ({link, target: document.getElementById(link.hash.slice(1))}))
+    .filter(item => item.target)
+  reportIndex.scrollTop = previousScroll
+  scheduleIndexPosition()
+}
+
+reportIndexPanel.open = !indexBreakpoint.matches
+indexBreakpoint.addEventListener('change', () => {
+  reportIndexPanel.open = !indexBreakpoint.matches
+  scheduleIndexPosition()
+})
+reportIndex.addEventListener('click', event => {
+  const link = event.target.closest('a[href^="#"]')
+  if (!link || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return
+  const target = document.getElementById(link.hash.slice(1))
+  if (!target) return
+  event.preventDefault()
+  if (window.location.hash !== link.hash) history.pushState(null, '', link.hash)
+  jumpToSection(target)
+})
+reportIndexPanel.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && indexBreakpoint.matches) {
+    reportIndexPanel.open = false
+    reportIndexPanel.querySelector('summary').focus()
+  }
+})
+window.addEventListener('scroll', scheduleIndexPosition, {passive: true})
+window.addEventListener('resize', scheduleIndexPosition)
+window.addEventListener('hashchange', () => jumpToSection(document.getElementById(window.location.hash.slice(1))))
 
 function textNode(tag, value, className = '') {
   const element = document.createElement(tag)
@@ -26,18 +124,7 @@ function textNode(tag, value, className = '') {
 }
 
 function renderBars(target, rows, nameKey) {
-  target.replaceChildren()
-  if (!rows?.length) { target.append(textNode('p', '当前未取得可核验数据。', 'empty-note')); return }
-  for (const row of rows) {
-    const value = row.change_pct == null ? NaN : Number(row.change_pct)
-    const item = document.createElement('div'); item.className = 'bar-row'
-    item.append(textNode('span', nameKey(row), 'bar-name'))
-    const track = document.createElement('div'); track.className = 'bar-track'
-    const fill = document.createElement('span'); fill.className = `bar-fill ${value >= 0 ? 'up' : 'down'}`
-    fill.style.width = `${Number.isFinite(value) ? Math.min(100, Math.abs(value) * 12) : 0}%`; track.append(fill); item.append(track)
-    item.append(textNode('strong', Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '—', value >= 0 ? 'positive' : 'negative'))
-    target.append(item)
-  }
+  ReportVisuals.renderBars(target, rows, nameKey)
 }
 
 function renderHorizon() {
@@ -62,6 +149,7 @@ function showInsights(payload) {
   displayedReportId = payload.id || ''
   currentView = payload.view || {}
   currentMarket = payload.market || 'a'
+  ReportVisuals.render(payload)
   const global = currentView.global_markets || {}
   document.querySelector('#globalMeta').textContent = `${global.source || '数据未归档'} · 各市场行情时间不同，请查看日报明细`
   renderBars(globalChart, global.indices || [], row => `${row.region} · ${row.name}`)
@@ -69,14 +157,7 @@ function showInsights(payload) {
   const marketState = currentView.market_panorama?.market_state || {}
   const breadthElement = document.querySelector('#marketBreadth')
   breadthElement.replaceChildren()
-  if (breadth.advancing != null && breadth.declining != null) {
-    const up = Number(breadth.advancing), down = Number(breadth.declining)
-    const total = up + down
-    breadthElement.append(textNode('p', `${marketState.summary || '大盘观察'} · 上涨 ${up} / 下跌 ${down} · 风险 ${marketState.risk_level || '待评估'}`))
-    const track = document.createElement('div'); track.className = 'breadth-track'
-    const fill = document.createElement('span'); fill.style.width = `${total > 0 ? up / total * 100 : 0}%`
-    track.append(fill); breadthElement.append(track)
-  }
+  breadthElement.append(textNode('p', marketState.summary || '市场状态未归档'))
   const sectors = currentView.sectors || {}
   document.querySelector('#sectorMeta').textContent = `${sectors.source || '数据未归档'} · 仅 A 股概念板块`
   renderBars(sectorChart, sectors.boards || [], row => `${row.theme} · ${row.name}`)
@@ -93,20 +174,96 @@ document.querySelectorAll('[data-horizon]').forEach(button => button.addEventLis
   renderHorizon()
 }))
 
+function friendlyMissing(values) {
+  return [...new Set((values || []).map(value => {
+    const raw = String(value)
+    if (raw.includes('HTTPSConnectionPool') || raw.includes('ProxyError') || raw.length > 200) {
+      const label = raw.includes('不可用') ? raw.slice(0, raw.indexOf('不可用') + 3) : raw.split('：')[0].slice(0, 100)
+      return `${label}（${raw.includes('ProxyError') ? '网络代理连接失败' : '数据源暂不可用'}）`
+    }
+    return raw
+  }))].join('；') || '无'
+}
+
+async function loadPortfolioStrategies() {
+  if (portfolioAnalyzing) return
+  try {
+    const payload = await requestJson('/api/portfolio-strategies')
+    if (portfolioAnalyzing) return
+    const selected = portfolioStrategyChosen ? portfolioStrategy.value : payload.selected
+    portfolioStrategy.replaceChildren()
+    for (const [id, strategy] of Object.entries(payload.strategies || {})) portfolioStrategy.add(new Option(strategy.name, id))
+    portfolioStrategy.value = selected
+    portfolioStrategy.disabled = false
+  } catch (error) {
+    portfolioStrategy.replaceChildren(new Option('沿用控制面板所选策略', ''))
+    portfolioStrategy.disabled = true
+  }
+}
+portfolioStrategy.addEventListener('change', () => {
+  portfolioStrategyChosen = true
+  portfolioContent.replaceChildren()
+  document.querySelector('#portfolioMeta').textContent = '策略已切换，请重新点击分析；本页选择不会修改控制面板配置。'
+})
+
+function renderPositionSummary(payload) {
+  const summary = payload.position_summary
+  if (!summary?.rows?.length) return
+  const title = textNode('h3', '仓位总结｜三组研究配置')
+  const meta = textNode('p', `${payload.strategy_review?.strategy_name || '策略未取得'} · ${payload.strategy_review?.scope || ''} · 信号 ${payload.strategy_review?.as_of || '未取得'}`, 'ranking-note')
+  const note = textNode('p', summary.basis, 'ranking-note')
+  const percentValue = value => value == null || !Number.isFinite(Number(value)) ? '待补充' : `${Number(value).toFixed(2)}%`
+  const wrap = document.createElement('div'); wrap.className = 'table-wrap position-summary'
+  const table = document.createElement('table'), head = document.createElement('thead'), header = document.createElement('tr')
+  for (const label of ['持仓 / 数据日', '当前股票市值占比（不含现金）', '研究建议1', '策略建议2', '综合结果3']) header.append(textNode('th', label))
+  head.append(header)
+  const body = document.createElement('tbody')
+  for (const row of summary.rows) {
+    const tr = document.createElement('tr'), name = document.createElement('td')
+    name.append(textNode('strong', `${row.name || row.symbol} · ${row.symbol}`), textNode('small', `研究 ${row.analysis_as_of || '未取得'} / 策略 ${row.strategy_as_of || '未取得'}`))
+    tr.append(name, textNode('td', percentValue(row.current_holding_share_pct)))
+    for (const [key, subtitle] of [['suggestion1', row.suggestion1?.action], ['suggestion2', row.suggestion2?.rank ? `策略入场排名 ${row.suggestion2.rank} · 分数 ${row.suggestion2.score}` : row.suggestion2?.status === 'not_triggered' ? '未触发新增入场' : '策略证据不足'], ['suggestion3', '综合复核']]) {
+      const item = row[key] || {}, cell = document.createElement('td')
+      cell.append(textNode('strong', percentValue(item.weight_pct)), textNode('small', subtitle || '待核验'), textNode('small', item.reason || '证据不足'))
+      tr.append(cell)
+    }
+    body.append(tr)
+  }
+  for (const [label, key] of [['股票配置合计', 'stock_totals_pct'], ['预留现金', 'cash_reserve_pct']]) {
+    const tr = document.createElement('tr'); tr.className = 'position-total'
+    tr.append(textNode('th', label), textNode('td', '—'))
+    for (const suggestion of ['suggestion1', 'suggestion2', 'suggestion3']) tr.append(textNode('td', percentValue(summary[key]?.[suggestion])))
+    body.append(tr)
+  }
+  table.append(head, body); wrap.append(table)
+  portfolioContent.append(title, meta, note, wrap)
+  const methods = document.createElement('details'); methods.className = 'position-methods'
+  methods.append(textNode('summary', '查看三组计算方法与限制'))
+  for (const value of [summary.method1, summary.method2, summary.method3, `研究股票配置上限 ${percentValue(summary.exposure_limit_pct)}；单股上限 ${percentValue(summary.single_name_limit_pct)}。缺失关键证据时不生成数值配置。`]) methods.append(textNode('p', value, 'ranking-note'))
+  portfolioContent.append(methods)
+}
+
 document.querySelector('#portfolioButton').addEventListener('click', async event => {
   const button = event.currentTarget
   const requestedMarket = currentMarket
   const requestedReportId = displayedReportId
   button.disabled = true
-  document.querySelector('#portfolioMeta').textContent = '正在读取持仓并逐只分析财报、估值和技术面…'
+  if (!portfolioStrategyChosen) await loadPortfolioStrategies()
+  if (requestedReportId !== displayedReportId) { button.disabled = false; return }
+  const selectedStrategy = portfolioStrategy.value
+  const strategyWasDisabled = portfolioStrategy.disabled
+  portfolioStrategy.disabled = true
+  portfolioAnalyzing = true
+  document.querySelector('#portfolioMeta').textContent = '正在分析财报、估值、技术面与所选策略，生成三组研究配置…'
   portfolioContent.replaceChildren()
   try {
-    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket}})
+    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket, 'X-Portfolio-Strategy': selectedStrategy}})
     const payload = await response.json()
     if (requestedReportId !== displayedReportId) return
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`)
     document.querySelector('#portfolioMeta').textContent = payload.note || ''
     if (!payload.available) { portfolioContent.append(textNode('p', '当前市场没有已保存持仓。', 'empty-note')); return }
+    renderPositionSummary(payload)
     const list = document.createElement('div'); list.className = 'watch-grid'
     for (const item of payload.holdings) {
       const analysis = item.analysis || {}
@@ -114,12 +271,16 @@ document.querySelector('#portfolioButton').addEventListener('click', async event
       card.append(textNode('h3', `${analysis.name || item.holding?.name || item.holding?.symbol} · ${item.holding?.symbol}`))
       card.append(textNode('p', item.strategy))
       card.append(textNode('small', `财报期 ${analysis.latest_report_period || '未取得'} · ${analysis.long_term?.evidence?.join('；') || '基本面待补充'}`))
-      card.append(textNode('small', `技术面：${analysis.short_term?.evidence?.join('；') || '待补充'}；缺失：${analysis.unavailable?.join('；') || '无'}`))
+      card.append(textNode('small', `技术面：${analysis.short_term?.evidence?.join('；') || '待补充'}`))
+      card.append(textNode('small', `缺失：${friendlyMissing(analysis.unavailable)}`))
       list.append(card)
     }
     portfolioContent.append(list)
   } catch (error) { document.querySelector('#portfolioMeta').textContent = `持仓分析失败：${error.message}` }
-  finally { button.disabled = false }
+  finally {
+    button.disabled = false; portfolioAnalyzing = false; portfolioStrategy.disabled = strategyWasDisabled
+    if (strategyWasDisabled) loadPortfolioStrategies()
+  }
 })
 
 function escapeHtml(value) {
@@ -146,11 +307,12 @@ function cells(line) {
 function renderMarkdown(markdown) {
   const lines = markdown.replaceAll('\r\n', '\n').split('\n')
   const html = []
+  let missingSection = false
   for (let index = 0; index < lines.length;) {
     const line = lines[index].trim()
     if (!line) { index += 1; continue }
     if (line.startsWith('# ')) { html.push(`<h1>${inlineMarkdown(line.slice(2))}</h1>`); index += 1; continue }
-    if (line.startsWith('## ')) { html.push(`<h2>${inlineMarkdown(line.slice(3))}</h2>`); index += 1; continue }
+    if (line.startsWith('## ')) { missingSection = line.slice(3) === '数据缺失'; html.push(`<h2>${inlineMarkdown(line.slice(3))}</h2>`); index += 1; continue }
     if (line.startsWith('### ')) { html.push(`<h3>${inlineMarkdown(line.slice(4))}</h3>`); index += 1; continue }
     if (line.startsWith('|') && index + 1 < lines.length && isTableDivider(lines[index + 1])) {
       const headings = cells(line)
@@ -166,7 +328,10 @@ function renderMarkdown(markdown) {
     if (line.startsWith('- ')) {
       const items = []
       while (index < lines.length && lines[index].trim().startsWith('- ')) {
-        items.push(`<li>${inlineMarkdown(lines[index].trim().slice(2))}</li>`)
+        let value = lines[index].trim().slice(2)
+        // Older archives contain entire HTTP tracebacks; keep the source label readable.
+        if (missingSection && value.length > 200 && value.includes('：')) value = `${value.split('：')[0]}；上游数据未取得，对应图表或分析可能不完整。`
+        items.push(`<li>${inlineMarkdown(value)}</li>`)
         index += 1
       }
       html.push(`<ul>${items.join('')}</ul>`)
@@ -185,6 +350,7 @@ function showEmpty(title = '尚无可展示的日报', message = '交易日 09:2
   statusCard.querySelector('p').textContent = message
   reportElement.hidden = true
   showInsights({})
+  rebuildReportIndex()
 }
 
 function showReport(payload) {
@@ -195,8 +361,13 @@ function showReport(payload) {
   reportElement.innerHTML = renderMarkdown(payload.markdown)
   reportElement.hidden = false
   statusCard.hidden = true
-  updatedAt.textContent = `${payload.label || payload.date} · 更新于 ${new Date(payload.updated_at).toLocaleString('zh-CN')}`
+  updatedAt.textContent = `${payload.label || payload.date} · 更新于 ${new Date(payload.updated_at).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}（北京时间）`
   showInsights(payload)
+  rebuildReportIndex()
+  if (!initialSectionApplied) {
+    initialSectionApplied = true
+    jumpToSection(document.getElementById(window.location.hash.slice(1)))
+  }
 }
 
 async function requestJson(url) {
@@ -205,72 +376,138 @@ async function requestJson(url) {
   return response.json()
 }
 
-async function loadRanking() {
+async function loadRankingStrategies() {
+  if (rankingJob || rankingStarting) return
   try {
-    const payload = await requestJson('/api/ranking/latest')
-    if (!payload.ranking?.length) {
-      rankingMeta.textContent = '尚未生成排名。请在控制面板依次点击“一键训练”“一键排序”。'
-      rankingContent.replaceChildren()
-      return
-    }
-    const quality = payload.model_quality === "exploratory" ? "探索性模拟 · 未正式验证" : "已验证"
-    const algorithm = payload.algorithm === 'xgboost' ? 'XGBoost' : 'Elastic Net'
-    rankingMeta.textContent = `生成于 ${new Date(payload.generated_at).toLocaleString('zh-CN')} · ${quality} ${algorithm} 模型 ${payload.model_id} · ${payload.candidate_count} 只有效候选`
-    const description = document.createElement('p')
-    description.className = 'ranking-note'
-    description.textContent = payload.note || ''
-    const tableWrap = document.createElement('div')
-    tableWrap.className = 'table-wrap'
-    const table = document.createElement('table')
-    const head = document.createElement('thead')
-    const headRow = document.createElement('tr')
-    for (const label of ['排名', '代码', '名称', '快照价', '综合分']) {
-      const cell = document.createElement('th'); cell.textContent = label; headRow.append(cell)
-    }
-    head.append(headRow)
-    const body = document.createElement('tbody')
-    for (const item of payload.ranking) {
-      const row = document.createElement('tr')
-      for (const value of [item.rank, item.symbol, item.name, item.price, item.score]) {
-        const cell = document.createElement('td'); cell.textContent = String(value ?? '—'); row.append(cell)
+    const payload = await requestJson('/api/ranking/strategies')
+    if (rankingJob || rankingStarting) return
+    const previous = rankingStrategyChosen ? rankingStrategy.value : payload.selected
+    rankingStrategy.replaceChildren()
+    for (const [kind, label] of [['fixed_rule', '固定交易策略'], ['model', '已训练因子模型']]) {
+      const group = document.createElement('optgroup'); group.label = label
+      for (const [id, strategy] of Object.entries(payload.strategies || {})) {
+        if (strategy.kind !== kind) continue
+        group.append(new Option(strategy.name + (strategy.trained_at ? ` · 训练 ${strategy.trained_at.slice(0, 10)}` : ''), id))
       }
-      body.append(row)
+      if (group.children.length) rankingStrategy.append(group)
     }
-    table.append(head, body)
-    tableWrap.append(table)
-    rankingContent.replaceChildren(tableWrap, description)
+    if ([...rankingStrategy.options].some(option => option.value === previous)) rankingStrategy.value = previous
+    rankingStrategy.disabled = !rankingStrategy.options.length
+    rankMarketButton.disabled = rankingStrategy.disabled
+    document.querySelector('#rankingOptionsNote').textContent = Object.entries(payload.unavailable_models || {})
+      .map(([id, reason]) => `${id === 'xgboost' ? 'XGBoost' : 'Elastic Net'}：${reason}`).join(' ')
+    await loadRanking()
   } catch (error) {
-    rankingMeta.textContent = `排名暂不可读：${error.message}`
+    document.querySelector('#rankingOptionsNote').textContent = `可用策略暂不可读：${error.message}`
   }
 }
 
-async function loadBacktest() {
+function renderRanking(payload) {
+  rankingPayload = payload
+  if (!payload.available || payload.scope !== 'full_market') {
+    rankingMeta.textContent = '所选策略尚未生成全市场盘中排序。点击“开始盘中排序”获取结果。'
+    rankingContent.replaceChildren()
+    return
+  }
+  const quality = payload.model_quality === 'exploratory' ? '探索性模拟' : (payload.model_quality === 'fixed_rule' ? '固定规则' : '研究模型')
+  const signal = new Date(payload.signal_at || payload.generated_at).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})
+  const completed = new Date(payload.completed_at || payload.generated_at).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})
+  rankingMeta.textContent = `信号 ${signal} · 完成 ${completed}（北京时间） · ${quality} ${payload.strategy_name} · 全市场快照 ${payload.universe_count} 只 / 符合范围 ${payload.input_count} 只 / 有效 ${payload.valid_count} 只 / 缺失 ${payload.failed_count} 只${payload.coverage_complete ? '' : ' · 有效子集排序'}`
+  const rows = payload.ranking || []
+  const pageCount = Math.max(1, Math.ceil(rows.length / 50))
+  rankingPage = Math.min(rankingPage, pageCount - 1)
+  const tableWrap = document.createElement('div'); tableWrap.className = 'table-wrap'
+  const table = document.createElement('table'), head = document.createElement('thead'), header = document.createElement('tr')
+  for (const label of ['排名', '代码', '名称', '信号价', '策略分数', '入场状态']) header.append(textNode('th', label))
+  head.append(header)
+  const body = document.createElement('tbody')
+  for (const item of rows.slice(rankingPage * 50, (rankingPage + 1) * 50)) {
+    const row = document.createElement('tr')
+    const status = item.entry === null ? '模型评分' : item.entry ? '已触发' : '未触发'
+    for (const value of [item.rank, item.symbol, item.name, item.price, item.score, status]) row.append(textNode('td', value))
+    body.append(row)
+  }
+  table.append(head, body); tableWrap.append(table)
+  const pagination = document.createElement('div'); pagination.className = 'ranking-pagination'
+  for (const [label, direction] of [['上一页', -1], ['下一页', 1]]) {
+    const button = textNode('button', label); button.type = 'button'
+    button.disabled = direction < 0 ? rankingPage === 0 : rankingPage >= pageCount - 1
+    button.addEventListener('click', () => { rankingPage += direction; renderRanking(rankingPayload) })
+    pagination.append(button)
+  }
+  pagination.append(textNode('span', `第 ${rankingPage + 1} / ${pageCount} 页 · 共 ${rows.length} 条，每页 50 条`))
+  const notes = textNode('p', payload.note, 'ranking-note')
+  const missing = document.createElement('details'); missing.className = 'position-methods'
+  if (payload.failures?.length) {
+    missing.append(textNode('summary', `查看 ${payload.failures.length} 只缺失评分及原因`))
+    for (const item of payload.failures) missing.append(textNode('p', `${item.symbol}：${item.reason}`, 'ranking-note'))
+  }
+  rankingContent.replaceChildren(tableWrap, pagination, notes, missing)
+}
+
+async function loadRanking() {
+  if (rankingJob || rankingStarting || !rankingStrategy.value || rankingStrategy.disabled) return
+  const strategy = rankingStrategy.value
   try {
-    const payload = await requestJson('/api/backtest/latest')
-    backtestContent.replaceChildren()
-    if (!payload.available) {
-      backtestMeta.textContent = '暂无符合新版逐日历史股票池与交易状态要求的回测。'
-      return
-    }
-    const stats = payload.stats || {}
-    backtestMeta.textContent = `${payload.first_day} 至 ${payload.last_day} · ${payload.days} 个交易日 · ${payload.slot} 信号 / ${payload.execution} 模拟成交 · 更新于 ${new Date(payload.generated_at).toLocaleString('zh-CN')}`
-    const grid = document.createElement('div'); grid.className = 'backtest-grid'
-    const metrics = [
-      ['累计收益', stats.total_return == null ? '—' : `${(Number(stats.total_return) * 100).toFixed(2)}%`],
-      ['最大回撤', stats.max_drawdown == null ? '—' : `${(Number(stats.max_drawdown) * 100).toFixed(2)}%`],
-      ['样本外 Rank IC', payload.oos_rank_ic?.rank_ic ?? '—'],
-      ['模拟交易 / 显式费用 / 估计滑点', `${stats.trades ?? '—'} 笔 / ${stats.costs == null ? '—' : Number(stats.costs).toLocaleString('zh-CN')} 元 / ${stats.slippage_costs == null ? '—' : Number(stats.slippage_costs).toLocaleString('zh-CN')} 元`],
-    ]
-    for (const [label, value] of metrics) {
-      const card = document.createElement('div'); card.className = 'backtest-metric'
-      card.append(textNode('small', label), textNode('strong', value)); grid.append(card)
-    }
-    backtestContent.append(grid)
-    backtestContent.append(textNode('p', '股票池使用交易日前已知的逐日名单；VWAP、成交参与率和滑点仍为模拟假设，结果仅供研究。', 'ranking-note'))
+    const payload = await requestJson(`/api/ranking/latest?scope=full_market&strategy=${encodeURIComponent(strategy)}`)
+    if (rankingStrategy.value === strategy && !rankingJob && !rankingStarting) renderRanking(payload)
   } catch (error) {
-    backtestMeta.textContent = `回测暂不可读：${error.message}`
+    if (rankingStrategy.value === strategy && !rankingJob && !rankingStarting) rankingMeta.textContent = `排名暂不可读：${error.message}`
   }
 }
+
+function finishRankingJob() {
+  rankingJob = null
+  rankingStarting = false
+  clearTimeout(rankingPollTimer)
+  rankingStrategy.disabled = false
+  rankMarketButton.disabled = false
+  rankMarketButton.textContent = '开始盘中排序'
+}
+
+async function pollRankingJob() {
+  if (!rankingJob) return
+  const id = rankingJob.job_id
+  try {
+    const state = await requestJson(`/api/ranking/jobs/${encodeURIComponent(id)}`)
+    if (rankingJob?.job_id !== id) return
+    rankingMeta.textContent = `${state.strategy_name} · ${state.message}${state.input_count ? ` · ${state.processed_count || 0}/${state.input_count}` : ''}`
+    if (state.status === 'completed') {
+      finishRankingJob(); rankingPage = 0; renderRanking(state.result); return
+    }
+    if (state.status === 'failed') { finishRankingJob(); return }
+  } catch (error) {
+    rankingMeta.textContent = `进度暂不可读：${error.message}；正在重试`
+  }
+  rankingPollTimer = setTimeout(pollRankingJob, 2000)
+}
+
+rankMarketButton.addEventListener('click', async () => {
+  if (rankingJob || rankingStarting || !rankingStrategy.value) return
+  rankingStarting = true
+  const strategy = rankingStrategy.value
+  rankingStrategy.disabled = true; rankMarketButton.disabled = true
+  rankMarketButton.textContent = '排序处理中…'
+  rankingMeta.textContent = '正在启动全市场盘中排序…'
+  try {
+    const response = await fetch('/api/ranking/start', {method: 'POST', headers: {'X-Ranking-Strategy': strategy, 'X-Report-Market': 'a'}})
+    const state = await response.json()
+    if (response.status === 409 && state.strategy_id !== strategy) {
+      throw Error(`已有 ${state.strategy_name} 全市场排序任务正在运行，请完成后重试。`)
+    }
+    if (!response.ok && response.status !== 409) throw Error(state.error || `HTTP ${response.status}`)
+    rankingJob = state
+    rankingStarting = false
+    rankingContent.replaceChildren(); rankingPayload = null
+    await pollRankingJob()
+  } catch (error) {
+    finishRankingJob(); rankingMeta.textContent = `盘中排序未启动：${error.message}`
+  }
+})
+rankingStrategy.addEventListener('change', () => {
+  rankingStrategyChosen = true; rankingPage = 0; rankingPayload = null
+  rankingContent.replaceChildren(); loadRanking()
+})
 
 async function loadIndex(preferredId = '') {
   try {
@@ -296,13 +533,12 @@ async function loadIndex(preferredId = '') {
 }
 
 reportDate.addEventListener('change', () => loadIndex(reportDate.value))
-refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRanking(); loadBacktest() })
+refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRankingStrategies(); loadPortfolioStrategies() })
 loadIndex(requestedReport)
-loadRanking()
-loadBacktest()
+loadRankingStrategies()
+loadPortfolioStrategies()
 setInterval(() => loadIndex(reportDate.value), 30_000)
 setInterval(loadRanking, 30_000)
-setInterval(loadBacktest, 30_000)
 
 const reportEvents = new EventSource('/api/events')
 reportEvents.addEventListener('report', event => {

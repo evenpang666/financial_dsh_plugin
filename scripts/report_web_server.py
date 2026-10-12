@@ -3,17 +3,31 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import math
+import sys
 import mimetypes
 import os
 import queue
 import re
 import threading
-from datetime import datetime
+import subprocess
+import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlencode, parse_qs
 from urllib.request import Request, urlopen
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from strategy_catalog import STRATEGIES
+from report_content import without_backtest_section
+from data_diagnostics import readable_issues
+
+CHINA = timezone(timedelta(hours=8))
+RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +41,62 @@ PORT = int(os.getenv("FINANCE_REPORT_PORT", "8766"))
 REPORT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}(?:-(?:a|hk)-(?:morning|afternoon))?\.md$")
 SUBSCRIBERS: set[queue.Queue] = set()
 SUBSCRIBERS_LOCK = threading.Lock()
+RANKING_JOB_LOCK = threading.Lock()
+ACTIVE_RANKING_JOB = ""
+
+
+def ranking_job(job_id):
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise ValueError("排序任务标识无效。")
+    path = PROJECT_ROOT / "data" / "factor-lab" / "ranking-jobs" / f"{job_id}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def run_ranking_worker(job_id, strategy):
+    global ACTIVE_RANKING_JOB
+    from factor_lab import write_json
+    directory = PROJECT_ROOT / "data" / "factor-lab" / "ranking-jobs"
+    try:
+        with (directory / f"{job_id}.log").open("w", encoding="utf-8") as output:
+            result = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "intraday_ranking.py"),
+                                     "--strategy", strategy, "--job-id", job_id],
+                                    cwd=PROJECT_ROOT, stdout=output, stderr=subprocess.STDOUT, timeout=1200)
+        state = ranking_job(job_id) or {}
+        if result.returncode or state.get("status") != "completed":
+            if state.get("status") != "failed":
+                write_json(directory / f"{job_id}.json", {**state, "status": "failed", "message": "排序进程未完成，请检查本机排序日志并重试。"})
+        else:
+            publish_ranking_event()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        state = ranking_job(job_id) or {}
+        message = "全市场分钟线取数超过20分钟，任务已停止；请稍后重试或选择快照策略。" if isinstance(exc, subprocess.TimeoutExpired) else "排序进程启动失败，请检查本机环境。"
+        write_json(directory / f"{job_id}.json", {**state, "status": "failed", "message": message})
+    finally:
+        with RANKING_JOB_LOCK:
+            if ACTIVE_RANKING_JOB == job_id:
+                ACTIVE_RANKING_JOB = ""
+
+
+def start_ranking_job(strategy):
+    global ACTIVE_RANKING_JOB
+    from intraday_ranking import ranking_options
+    from factor_lab import write_json
+    if strategy not in ranking_options()["strategies"]:
+        raise ValueError("所选策略或模型当前不可用，请刷新列表并检查训练状态。")
+    with RANKING_JOB_LOCK:
+        if ACTIVE_RANKING_JOB:
+            return ranking_job(ACTIVE_RANKING_JOB), False
+        job_id = uuid.uuid4().hex
+        state = {"job_id": job_id, "strategy_id": strategy, "strategy_name": STRATEGIES[strategy]["name"],
+                 "scope": "full_market", "status": "running", "stage": "queued", "message": "已开始全市场盘中排序",
+                 "started_at": datetime.now(CHINA).isoformat(timespec="seconds")}
+        write_json(PROJECT_ROOT / "data" / "factor-lab" / "ranking-jobs" / f"{job_id}.json", state)
+        ACTIVE_RANKING_JOB = job_id
+        threading.Thread(target=run_ranking_worker, args=(job_id, strategy), daemon=True).start()
+        return state, True
 
 
 def publish_report_event(report_id: str):
@@ -44,33 +114,86 @@ def publish_ranking_event():
         subscriber.put(json.dumps({"type": "ranking"}))
 
 
-def latest_ranking():
+def latest_ranking(strategy="", scope=""):
     try:
-        payload = json.loads(RANKING_FILE.read_text(encoding="utf-8"))
-        return (payload if isinstance(payload, dict) and payload.get("ranking")
-                and payload.get("algorithm") in {"xgboost", "elastic_net"} else {"available": False})
+        if scope == "full_market":
+            if strategy not in STRATEGIES:
+                raise ValueError("策略参数无效。")
+            path = PROJECT_ROOT / "data" / "factor-lab" / f"full-market-{strategy}.json"
+        else:
+            path = RANKING_FILE
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {"available": False}
+        if scope == "full_market" and (payload.get("scope") != scope or payload.get("strategy_id") != strategy):
+            return {"available": False}
+        return (payload if isinstance(payload, dict) and (payload.get("ranking") or payload.get("available"))
+                and payload.get("algorithm") in STRATEGIES else {"available": False})
     except (OSError, json.JSONDecodeError):
         return {"available": False}
 
 
-def latest_backtest():
+def read_backtest(run_id: str, curve: bool = False) -> dict:
+    if not RUN_ID.fullmatch(run_id):
+        raise ValueError("回测标识无效。")
+    directory = BACKTEST_DIR / run_id
+    if directory.resolve().parent != BACKTEST_DIR.resolve():
+        raise ValueError("回测路径无效。")
+    try:
+        path = directory / "summary.json"
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(summary, dict) or summary.get("schema_version") != 2
+                or summary.get("kind") != "point_in_time_backtest"
+                or "stats" not in summary or "slot" not in summary):
+            return {"available": False}
+        payload = {**summary, "available": True, "run_id": run_id,
+                   "strategy_id": summary.get("strategy_id", "legacy"),
+                   "strategy_name": summary.get("strategy_name", "历史因子选模回测"),
+                   "generated_at": summary.get("generated_at") or datetime.fromtimestamp(
+                       path.stat().st_mtime, CHINA).isoformat(timespec="seconds")}
+        if curve:
+            points = []
+            initial = float(summary["stats"].get("initial_cash", 0))
+            if initial > 0 and math.isfinite(initial):
+                with (directory / "equity.csv").open(encoding="utf-8-sig", newline="") as handle:
+                    rows = sorted(csv.DictReader(handle), key=lambda row: row["day"])
+                    peak = initial
+                    for row in rows:
+                        value = float(row["equity"])
+                        if not math.isfinite(value) or value <= 0:
+                            raise ValueError("净值数据无效。")
+                        peak = max(peak, value)
+                        points.append({"day": row["day"], "net_value": value / initial,
+                                       "drawdown": value / peak - 1})
+            payload["curve"] = points
+            payload["downloads"] = {name: f"/api/backtests/{run_id}/{name}"
+                                    for name in ("equity.csv", "trades.csv") if (directory / name).is_file()}
+        return payload
+    except (OSError, ValueError, KeyError, TypeError):
+        if curve:
+            payload = read_backtest(run_id)
+            return {**payload, "curve": [], "curve_error": "净值文件缺失或损坏。"}
+        return {"available": False}
+
+
+def backtest_runs() -> list[dict]:
     try:
         reports = sorted(BACKTEST_DIR.glob("*/summary.json"), key=lambda path: path.stat().st_mtime, reverse=True)
     except OSError:
-        return {"available": False}
-    for path in reports:
-        try:
-            summary = json.loads(path.read_text(encoding="utf-8"))
-            if (not isinstance(summary, dict) or summary.get("schema_version") != 2
-                    or summary.get("kind") != "point_in_time_backtest"
-                    or "stats" not in summary or "slot" not in summary):
-                continue
-            return {"available": True, "model_id": path.parent.name,
-                    "generated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
-                    **summary}
-        except (OSError, json.JSONDecodeError):
-            continue
-    return {"available": False}
+        return []
+    return [payload for path in reports if RUN_ID.fullmatch(path.parent.name)
+            and (payload := read_backtest(path.parent.name)).get("available")]
+
+
+def latest_backtest():
+    return next(iter(backtest_runs()), {"available": False})
+
+
+def publish_backtest_event():
+    with SUBSCRIBERS_LOCK:
+        subscribers = list(SUBSCRIBERS)
+    for subscriber in subscribers:
+        subscriber.put(json.dumps({"type": "backtest"}))
 
 
 def report_metadata(report_id: str) -> dict:
@@ -116,11 +239,14 @@ def read_report(filename: str):
     if not isinstance(snapshot, dict):
         snapshot = {}
     # Do not expose private portfolio fields from historical snapshots.
-    view = {key: snapshot.get(key) for key in ("global_markets", "sectors", "market_panorama", "horizon_recommendations", "intraday_review") if key in snapshot}
+    view = {key: snapshot.get(key) for key in (
+        "global_markets", "sectors", "market_panorama", "horizon_recommendations",
+        "intraday_review", "candidates", "weekly_events", "warnings",
+    ) if key in snapshot}
     return {
         "available": True, **report_metadata(path.stem),
         "updated_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
-        "markdown": path.read_text(encoding="utf-8"), "view": view,
+        "markdown": without_backtest_section(path.read_text(encoding="utf-8")), "view": view,
     }
 
 
@@ -152,9 +278,42 @@ class ReportHandler(BaseHTTPRequestHandler):
             if path == "/api/reports":
                 return self.send_json(200, {"reports": list_reports()})
             if path == "/api/ranking/latest":
-                return self.send_json(200, latest_ranking())
+                query = parse_qs(urlparse(self.path).query)
+                if query.get("scope", [""])[0] not in {"", "full_market"} or (query.get("scope", [""])[0] == "full_market" and query.get("strategy", [""])[0] not in STRATEGIES):
+                    return self.send_json(400, {"error": "排序范围或策略参数无效。"})
+                return self.send_json(200, latest_ranking(query.get("strategy", [""])[0], query.get("scope", [""])[0]))
+            if path == "/api/ranking/strategies":
+                from intraday_ranking import ranking_options
+                return self.send_json(200, ranking_options())
+            if path.startswith("/api/ranking/jobs/"):
+                state = ranking_job(path.removeprefix("/api/ranking/jobs/"))
+                return self.send_json(200, state) if state else self.send_json(404, {"error": "未找到排序任务。"})
+            if path == "/api/portfolio-strategies":
+                try:
+                    settings = json.loads((PROJECT_ROOT / "config" / "factor-lab.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    settings = {}
+                selected = settings.get("strategy", "xgboost") if isinstance(settings, dict) else "xgboost"
+                return self.send_json(200, {"selected": selected if selected in STRATEGIES else "xgboost", "strategies": STRATEGIES})
             if path == "/api/backtest/latest":
                 return self.send_json(200, latest_backtest())
+            if path == "/api/backtests":
+                return self.send_json(200, {"runs": backtest_runs(), "strategies": STRATEGIES})
+            if path.startswith("/api/backtests/"):
+                parts = path.removeprefix("/api/backtests/").split("/")
+                if not RUN_ID.fullmatch(parts[0]):
+                    return self.send_json(400, {"error": "回测标识无效。"})
+                report = read_backtest(parts[0], curve=len(parts) == 1)
+                if not report.get("available"):
+                    return self.send_json(404, {"error": "未找到有效回测。"})
+                if len(parts) == 1:
+                    return self.send_json(200, report)
+                if len(parts) == 2 and parts[1] in {"equity.csv", "trades.csv"}:
+                    target = BACKTEST_DIR / parts[0] / parts[1]
+                    if not target.is_file():
+                        return self.send_json(404, {"error": "回测数据文件缺失。"})
+                    return self.send_bytes(200, target.read_bytes(), "text/csv; charset=utf-8")
+                return self.send_json(404, {"error": "Not found"})
             if path == "/api/events":
                 return self.stream_events()
             if path == "/api/reports/latest":
@@ -167,8 +326,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 report = read_report(filename)
                 return self.send_json(200, report) if report else self.send_json(404, {"available": False, "error": "未找到该日报。"})
 
-            asset = "index.html" if path in ("/", "/index.html") else path.lstrip("/")
-            if asset not in {"index.html", "styles.css", "app.js"}:
+            if path in ("/backtests", "/backtests/"):
+                asset = "backtests.html"
+            else:
+                asset = "index.html" if path in ("/", "/index.html") else path.lstrip("/")
+            if asset not in {"index.html", "styles.css", "app.js", "report-visuals.js", "backtests.html", "backtests.js"}:
                 return self.send_json(404, {"error": "Not found"})
             target = WEB_ROOT / asset
             content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
@@ -180,6 +342,20 @@ class ReportHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if path == "/api/ranking/start":
+            origin, host = self.headers.get("Origin", ""), self.headers.get("Host", "")
+            if origin and urlparse(origin).netloc != host:
+                return self.send_json(403, {"error": "同源页面才可发起盘中排序。"})
+            if self.headers.get("X-Report-Market", "a") != "a":
+                return self.send_json(400, {"error": "当前盘中交易策略只支持沪深 A 股。"})
+            strategy = self.headers.get("X-Ranking-Strategy", "")
+            if strategy not in STRATEGIES:
+                return self.send_json(400, {"error": "策略参数无效。"})
+            try:
+                state, created = start_ranking_job(strategy)
+                return self.send_json(202 if created else 409, state)
+            except (OSError, ValueError) as exc:
+                return self.send_json(400, {"error": str(exc)})
         if path == "/api/portfolio-analysis":
             origin = self.headers.get("Origin", "")
             host = self.headers.get("Host", "")
@@ -188,17 +364,26 @@ class ReportHandler(BaseHTTPRequestHandler):
             market = str(self.headers.get("X-Report-Market", "a"))
             if market not in {"a", "hk"}:
                 return self.send_json(400, {"error": "市场参数无效。"})
+            strategy = str(self.headers.get("X-Portfolio-Strategy", ""))
+            if strategy and strategy not in STRATEGIES:
+                return self.send_json(400, {"error": "策略参数无效。"})
             try:
-                request = Request(f"http://127.0.0.1:8765/v1/portfolio-analysis?market={market}",
+                query = urlencode({"market": market, "strategy": strategy})
+                request = Request(f"http://127.0.0.1:8765/v1/portfolio-analysis?{query}",
                                   headers={"Accept": "application/json"})
                 with urlopen(request, timeout=180) as response:
                     return self.send_json(200, json.loads(response.read().decode("utf-8")))
             except (OSError, ValueError, json.JSONDecodeError) as exc:
-                return self.send_json(502, {"error": f"持仓分析暂不可用：{exc}"})
+                return self.send_json(502, {"error": readable_issues([f"持仓分析不可用：{exc}"])[0]})
+        if path == "/api/publish-backtest":
+            if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                return self.send_json(403, {"error": "Local publishing only"})
+            publish_backtest_event()
+            return self.send_json(200, {"published": True})
         if path == "/api/publish-ranking":
             if self.client_address[0] not in {"127.0.0.1", "::1"}:
                 return self.send_json(403, {"error": "Local publishing only"})
-            if not latest_ranking().get("ranking"):
+            if latest_ranking().get("available") is False:
                 return self.send_json(400, {"error": "No ranking is available"})
             publish_ranking_event()
             return self.send_json(200, {"published": True})
@@ -233,7 +418,8 @@ class ReportHandler(BaseHTTPRequestHandler):
             while True:
                 try:
                     message = subscriber.get(timeout=20)
-                    event_name = "ranking" if json.loads(message).get("type") == "ranking" else "report"
+                    event_type = json.loads(message).get("type")
+                    event_name = event_type if event_type in {"ranking", "backtest"} else "report"
                     chunk = f"event: {event_name}\ndata: {message}\n\n".encode("utf-8")
                 except queue.Empty:
                     chunk = b": keep-alive\n\n"

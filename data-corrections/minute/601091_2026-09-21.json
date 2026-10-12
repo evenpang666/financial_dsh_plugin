@@ -1,0 +1,55 @@
+{
+  "symbol": "601091",
+  "day": "2026-09-21",
+  "source": "Sina unadjusted 5-minute bars",
+  "repaired_at": "2026-10-12T15:27:59+08:00",
+  "original_sha256": "4a05c2cf5c8eacc79008178ecc02f068f75e9bd02bd1673c2279f86be9b94b54",
+  "confirmed_no_trade_windows": [
+    "2026-09-21 09:40:00",
+    "2026-09-21 09:50:00"
+  ],
+  "issues": [
+    {
+      "reason": "成交均价超出 K 线高低价",
+      "count": 1,
+      "days": [
+        "2026-09-21"
+      ],
+      "examples": [
+        {
+          "time": "2026-09-21 09:45:00",
+          "open": "40.01",
+          "high": "47.99",
+          "low": "40.01",
+          "close": "47.99",
+          "volume": "11408625",
+          "amount": "389593045.0",
+          "vwap": "34.14899210027501"
+        }
+      ]
+    },
+    {
+      "reason": "分钟成交额合计超出日线总成交额",
+      "count": 1,
+      "days": [
+        "2026-09-21"
+      ],
+      "examples": [
+        {
+          "day": "2026-09-21",
+          "minute_amount": 7408662163.0,
+          "daily_amount": 6770866376.39
+        }
+      ]
+    }
+  ],
+  "minute_amount": 6767849692.8555,
+  "daily_amount": 6770866376.39,
+  "source_url": "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData?symbol=sh601091&scale=5&ma=no&datalen=1970",
+  "correction_file": "601091_2026-09-21.csv",
+  "files": {
+    "601091_2026-09-21.csv": "56dc37e214daa9b8a803d823e1078cdb34e04ad8aa155ed076a6f1011f0d2036",
+    "601091_2026-09-21.baostock.csv": "4a05c2cf5c8eacc79008178ecc02f068f75e9bd02bd1673c2279f86be9b94b54",
+    "601091_2026-09-21.sina.csv": "8faf4f768aec0136eeda655b3509b964c5d9475c898911f6121e70a5cea77e48"
+  }
+}

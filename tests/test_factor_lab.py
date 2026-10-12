@@ -20,13 +20,75 @@ spec.loader.exec_module(factor_lab)
 
 
 class FactorLabTests(unittest.TestCase):
+    def setUp(self):
+        # User preferences must not change a test's intended model or slot.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        setting = patch.object(factor_lab, "SETTINGS", Path(directory.name) / "factor.json")
+        setting.start()
+        self.addCleanup(setting.stop)
+
+    def test_future_prices_cannot_change_signal_time_features(self):
+        from tests.test_factor_backtest import bars
+        days = ["2026-01-05", "2026-01-06", "2026-01-07"]
+        original = bars(days, [10, 11, 12])
+        before = next(row for row in factor_lab.history_samples("600001", original)
+                      if row["day"] == days[1] and row["slot"] == "14:00")
+        changed = original.copy()
+        future = changed.time.gt(pd.Timestamp(f"{days[1]} 14:00"))
+        changed.loc[future, ["open", "high", "low", "close"]] = 999
+        changed.loc[future, "amount"] = changed.loc[future, "volume"] * 999
+        after = next(row for row in factor_lab.history_samples("600001", changed)
+                     if row["day"] == days[1] and row["slot"] == "14:00")
+        for feature in factor_lab.FACTOR_NAMES:
+            self.assertEqual(before[feature], after[feature])
+
     def test_backtest_slot_settings_default_and_persisted(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(factor_lab, "SETTINGS", Path(directory) / "factor.json"):
             self.assertEqual(factor_lab.load_settings()["backtest_slot"], "14:00")
+            factor_lab.write_json(factor_lab.SETTINGS, {"strategy": "elastic_net", "weekly_training_enabled": False})
             factor_lab.save_settings("10:30")
             self.assertEqual(factor_lab.load_settings()["backtest_slot"], "10:30")
+            self.assertEqual(factor_lab.load_settings()["strategy"], "elastic_net")
             with self.assertRaises(ValueError):
                 factor_lab.save_settings("15:00")
+
+    def test_switching_models_reads_matching_artifact_and_does_not_use_other_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(factor_lab, "MODEL", root / "model.json"), patch.object(factor_lab, "MODELS", root / "models"):
+                for algorithm in ("xgboost", "elastic_net"):
+                    model = {"model_id": algorithm, "algorithm": algorithm, "target_version": factor_lab.ML_TARGET_VERSION}
+                    factor_lab.write_json(root / f"model-{algorithm}.json", model)
+                    artifact = root / "models" / algorithm / f"{algorithm}.json"
+                    artifact.parent.mkdir(parents=True); artifact.write_text("{}")
+                self.assertEqual(factor_lab.selected_model("xgboost")["model_id"], "xgboost")
+                self.assertEqual(factor_lab.selected_model("elastic_net")["model_id"], "elastic_net")
+                (root / "models" / "elastic_net" / "elastic_net.json").unlink()
+                self.assertEqual(factor_lab.selected_model("elastic_net"), {})
+
+    def test_rule_strategy_ranks_without_training_and_no_triggers_is_a_valid_result(self):
+        moment = datetime(2026, 9, 23, 10, 31, tzinfo=factor_lab.CHINA)
+        rows = [{"代码": f"600{index:03d}", "名称": f"股票{index}", "最新价": 100,
+                 "今开": 100, "昨收": 99, "最高": 101, "最低": 99,
+                 "成交量": 1000, "成交额": 10000000} for index in range(15)]
+        fake = types.SimpleNamespace(tool_trade_date_hist_sina=lambda: pd.DataFrame({"trade_date": [moment.date()]}))
+        import factor_models
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (patch.object(factor_lab, "STORE", root), patch.object(factor_lab, "LATEST", root / "latest.json"),
+                  patch.object(factor_lab, "now_cn", return_value=moment),
+                  patch.object(factor_lab, "load_settings", return_value={"strategy": "mean_reversion", "backtest_slot": "14:00"}),
+                  patch.object(factor_lab, "today_pit_universe", return_value={row["代码"] for row in rows}),
+                  patch.object(factor_lab, "spot_frame", return_value=pd.DataFrame(rows)),
+                  patch.object(factor_models, "predict", side_effect=AssertionError("rules must not use ML")),
+                  patch.object(factor_lab, "urlopen", side_effect=OSError("offline")),
+                  patch.dict(sys.modules, {"akshare": fake})):
+                self.assertFalse(factor_lab.train()["requires_training"])
+                result = factor_lab.rank()
+            self.assertEqual(result["strategy_id"], "mean_reversion")
+            self.assertTrue(result["available"])
+            self.assertEqual(result["ranking"], [])
 
     def tearDown(self):
         factor_lab.EM_MINUTE_UNAVAILABLE.clear()
@@ -207,6 +269,25 @@ class FactorLabTests(unittest.TestCase):
         self.assertTrue(samples)
         self.assertEqual({item["day"] for item in samples}, {"2026-09-23"})
 
+    def test_new_candidate_has_features_on_first_day_after_warmup_is_loaded(self):
+        from tests.test_factor_backtest import bars
+        warmup_day, first_day = "2025-09-05", "2025-09-08"
+        frame = bars([warmup_day, first_day], [10, 11])
+        state = pd.DataFrame([{"day": first_day, "symbol": "002463",
+                               "split_ratio": 1, "cash_dividend": 0}])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "002463.csv"
+            frame[frame.time.dt.strftime("%Y-%m-%d").eq(first_day)].to_csv(path, index=False)
+            _, _, missing = factor_lab._pit_symbol_inputs("002463", path, "2025-09-04",
+                                                          first_day, "2025-09-09", state)
+            self.assertEqual(missing, [])
+            frame.to_csv(path, index=False)
+            _, _, repaired = factor_lab._pit_symbol_inputs("002463", path, "2025-09-04",
+                                                           first_day, "2025-09-09", state)
+        signal = next(row for row in repaired if row["day"] == first_day and row["slot"] == "14:00")
+        self.assertAlmostEqual(signal["gap"], 0.1)
+        self.assertIsNone(signal["target"])
+
     def test_live_pit_universe_uses_previous_day_public_fallback(self):
         import factor_data_prep as prep
 
@@ -245,7 +326,7 @@ class FactorLabTests(unittest.TestCase):
                              "成交量": 1000, "成交额": price * 100000})
             fake_ak = types.SimpleNamespace(tool_trade_date_hist_sina=lambda: pd.DataFrame({"trade_date": [moment.date()]}))
             with patch.object(factor_lab, "MODEL", base / "model.json"):
-                with self.assertRaisesRegex(RuntimeError, "旧版非 AI"):
+                with self.assertRaisesRegex(RuntimeError, "所选因子模型尚未训练"):
                     factor_lab.rank()
 
     def test_live_ranking_uses_selected_ml_algorithm(self):
@@ -259,15 +340,18 @@ class FactorLabTests(unittest.TestCase):
                      "training": {"last_day": "2026-09-22"},
                      "universe_method": "test", "universe": [{"symbol": f"600{index:03d}"} for index in range(15)]}
             (base / "model.json").write_text(json.dumps(model), encoding="utf-8")
+            (base / "models" / "ml-test").mkdir(parents=True)
+            (base / "models" / "ml-test" / "elastic_net.json").write_text("{}", encoding="utf-8")
             rows = [{"代码": f"600{index:03d}", "名称": f"股票{index}", "最新价": 100 + index,
                      "今开": 100, "昨收": 99, "最高": 102 + index, "最低": 99,
                      "成交量": 1000, "成交额": (100 + index) * 100000} for index in range(15)]
             fake_ak = types.SimpleNamespace(tool_trade_date_hist_sina=lambda: pd.DataFrame({"trade_date": [moment.date()]}))
             import factor_models
             with patch.object(factor_lab, "STORE", base), patch.object(factor_lab, "MODEL", base / "model.json"), \
+                 patch.object(factor_lab, "MODELS", base / "models"), \
                  patch.object(factor_lab, "LATEST", base / "latest.json"), \
                  patch.object(factor_lab, "now_cn", return_value=moment), \
-                 patch.object(factor_lab, "load_settings", return_value={"backtest_slot": "10:30", "weekly_training_enabled": True}), \
+                 patch.object(factor_lab, "load_settings", return_value={"backtest_slot": "10:30", "weekly_training_enabled": True, "strategy": "elastic_net"}), \
                  patch.object(factor_lab, "spot_frame", return_value=pd.DataFrame(rows)), \
                  patch.object(factor_lab, "urlopen", side_effect=OSError("web offline")), \
                  patch.object(factor_models, "predict", return_value=np.arange(15)) as predict, \
@@ -284,7 +368,7 @@ class FactorLabTests(unittest.TestCase):
             path = Path(directory) / "model.json"
             path.write_text(json.dumps({"algorithm": "xgboost", "model_id": "old"}), encoding="utf-8")
             with patch.object(factor_lab, "MODEL", path):
-                with self.assertRaisesRegex(RuntimeError, "旧版非 AI"):
+                with self.assertRaisesRegex(RuntimeError, "所选因子模型尚未训练"):
                     factor_lab.rank()
 
     def test_one_click_train_publishes_chosen_ml_model(self):

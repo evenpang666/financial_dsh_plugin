@@ -18,25 +18,31 @@ LOG = factor_lab.STORE / "weekly-scheduler.log"
 
 
 def due(now: datetime, model: dict, state: dict, settings: dict) -> bool:
+    strategy = settings.get("strategy", "xgboost")
+    if strategy not in factor_lab.MODEL_STRATEGIES:
+        return False
     if not settings["weekly_training_enabled"] or now.weekday() >= 5 or (now.hour, now.minute) < (12, 0):
         return False
     week = now.isocalendar()[:2]
     try:
         trained = datetime.fromisoformat(model["selected_at"])
-        if trained.isocalendar()[:2] == week and model.get("target_version") == factor_lab.ML_TARGET_VERSION:
+        if (trained.isocalendar()[:2] == week and model.get("target_version") == factor_lab.ML_TARGET_VERSION
+                and model.get("algorithm", strategy) == strategy):
             return False
     except (KeyError, TypeError, ValueError):
         pass
-    return state.get("last_attempt_date") != now.date().isoformat()
+    return (state.get("last_attempt_date") != now.date().isoformat()
+            or state.get("strategy", "xgboost") != strategy)
 
 
 def run_once(now: datetime | None = None) -> bool:
     now = now or factor_lab.now_cn()
-    if not due(now, factor_lab.read_json(factor_lab.MODEL), factor_lab.read_json(STATE), factor_lab.load_settings()):
+    settings = factor_lab.load_settings()
+    if not due(now, factor_lab.selected_model(), factor_lab.read_json(STATE), settings):
         return False
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    factor_lab.write_json(STATE, {"last_attempt_date": now.date().isoformat(), "started_at": now.isoformat()})
-    command = [sys.executable, str(Path(__file__).with_name("factor_lab.py")), "train"]
+    factor_lab.write_json(STATE, {"last_attempt_date": now.date().isoformat(), "started_at": now.isoformat(), "strategy": settings["strategy"]})
+    command = [sys.executable, str(Path(__file__).with_name("factor_lab.py")), "train", "--strategy", settings["strategy"]]
     with LOG.open("a", encoding="utf-8") as output:
         output.write(f"\n[{now.isoformat()}] Weekly training started\n")
         output.flush()
