@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="220" viewBox="0 0 960 220" role="img" aria-labelledby="title desc">
+  <title id="title">AKAgent 研究流程</title>
+  <desc id="desc">市场数据进入本地工具与指标服务，智能体组织研究证据，输出日报和策略验证。策略回测使用经过独立验收的历史数据。</desc>
+  <defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#8498b0" stroke-width="1.5"/></marker></defs>
+  <rect x="1" y="1" width="958" height="218" rx="18" fill="#f5f8fc" stroke="#dce5ef"/>
+  <g font-family="Noto Sans CJK SC, Microsoft YaHei, sans-serif">
+    <g fill="#ffffff" stroke="#d7e2ef">
+      <rect x="30" y="55" width="196" height="115" rx="12"/>
+      <rect x="264" y="55" width="196" height="115" rx="12"/>
+      <rect x="498" y="55" width="196" height="115" rx="12"/>
+      <rect x="732" y="55" width="196" height="115" rx="12"/>
+    </g>
+    <g fill="#187e80" font-family="DejaVu Sans, sans-serif" font-size="11" font-weight="700">
+      <text x="48" y="79">01 / DATA</text><text x="282" y="79">02 / TOOLS</text>
+      <text x="516" y="79">03 / AGENT</text><text x="750" y="79">04 / REVIEW</text>
+    </g>
+    <g fill="#152a43" font-size="19" font-weight="700">
+      <text x="48" y="113">市场数据</text><text x="282" y="113">本地工具与指标</text>
+      <text x="516" y="113">智能体研究</text><text x="750" y="113">日报与策略验证</text>
+    </g>
+    <g fill="#63748a" font-size="12">
+      <text x="48" y="143">行情 · 财务 · 事件线索</text><text x="282" y="143">Python 服务 · 20 个工具</text>
+      <text x="516" y="143">DeepSeek Harness · 8 Skills</text><text x="750" y="143">双时点复盘 · 10 项策略</text>
+    </g>
+  </g>
+  <g fill="none" stroke="#8498b0" stroke-width="1.5" marker-end="url(#arrow)">
+    <path d="M233 113H255"/><path d="M467 113H489"/><path d="M701 113H723"/>
+  </g>
+</svg>

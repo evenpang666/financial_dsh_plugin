@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="168" viewBox="0 0 720 168" role="img" aria-labelledby="title desc">
+  <title id="title">AKAgent</title>
+  <desc id="desc">紧凑的深蓝色品牌横幅，以字母 A 和行情折线组成的标志，与 AKAgent 大字居中并排展示。</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#0b1224"/><stop offset="1" stop-color="#142d43"/></linearGradient>
+    <linearGradient id="accent" x2="1" y2="1"><stop stop-color="#7debd5"/><stop offset="1" stop-color="#63aaff"/></linearGradient>
+  </defs>
+  <rect width="720" height="168" rx="18" fill="url(#bg)"/>
+  <g transform="translate(132 32) scale(.6)">
+    <rect width="174" height="174" rx="40" fill="#142b3e" stroke="#395568"/>
+    <path d="M40 130L86 40L134 130" fill="none" stroke="url(#accent)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M39 105H65L80 89L98 108L120 82H139" fill="none" stroke="#e6fff9" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="139" cy="82" r="5" fill="#7debd5"/>
+  </g>
+  <g font-family="Inter, DejaVu Sans, Arial, sans-serif">
+    <text x="266" y="106" fill="#f1f7ff" font-size="68" font-weight="700" letter-spacing="-2">AKAgent</text>
+  </g>
+</svg>

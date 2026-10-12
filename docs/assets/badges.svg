@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="580" height="28" viewBox="0 0 580 28" role="img" aria-labelledby="title">
+  <title id="title">项目版本 2.0；Python 3.11+；Node.js 22 LTS；Windows / Linux</title>
+  <g font-family="DejaVu Sans, Arial, sans-serif" font-size="11" text-anchor="middle">
+    <rect width="110" height="28" rx="5" fill="#25364b"/><path d="M63 0H105Q110 0 110 5V23Q110 28 105 28H63Z" fill="#187e80"/>
+    <text x="31" y="18" fill="#ffffff">version</text><text x="86" y="18" fill="#ffffff">2.0</text>
+    <rect x="122" width="130" height="28" rx="5" fill="#25364b"/><path d="M190 0H247Q252 0 252 5V23Q252 28 247 28H190Z" fill="#386fa4"/>
+    <text x="156" y="18" fill="#ffffff">Python</text><text x="221" y="18" fill="#ffffff">3.11+</text>
+    <rect x="264" width="142" height="28" rx="5" fill="#25364b"/><path d="M335 0H401Q406 0 406 5V23Q406 28 401 28H335Z" fill="#417b43"/>
+    <text x="299" y="18" fill="#ffffff">Node.js</text><text x="370" y="18" fill="#ffffff">22 LTS</text>
+    <rect x="418" width="162" height="28" rx="5" fill="#25364b"/><text x="499" y="18" fill="#ffffff">Windows / Linux</text>
+  </g>
+</svg>

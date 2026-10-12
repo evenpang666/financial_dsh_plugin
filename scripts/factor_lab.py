@@ -579,7 +579,7 @@ def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame
         universe_history = pd.read_csv(UNIVERSE_HISTORY, dtype={"symbol": str})
         market_state = pd.read_csv(MARKET_STATE, dtype={"symbol": str})
     except (OSError, ValueError) as exc:
-        raise RuntimeError("缺少 universe-history.csv 或 market-state.csv；请先按 README 5.5 运行 scripts/factor_data_prep.py 准备并验收历史数据，再回测。") from exc
+        raise RuntimeError("缺少 universe-history.csv 或 market-state.csv；请先按 docs/factor-lab.md 运行 scripts/factor_data_prep.py 准备并验收历史数据，再回测。") from exc
     universe_history, market_state = validate_context(universe_history, market_state)
     manifest = read_json(SOURCE_MANIFEST)
     if manifest.get("data_schema_version") != 2:
