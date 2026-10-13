@@ -1151,6 +1151,8 @@ class ControlPanel(tk.Tk):
                     self.after(0, lambda: self.status_text.set(f"{operation}，详情见运行日志…"))
                 self.after(0, lambda: self.append_log(f"> {VENV_PYTHON.name} factor_lab.py {action} --strategy {strategy}"))
                 command = [str(VENV_PYTHON), str(FACTOR_SCRIPT), action, "--strategy", strategy] + date_args
+                if action == "rank":
+                    command += ["--scope", "full_market"]
                 if hasattr(self, "research_dates") and action != "backtest-all":
                     command += ["--parameters", json.dumps(params)]
                 if checkpoint_id and action in ("backtest", "rank"):

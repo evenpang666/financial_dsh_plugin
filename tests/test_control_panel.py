@@ -404,7 +404,7 @@ class BacktestPreparationTests(unittest.TestCase):
                 self.assertTrue(control_panel.backtest_data_missing())
 
     def test_backtest_downloads_after_notice_then_runs(self):
-        for action in ("backtest", "backtest-all"):
+        for action in ("backtest", "backtest-all", "rank"):
             commands = []
 
             class ImmediateThread:
@@ -446,6 +446,11 @@ class BacktestPreparationTests(unittest.TestCase):
                 control_panel.write_json(control_panel.FACTOR_SETTINGS, {"strategy": "momentum"})
                 control_panel.ControlPanel.run_factor_action(Panel(), action, "回测中")
 
+            if action == "rank":
+                notice.assert_not_called()
+                self.assertEqual(commands[0], [str(control_panel.VENV_PYTHON), str(control_panel.FACTOR_SCRIPT), action, "--strategy", "momentum", "--scope", "full_market"])
+                self.assertEqual(commands[1], (action, "completed"))
+                continue
             notice.assert_called_once()
             self.assertEqual(commands[0], [str(control_panel.VENV_PYTHON), str(control_panel.FACTOR_PREP_SCRIPT),
                                            "--start", "2025-09-04", "--end", "2026-10-09"])

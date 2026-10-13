@@ -141,6 +141,8 @@ button:disabled { cursor:default; opacity:.6; }
 .portfolio-actions .select-control { min-width:0; flex:1 1 180px; }
 .portfolio-actions select { width:100%; min-width:0; max-width:20rem; }
 .ranking-actions { display:flex; flex-wrap:wrap; align-items:flex-end; gap:.7rem; margin-top:1rem; }
+#researchUpdateButton[hidden] { display:none; }
+.report-page .actions { flex-wrap:wrap; }
 .ranking-actions .select-control { min-width:0; flex:1 1 200px; max-width:26rem; }
 .ranking-actions select { width:100%; min-width:0; }
 .ranking-pagination { display:flex; flex-wrap:wrap; align-items:center; gap:.7rem; font-size:.8rem; color:var(--subtle-ink); }

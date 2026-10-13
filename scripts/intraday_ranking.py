@@ -158,6 +158,7 @@ def rank_market(strategy, progress=lambda **state: None, checkpoint_id=None, par
     lab.write_json(STORE / f"full-market-{strategy}.json", payload)
     if model:
         lab.write_json(STORE / f"full-market-{strategy}-{model['model_id']}.json", payload)
+    lab.write_json(STORE / "latest-ranking.json", payload)
     return payload
 
 

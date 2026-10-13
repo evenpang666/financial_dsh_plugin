@@ -26,6 +26,11 @@ const portfolioKind = document.querySelector('#portfolioKind')
 let portfolioOptions = null
 let portfolioStrategyChosen = false
 let portfolioAnalyzing = false
+let portfolioStarting = false
+const portfolioResults = new Map()
+const researchUpdateButton = document.querySelector('#researchUpdateButton')
+let publishedRanking = null
+let rankingPublicationId = ''
 let currentView = {}
 let currentMarket = 'a'
 let selectedHorizon = 'long'
@@ -149,7 +154,7 @@ function renderHorizon() {
 }
 
 function showInsights(payload) {
-  const changedReport = (payload.id || '') !== displayedReportId
+  const changedMarket = (payload.market || 'a') !== currentMarket
   displayedReportId = payload.id || ''
   currentView = payload.view || {}
   currentMarket = payload.market || 'a'
@@ -166,9 +171,11 @@ function showInsights(payload) {
   document.querySelector('#sectorMeta').textContent = `${sectors.source || '数据未归档'} · 仅 A 股概念板块`
   renderBars(sectorChart, sectors.boards || [], row => `${row.theme} · ${row.name}`)
   renderHorizon()
-  if (changedReport) {
+  if (changedMarket) {
     portfolioContent.replaceChildren()
-    document.querySelector('#portfolioMeta').textContent = portfolioKind.value === 'model' && !portfolioStrategy.value
+    const saved = portfolioResults.get(currentMarket)
+    if (saved && saved.selection === portfolioStrategy.value) renderPortfolioResult(saved.payload)
+    else document.querySelector('#portfolioMeta').textContent = portfolioKind.value === 'model' && !portfolioStrategy.value
       ? '没有已训练模型，请先在控制面板训练。' : '默认不读取持仓；点击后按当前公开数据分析。'
   }
 }
@@ -257,7 +264,7 @@ async function loadPortfolioStrategies() {
     portfolioOptions = payload
     if (!portfolioStrategyChosen) portfolioKind.value = payload.selected_kind || (selected?.includes('@') ? 'model' : 'fixed')
     fillExecutionSelect(portfolioKind, portfolioStrategy, payload, selected)
-    document.querySelector('#portfolioButton').disabled = portfolioStrategy.disabled
+    document.querySelector('#portfolioButton').disabled = portfolioStarting || portfolioAnalyzing || portfolioStrategy.disabled
     if (portfolioStrategy.disabled) document.querySelector('#portfolioMeta').textContent = '没有已训练模型，请先在控制面板训练。'
   } catch (error) {
     portfolioStrategy.replaceChildren()
@@ -316,46 +323,53 @@ function renderPositionSummary(payload) {
   portfolioContent.append(methods)
 }
 
+function renderPortfolioResult(payload) {
+  portfolioContent.replaceChildren()
+  const stamp = payload.as_of ? `分析完成 ${new Date(payload.as_of).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}（北京时间） · ` : ''
+  document.querySelector('#portfolioMeta').textContent = stamp + (payload.note || '')
+  if (payload.strategy_review?.checkpoint_id) document.querySelector('#portfolioMeta').textContent += ` · checkpoint ${payload.strategy_review.checkpoint_id} · 训练 ${payload.strategy_review.checkpoint_trained_at}`
+  if (!payload.available) { portfolioContent.append(textNode('p', '当前市场没有已保存持仓。', 'empty-note')); return }
+  renderPositionSummary(payload)
+  const list = document.createElement('div'); list.className = 'watch-grid'
+  for (const item of payload.holdings || []) {
+    const analysis = item.analysis || {}
+    const card = document.createElement('article'); card.className = 'watch-card'
+    card.append(textNode('h3', `${analysis.name || item.holding?.name || item.holding?.symbol} · ${item.holding?.symbol}`))
+    card.append(textNode('p', item.strategy))
+    card.append(textNode('small', `财报期 ${analysis.latest_report_period || '未取得'} · ${analysis.long_term?.evidence?.join('；') || '基本面待补充'}`))
+    card.append(textNode('small', `技术面：${analysis.short_term?.evidence?.join('；') || '待补充'}`))
+    card.append(textNode('small', `缺失：${friendlyMissing(analysis.unavailable)}`))
+    list.append(card)
+  }
+  portfolioContent.append(list)
+}
+
 document.querySelector('#portfolioButton').addEventListener('click', async event => {
+  if (portfolioStarting || portfolioAnalyzing) return
   const button = event.currentTarget
   const requestedMarket = currentMarket
-  const requestedReportId = displayedReportId
+  portfolioStarting = true
   button.disabled = true
-  if (!portfolioStrategyChosen) await loadPortfolioStrategies()
-  if (!portfolioStrategy.value) { button.disabled = true; return }
-  if (requestedReportId !== displayedReportId) { button.disabled = false; return }
-  const selectedStrategy = portfolioStrategy.value
-  const strategyWasDisabled = portfolioStrategy.disabled
-  portfolioStrategy.disabled = true
-  portfolioKind.disabled = true
-  portfolioAnalyzing = true
-  document.querySelector('#portfolioMeta').textContent = '正在分析财报、估值、技术面与所选策略，生成三组研究配置…'
-  portfolioContent.replaceChildren()
   try {
-    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket, 'X-Portfolio-Strategy': selectedStrategy, 'X-Strategy-Parameters': JSON.stringify(executionParameters('portfolio'))}})
+    if (!portfolioStrategyChosen) await loadPortfolioStrategies()
+    if (!portfolioStrategy.value || requestedMarket !== currentMarket) return
+    const selectedStrategy = portfolioStrategy.value
+    const parameters = executionParameters('portfolio')
+    portfolioStrategy.disabled = true; portfolioKind.disabled = true
+    portfolioStarting = false; portfolioAnalyzing = true
+    document.querySelector('#portfolioMeta').textContent = '正在分析财报、估值、技术面与所选策略，生成三组研究配置…'
+    portfolioContent.replaceChildren()
+    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket, 'X-Portfolio-Strategy': selectedStrategy, 'X-Strategy-Parameters': JSON.stringify(parameters)}})
     const payload = await response.json()
-    if (requestedReportId !== displayedReportId) return
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`)
-    document.querySelector('#portfolioMeta').textContent = payload.note || ''
-    if (payload.strategy_review?.checkpoint_id) document.querySelector('#portfolioMeta').textContent += ` · checkpoint ${payload.strategy_review.checkpoint_id} · 训练 ${payload.strategy_review.checkpoint_trained_at}`
-    if (!payload.available) { portfolioContent.append(textNode('p', '当前市场没有已保存持仓。', 'empty-note')); return }
-    renderPositionSummary(payload)
-    const list = document.createElement('div'); list.className = 'watch-grid'
-    for (const item of payload.holdings) {
-      const analysis = item.analysis || {}
-      const card = document.createElement('article'); card.className = 'watch-card'
-      card.append(textNode('h3', `${analysis.name || item.holding?.name || item.holding?.symbol} · ${item.holding?.symbol}`))
-      card.append(textNode('p', item.strategy))
-      card.append(textNode('small', `财报期 ${analysis.latest_report_period || '未取得'} · ${analysis.long_term?.evidence?.join('；') || '基本面待补充'}`))
-      card.append(textNode('small', `技术面：${analysis.short_term?.evidence?.join('；') || '待补充'}`))
-      card.append(textNode('small', `缺失：${friendlyMissing(analysis.unavailable)}`))
-      list.append(card)
-    }
-    portfolioContent.append(list)
-  } catch (error) { document.querySelector('#portfolioMeta').textContent = `持仓分析失败：${error.message}` }
-  finally {
-    button.disabled = !portfolioStrategy.value; portfolioAnalyzing = false; portfolioStrategy.disabled = strategyWasDisabled; portfolioKind.disabled = false
-    if (strategyWasDisabled) loadPortfolioStrategies()
+    portfolioResults.set(requestedMarket, {selection: selectedStrategy, payload})
+    if (requestedMarket === currentMarket) renderPortfolioResult(payload)
+  } catch (error) {
+    if (requestedMarket === currentMarket) document.querySelector('#portfolioMeta').textContent = `持仓分析失败：${error.message}`
+  } finally {
+    portfolioStarting = false; portfolioAnalyzing = false
+    button.disabled = !portfolioStrategy.value
+    portfolioStrategy.disabled = !portfolioStrategy.options.length; portfolioKind.disabled = false
   }
 })
 
@@ -452,22 +466,67 @@ async function requestJson(url) {
   return response.json()
 }
 
-async function loadRankingStrategies() {
+async function loadRankingStrategies(preferredId = '', force = false) {
   if (rankingJob || rankingStarting) return
   try {
     const payload = await requestJson('/api/ranking/strategies')
     if (rankingJob || rankingStarting) return
-    const previous = rankingStrategyChosen ? rankingStrategy.value : payload.selected
+    const previous = preferredId && (force || !rankingStrategyChosen) ? preferredId : rankingStrategyChosen ? rankingStrategy.value : payload.selected
     rankingOptions = payload
-    if (!rankingStrategyChosen) rankingKind.value = payload.selected_kind || (previous?.includes('@') ? 'model' : 'fixed')
+    if (preferredId && (force || !rankingStrategyChosen)) rankingKind.value = previous.includes('@') ? 'model' : 'fixed'
+    else if (!rankingStrategyChosen) rankingKind.value = payload.selected_kind || (previous?.includes('@') ? 'model' : 'fixed')
     fillExecutionSelect(rankingKind, rankingStrategy, payload, previous)
     rankMarketButton.disabled = rankingStrategy.disabled
     document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.disabled ? '没有已训练模型，请先在控制面板训练。' : ''
-    await loadRanking()
+    return await loadRanking()
   } catch (error) {
-    rankingStrategy.replaceChildren(); rankingStrategy.disabled = true; rankMarketButton.disabled = true
+    if (!rankingOptions) {
+      rankingStrategy.replaceChildren(); rankingStrategy.disabled = true; rankMarketButton.disabled = true
+    }
     document.querySelector('#rankingOptionsNote').textContent = `可用策略暂不可读：${error.message}`
+    return false
   }
+}
+
+async function handleRankingPublication(payload) {
+  if (payload.scope !== 'full_market' || !payload.id || payload.id === rankingPublicationId) return
+  publishedRanking = payload
+  researchUpdateButton.hidden = false
+  researchUpdateButton.textContent = `${payload.strategy_name || '策略'}部署已更新 · 查看`
+  if (!rankingJob && !rankingStarting && await loadRankingStrategies(payload.selection_id || '')) rankingPublicationId = payload.id
+}
+
+async function refreshRankingPublication() {
+  try {
+    const payload = await requestJson('/api/ranking/update')
+    if (payload.available) await handleRankingPublication(payload)
+  } catch (_) { /* SSE and the next refresh will recover a disconnected service. */ }
+}
+
+researchUpdateButton.addEventListener('click', async () => {
+  if (publishedRanking && !rankingJob && !rankingStarting) {
+    await loadRankingStrategies(publishedRanking.selection_id, true)
+    rankingStrategyChosen = true
+  }
+  document.querySelector('#researchTools').open = true
+  jumpToSection(document.querySelector('#rankingTools'))
+})
+
+async function restoreRankingJob() {
+  if (rankingJob || rankingStarting) return
+  try {
+    const state = await requestJson('/api/ranking/active')
+    if (!state?.job_id || state.status !== 'running' || rankingJob || rankingStarting) return
+    const selection = state.selection_id || state.strategy_id
+    if (rankingStrategyChosen && rankingStrategy.value !== selection) return
+    rankingKind.value = selection.includes('@') ? 'model' : 'fixed'
+    fillExecutionSelect(rankingKind, rankingStrategy, rankingOptions, selection)
+    if (rankingStrategy.value !== selection) return
+    rankingJob = state
+    rankingStrategy.disabled = true; rankingKind.disabled = true; rankMarketButton.disabled = true
+    rankMarketButton.textContent = '策略部署处理中…'
+    await pollRankingJob()
+  } catch (_) { /* A refresh can reattach once the service is available. */ }
 }
 rankingKind.addEventListener('change', () => {
   rankingStrategyChosen = true
@@ -528,14 +587,15 @@ function renderRanking(payload) {
 }
 
 async function loadRanking() {
-  if (rankingJob || rankingStarting || !rankingStrategy.value || rankingStrategy.disabled) return
+  if (rankingJob || rankingStarting || !rankingStrategy.value || rankingStrategy.disabled) return false
   const strategy = rankingStrategy.value
   try {
     const payload = await requestJson(`/api/ranking/latest?scope=full_market&strategy=${encodeURIComponent(strategy)}`)
-    if (rankingStrategy.value === strategy && !rankingJob && !rankingStarting) renderRanking(payload)
+    if (rankingStrategy.value === strategy && !rankingJob && !rankingStarting) { renderRanking(payload); return true }
   } catch (error) {
     if (rankingStrategy.value === strategy && !rankingJob && !rankingStarting) rankingMeta.textContent = `排名暂不可读：${error.message}`
   }
+  return false
 }
 
 function finishRankingJob() {
@@ -560,6 +620,10 @@ async function pollRankingJob() {
     }
     if (state.status === 'failed') { finishRankingJob(); return }
   } catch (error) {
+    if (rankingJob?.job_id !== id) return
+    if (error.message === 'HTTP 404') {
+      finishRankingJob(); rankingMeta.textContent = '部署任务已不存在，请重新发起。'; return
+    }
     rankingMeta.textContent = `进度暂不可读：${error.message}；正在重试`
   }
   rankingPollTimer = setTimeout(pollRankingJob, 2000)
@@ -621,16 +685,17 @@ async function loadIndex(preferredId = '') {
 reportDate.addEventListener('change', () => loadIndex(reportDate.value))
 refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRankingStrategies(); loadPortfolioStrategies() })
 loadIndex(requestedReport)
-loadRankingStrategies()
+loadRankingStrategies().then(async () => { await restoreRankingJob(); await refreshRankingPublication() })
 loadPortfolioStrategies()
 setInterval(() => loadIndex(reportDate.value), 30_000)
 setInterval(loadRanking, 30_000)
+setInterval(refreshRankingPublication, 30_000)
 
 const reportEvents = new EventSource('/api/events')
 reportEvents.addEventListener('report', event => {
   const payload = JSON.parse(event.data)
   loadIndex(payload.id || payload.date)
 })
-reportEvents.addEventListener('ranking', loadRanking)
-reportEvents.addEventListener('open', () => { connectionState.textContent = '实时连接' })
+reportEvents.addEventListener('ranking', event => handleRankingPublication(JSON.parse(event.data)))
+reportEvents.addEventListener('open', () => { connectionState.textContent = '实时连接'; refreshRankingPublication(); restoreRankingJob() })
 reportEvents.addEventListener('error', () => { connectionState.textContent = '自动刷新中' })

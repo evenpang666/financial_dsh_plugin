@@ -23,6 +23,7 @@
       <div class="intro-heading">
         <div><h1 id="pageTitle">双时点日报</h1><p id="updatedAt">正在连接本地日报服务</p></div>
         <div class="actions">
+          <button id="researchUpdateButton" type="button" hidden>部署结果已更新 · 查看</button>
           <label class="select-control" for="reportDate"><span>报告日期</span><select id="reportDate" aria-label="选择历史日报" disabled><option>暂无日报</option></select></label>
           <button id="refreshButton" type="button"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 7.25A6.5 6.5 0 1 0 16.2 11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16 3.75v3.5h-3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>刷新</button>
         </div>
@@ -72,12 +73,12 @@
       <article id="report" class="report" hidden></article>
     </section>
     <details id="researchTools" class="research-tools"><summary>研究工具 · 持仓与盘中策略部署</summary><p class="ranking-note">以下为当前研究工具结果，时间可能与所选归档日报不同。</p>
-    <section class="insight-card portfolio-shell" aria-labelledby="portfolioTitle">
+    <section id="portfolioTools" class="insight-card portfolio-shell" aria-labelledby="portfolioTitle">
       <div class="section-heading"><div><p class="eyebrow">ON-DEMAND PORTFOLIO</p><h2 id="portfolioTitle">持仓分析与仓位总结</h2><p id="portfolioMeta" class="insight-meta">默认不读取持仓；点击后对照个股研究与所选策略。</p></div><div class="portfolio-actions"><label class="select-control" for="portfolioKind"><span>策略类型</span><select id="portfolioKind"><option value="fixed">经典策略</option><option value="model">多因子模型策略</option></select></label><label class="select-control" for="portfolioStrategy"><span>经典策略 / 已训练 checkpoint</span><select id="portfolioStrategy" disabled><option value="">正在读取策略…</option></select></label><button id="portfolioButton" type="button">分析我的持仓</button></div></div>
       <div id="portfolioParameters" class="strategy-parameters"></div>
       <div id="portfolioContent" aria-live="polite"></div>
     </section>
-    <section class="ranking-shell" aria-labelledby="rankingTitle">
+    <section id="rankingTools" class="ranking-shell" aria-labelledby="rankingTitle">
       <div class="ranking-heading"><div><p class="eyebrow">STRATEGY DEPLOYMENT</p><h2 id="rankingTitle">全市场盘中策略部署</h2><p id="rankingMeta" role="status">选择经典交易策略或已训练的因子模型，点击策略部署获取当前盘中结果。</p></div><span class="ranking-badge">沪深 A 股 · 盘中研究</span></div>
       <div class="ranking-actions"><label class="select-control" for="rankingKind"><span>策略类型</span><select id="rankingKind"><option value="fixed">经典策略</option><option value="model">多因子模型策略</option></select></label><label class="select-control" for="rankingStrategy"><span>经典策略 / 已训练 checkpoint</span><select id="rankingStrategy" disabled><option>正在读取可用策略…</option></select></label><button id="rankMarketButton" type="button" disabled>开始盘中策略部署</button></div>
       <div id="rankingParameters" class="strategy-parameters"></div>

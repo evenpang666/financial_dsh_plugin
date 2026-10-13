@@ -20,6 +20,23 @@ spec.loader.exec_module(factor_lab)
 
 
 class FactorLabTests(unittest.TestCase):
+    def test_panel_market_deployment_uses_same_engine_and_notifies_after_persisting(self):
+        import intraday_ranking
+        settings = {"strategy": "momentum", "checkpoint_id": "", "strategy_parameters": {"momentum": {"threshold": .01, "top_n": 3}}}
+        result = {"available": True, "scope": "full_market", "strategy_id": "momentum", "id": "new-deployment"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(factor_lab, "LATEST", Path(directory)/"latest.json"), patch.object(factor_lab, "load_settings", return_value=settings), patch.object(intraday_ranking, "rank_market", return_value=result) as rank, patch.object(factor_lab, "urlopen") as publish:
+            response = publish.return_value
+            def check_publish(*args, **kwargs):
+                self.assertEqual(factor_lab.read_json(factor_lab.LATEST), result)
+                return response
+            publish.side_effect = check_publish
+            returned = factor_lab.rank_full_market()
+            self.assertEqual(returned, result)
+            self.assertEqual(factor_lab.read_json(factor_lab.LATEST), result)
+            self.assertEqual(rank.call_args.kwargs["parameters"]["top_n"], 3)
+            self.assertEqual(rank.call_args.kwargs["parameters"]["threshold"], .01)
+            self.assertIn("/api/publish-ranking", publish.call_args.args[0].full_url)
+
     def setUp(self):
         # User preferences must not change a test's intended model or slot.
         directory = tempfile.TemporaryDirectory()

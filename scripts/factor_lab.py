@@ -955,6 +955,24 @@ def rank() -> dict:
     return payload
 
 
+def rank_full_market() -> dict:
+    from intraday_ranking import rank_market
+    settings = load_settings()
+    strategy = settings["strategy"]
+    result = rank_market(strategy, lambda **state: log(state.get("message", "正在部署…")),
+                         checkpoint_id=settings.get("checkpoint_id", ""),
+                         parameters=configured_parameters(settings, strategy))
+    write_json(LATEST, result)
+    try:
+        request = Request("http://127.0.0.1:8766/api/publish-ranking", data=b"{}", method="POST",
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=4):
+            log("全市场部署结果已实时发布至日报研究工具。")
+    except OSError:
+        log("全市场部署已保存；日报服务暂不可连接，打开页面后可读取。")
+    return result
+
+
 def status() -> dict:
     settings = load_settings()
     try:
@@ -980,6 +998,7 @@ def main() -> int:
     parser.add_argument("--start", help="本次训练或回测的起始日期 YYYY-MM-DD")
     parser.add_argument("--end", help="本次训练或回测的结束日期 YYYY-MM-DD")
     parser.add_argument("--parameters", help="本次策略的超参数 JSON 对象")
+    parser.add_argument("--scope", choices=("candidate_pool", "full_market"), default="candidate_pool", help="部署范围；控制面板使用全市场")
     args = parser.parse_args()
     global _STRATEGY_OVERRIDE, _CHECKPOINT_OVERRIDE, _SETTINGS_OVERRIDE
     _STRATEGY_OVERRIDE = args.strategy
@@ -997,7 +1016,7 @@ def main() -> int:
             _SETTINGS_OVERRIDE[key] = {**read_json(SETTINGS).get(key, {}), selected: json.loads(args.parameters)}
             configured_parameters(load_settings(), selected, "training" if purpose == "training" else "execution")
         result = {"train": train, "train-cached": train_from_cache, "backtest": backtest_from_cache,
-                  "backtest-all": backtest_all_from_cache, "rank": rank, "status": status}[args.action]()
+                  "backtest-all": backtest_all_from_cache, "rank": rank_full_market if args.scope == "full_market" else rank, "status": status}[args.action]()
         if args.action == "status":
             log(json.dumps(result, ensure_ascii=False))
         return 0

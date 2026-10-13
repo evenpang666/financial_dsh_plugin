@@ -56,6 +56,36 @@ class ReportWebServerTests(unittest.TestCase):
         self.assertIn("代理", message)
         self.assertNotIn("https", message)
 
+    def test_deployment_notification_identifies_checkpoint_without_broadcasting_portfolio(self):
+        result = {"available": True, "scope": "full_market", "id": "new-deployment", "strategy_id": "elastic_net",
+                  "checkpoint_id": "frozen-model", "strategy_name": "Elastic Net", "generated_at": "2026-10-13T10:00:00+08:00",
+                  "ranking": [{"symbol": "600000"}], "portfolio": [{"private": True}]}
+        subscriber = queue.Queue()
+        with report_web.SUBSCRIBERS_LOCK:
+            report_web.SUBSCRIBERS.add(subscriber)
+        try:
+            report_web.publish_ranking_event(result)
+            notification = json.loads(subscriber.get_nowait())
+        finally:
+            with report_web.SUBSCRIBERS_LOCK:
+                report_web.SUBSCRIBERS.discard(subscriber)
+        self.assertEqual(notification["selection_id"], "elastic_net@frozen-model")
+        self.assertEqual(notification["id"], "new-deployment")
+        self.assertNotIn("portfolio", notification)
+        self.assertNotIn("ranking", notification)
+        handler = self.handler("/api/ranking/update")
+        with patch.object(report_web, "latest_ranking", return_value=result):
+            handler.do_GET()
+        self.assertTrue(handler.send_json.call_args.args[1]["available"])
+
+    def test_page_can_reattach_to_active_job_without_starting_new_computation(self):
+        state = {"job_id": "a"*32, "status": "running", "selection_id": "momentum"}
+        handler = self.handler("/api/ranking/active")
+        with patch.object(report_web, "ACTIVE_RANKING_JOB", state["job_id"]), patch.object(report_web, "ranking_job", return_value=state), patch.object(report_web, "start_ranking_job") as start:
+            handler.do_GET()
+        self.assertEqual(handler.send_json.call_args.args[1], state)
+        start.assert_not_called()
+
     def test_whole_market_ranking_request_validates_origin_and_strategy(self):
         handler = self.handler("/api/ranking/start", {"Host": "localhost:8766", "Origin": "http://evil.invalid", "X-Ranking-Strategy": "momentum"})
         with patch.object(report_web, "start_ranking_job") as start:

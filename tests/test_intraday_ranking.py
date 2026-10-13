@@ -32,6 +32,7 @@ class IntradayRankingTests(unittest.TestCase):
                 result = ranking.rank_market(strategy, **kwargs)
                 persisted = lab.read_json(Path(directory) / f"full-market-{strategy}.json")
                 self.assertEqual(persisted, result)
+                self.assertEqual(lab.read_json(Path(directory) / "latest-ranking.json"), result)
                 return result
 
     def test_whole_market_keeps_all_scores_and_non_entries(self):

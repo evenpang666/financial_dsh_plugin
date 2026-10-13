@@ -73,7 +73,7 @@ def run_ranking_worker(job_id, strategy, checkpoint_id=""):
             if state.get("status") != "failed":
                 write_json(directory / f"{job_id}.json", {**state, "status": "failed", "message": "排序进程未完成，请检查本机排序日志并重试。"})
         else:
-            publish_ranking_event()
+            publish_ranking_event(state.get("result"))
     except (OSError, subprocess.TimeoutExpired) as exc:
         state = ranking_job(job_id) or {}
         message = "全市场分钟线取数超过20分钟，任务已停止；请稍后重试或选择快照策略。" if isinstance(exc, subprocess.TimeoutExpired) else "排序进程启动失败，请检查本机环境。"
@@ -119,11 +119,21 @@ def publish_report_event(report_id: str):
         subscriber.put(message)
 
 
-def publish_ranking_event():
+def ranking_publication(result=None):
+    result = result or {}
+    strategy, checkpoint = result.get("strategy_id", ""), result.get("checkpoint_id")
+    message = {"type": "ranking", "scope": result.get("scope"), "id": result.get("id"),
+               "selection_id": f"{strategy}@{checkpoint}" if checkpoint else strategy,
+               "strategy_name": result.get("strategy_name"), "generated_at": result.get("generated_at")}
+    return message
+
+
+def publish_ranking_event(result=None):
+    message = ranking_publication(result)
     with SUBSCRIBERS_LOCK:
         subscribers = list(SUBSCRIBERS)
     for subscriber in subscribers:
-        subscriber.put(json.dumps({"type": "ranking"}))
+        subscriber.put(json.dumps(message, ensure_ascii=False))
 
 
 def latest_ranking(strategy="", scope=""):
@@ -298,6 +308,12 @@ class ReportHandler(BaseHTTPRequestHandler):
             if path == "/api/ranking/strategies":
                 from intraday_ranking import ranking_options
                 return self.send_json(200, ranking_options())
+            if path == "/api/ranking/update":
+                result = latest_ranking()
+                return self.send_json(200, {"available": bool(result.get("available") and result.get("scope") == "full_market"),
+                                            **ranking_publication(result)})
+            if path == "/api/ranking/active":
+                return self.send_json(200, ranking_job(ACTIVE_RANKING_JOB) if ACTIVE_RANKING_JOB else {"available": False})
             if path.startswith("/api/ranking/jobs/"):
                 state = ranking_job(path.removeprefix("/api/ranking/jobs/"))
                 return self.send_json(200, state) if state else self.send_json(404, {"error": "未找到排序任务。"})
@@ -404,9 +420,10 @@ class ReportHandler(BaseHTTPRequestHandler):
         if path == "/api/publish-ranking":
             if self.client_address[0] not in {"127.0.0.1", "::1"}:
                 return self.send_json(403, {"error": "Local publishing only"})
-            if latest_ranking().get("available") is False:
+            result = latest_ranking()
+            if result.get("available") is False:
                 return self.send_json(400, {"error": "No ranking is available"})
-            publish_ranking_event()
+            publish_ranking_event(result)
             return self.send_json(200, {"published": True})
         if path != "/api/publish":
             return self.send_json(404, {"error": "Not found"})
