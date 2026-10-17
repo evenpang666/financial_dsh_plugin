@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import RLock
+from uuid import uuid4
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -34,6 +36,7 @@ except ImportError as exc:  # pragma: no cover
 HOST, PORT = "127.0.0.1", 8765
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PORTFOLIO_FILE = PROJECT_ROOT / "data" / "portfolio.json"
+PORTFOLIO_LOCK = RLock()
 EVENT_ARCHIVE_FILE = PROJECT_ROOT / "data" / "market-events.json"
 REPORT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "report-snapshots"
 REFLECTION_FILE = PROJECT_ROOT / "data" / "research-reflections.json"
@@ -259,15 +262,18 @@ def save_portfolio(payload: dict):
     symbols = [(item.get("market", "a"), item["symbol"]) for item in holdings]
     if len(symbols) != len(set(symbols)):
         raise ValueError("持仓代码不能重复。")
-    PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PORTFOLIO_FILE.write_text(json.dumps({"holdings": holdings}, ensure_ascii=False, indent=2), encoding="utf-8")
+    with PORTFOLIO_LOCK:
+        PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = PORTFOLIO_FILE.with_name(PORTFOLIO_FILE.name + "." + uuid4().hex + ".tmp")
+        try:
+            temporary.write_text(json.dumps({"holdings": holdings}, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(PORTFOLIO_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
     return {"source": "local portfolio file", "as_of": str(date.today()), "holdings": holdings, "saved": True}
 
 
-def stock_search_response(query: str, limit: int, market: str = "a"):
-    query = str(query or "").strip()
-    if not query:
-        raise ValueError("query 不能为空。")
+def stock_catalog(market: str):
     market = normalize_market(market)
     if market == "a":
         frame = ak.stock_info_a_code_name().copy()
@@ -282,12 +288,113 @@ def stock_search_response(query: str, limit: int, market: str = "a"):
     normalizer = normalize_a_symbol if market == "a" else normalize_hk_symbol
     frame[code_key] = frame[code_key].map(normalizer)
     frame = frame.loc[frame[code_key].ne("")]
+    return frame, code_key, name_key, source
+
+
+def stock_search_response(query: str, limit: int, market: str = "a"):
+    query = str(query or "").strip()
+    if not query:
+        raise ValueError("query 不能为空。")
+    market = normalize_market(market)
+    frame, code_key, name_key, source = stock_catalog(market)
+    normalizer = normalize_a_symbol if market == "a" else normalize_hk_symbol
     query_symbol = normalizer(query)
     exact = frame[code_key].eq(query_symbol) | frame[name_key].astype(str).eq(query)
     partial = frame[code_key].str.contains(query, case=False, na=False, regex=False) | frame[name_key].astype(str).str.contains(query, case=False, na=False, regex=False)
     result = pd.concat([frame.loc[exact], frame.loc[partial & ~exact]]).head(limit)
     matches = [{"symbol": str(item[code_key]), "name": str(item[name_key])} for item in result.to_dict("records")]
     return {"query": query, "market": market, "source": source, "as_of": str(date.today()), "matches": matches}
+
+
+def import_holdings(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("holdings"), list) or not 1 <= len(payload["holdings"]) <= 100:
+        raise ValueError("请提供1–100条持仓。")
+    result, seen = [], set()
+    for item in payload["holdings"]:
+        if not isinstance(item, dict) or item.get("market") not in ("a", "hk"):
+            raise ValueError("每条持仓必须标明 a 或 hk 市场。")
+        market, symbol, shares = item["market"], item.get("symbol"), item.get("shares")
+        size = 6 if market == "a" else 5
+        if not isinstance(symbol, str) or len(symbol) != size or not symbol.isascii() or not symbol.isdigit() or int(symbol) == 0:
+            raise ValueError("股票代码无效。")
+        if isinstance(shares, bool) or not isinstance(shares, (int, float)) or not 0 < shares <= 1_000_000_000_000 or not float(shares).is_integer():
+            raise ValueError("股数必须是正整数。")
+        key = (market, symbol)
+        if key in seen:
+            raise ValueError("本次输入包含重复持仓代码。")
+        seen.add(key)
+        holding = {"market": market, "symbol": symbol, "shares": int(shares)}
+        if item.get("name"):
+            holding["name"] = str(item["name"])[:80]
+        result.append(holding)
+    return result
+
+
+def resolve_portfolio(payload: dict):
+    holdings = import_holdings(payload)
+    previous = {(row.get("market", "a"), row["symbol"]): row for row in portfolio_response()["holdings"]}
+    unavailable, catalogs, missing = [], {}, []
+    for row in holdings:
+        market, symbol = row["market"], row["symbol"]
+        row.pop("name", None)
+        name = previous.get((market, symbol), {}).get("name")
+        if not name:
+            if market not in catalogs:
+                try:
+                    frame, code_key, name_key, _ = stock_catalog(market)
+                    catalogs[market] = dict(zip(frame[code_key], frame[name_key]))
+                except Exception:
+                    catalogs[market] = {}
+            name = catalogs[market].get(symbol)
+        if isinstance(name, str) and name.strip():
+            row["name"] = name.strip()[:80]
+        elif catalogs.get(market):
+            raise ValueError(f"{market_label(market)}代码 {symbol} 未在股票列表中找到，请核对。")
+        else:
+            missing.append(row)
+    if missing:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            names = executor.map(lambda row: portfolio_name_fallback(row["symbol"], row["market"]), missing)
+            for row, name in zip(missing, names):
+                if name:
+                    row["name"] = name
+        for market in dict.fromkeys(row["market"] for row in missing if not row.get("name")):
+            unavailable.append(f"{market_label(market)}名称暂未取得；代码和股数可正常保存，名称稍后可重试补全。")
+    return {"holdings": holdings, "unavailable": unavailable, "source": "local portfolio / AKShare stock catalog / Tencent quote identity", "as_of": str(date.today())}
+
+
+def portfolio_name_fallback(symbol: str, market: str) -> str | None:
+    prefix = "hk" if market == "hk" else "bj" if symbol.startswith(("4", "8", "92")) else "sh" if symbol.startswith(("5", "6", "9")) else "sz"
+    try:
+        response = requests.get(f"https://qt.gtimg.cn/q={prefix}{symbol}", timeout=8)
+        response.raise_for_status()
+        response.encoding = "gbk"
+        text = response.text
+        if f'v_{prefix}{symbol}="' not in text:
+            return None
+        fields = text.split('="', 1)[1].split('"', 1)[0].split("~")
+        if len(fields) < 3 or fields[2] != symbol or not fields[1].strip():
+            return None
+        return fields[1].strip()[:80]
+    except Exception:
+        return None
+
+
+def import_portfolio(payload: dict):
+    incoming = import_holdings(payload)
+    with PORTFOLIO_LOCK:
+        merged = {(row.get("market", "a"), row["symbol"]): row for row in portfolio_response()["holdings"]}
+        added = updated = 0
+        for row in incoming:
+            key = (row["market"], row["symbol"])
+            if key in merged:
+                updated += 1
+                merged[key] = {**merged[key], "shares": row["shares"], **({"name": row["name"]} if row.get("name") else {})}
+            else:
+                added += 1
+                merged[key] = row
+        saved = save_portfolio({"holdings": list(merged.values())})
+    return {**saved, "added": added, "updated": updated}
 
 
 def trading_day_response(day_text: str = "", market: str = "a"):
@@ -1664,13 +1771,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
-            if parsed.path != "/v1/portfolio":
+            handlers = {"/v1/portfolio": save_portfolio, "/v1/portfolio/resolve": resolve_portfolio, "/v1/portfolio/import": import_portfolio}
+            if parsed.path not in handlers:
                 return self.send_json(404, {"error": "Unknown endpoint"})
             content_length = int(self.headers.get("Content-Length", "0"))
             if content_length <= 0 or content_length > 100_000:
                 raise ValueError("请求体大小无效。")
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-            self.send_json(200, save_portfolio(payload))
+            self.send_json(200, handlers[parsed.path](payload))
         except Exception as exc:
             self.send_json(400, {"error": f"保存持仓失败：{exc}"})
 

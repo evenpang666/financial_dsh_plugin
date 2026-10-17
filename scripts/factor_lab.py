@@ -569,7 +569,7 @@ def cached_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], list[dict]]:
     model = read_json(MODEL)
     universe = model.get("universe", [])
     if len(universe) < MIN_STOCKS:
-        raise RuntimeError("尚无有效候选池；请先点击“一键训练”。")
+        raise RuntimeError("尚无有效候选池；请先在网页开始训练。")
     samples, bars_by_symbol = [], {}
     for index, item in enumerate(universe, 1):
         symbol = item["symbol"]
@@ -631,7 +631,11 @@ def backtest_inputs() -> tuple[list[dict], dict[str, pd.DataFrame], pd.DataFrame
         if not path.exists() or file_sha256(path) != manifest["bars"][symbol]:
             raise RuntimeError(f"历史股票池 {symbol} 的分钟线与验收清单不一致。")
     indicator_parameters = {key: configured_parameters(load_settings(), key) for key in TECHNICAL_STRATEGIES}
-    with ProcessPoolExecutor(max_workers=4) as executor:
+    pool_options = {}
+    if os.getenv("FINANCE_WEB_OWNED") == "1":
+        from web_process_owner import watch_owner
+        pool_options["initializer"] = watch_owner
+    with ProcessPoolExecutor(max_workers=4, **pool_options) as executor:
         futures = [executor.submit(_pit_symbol_inputs, symbol, BARS / f"{symbol}.csv",
                                    first_day, last_day, cutoff_day,
                                    market_state[market_state.symbol.eq(symbol)], indicator_parameters)
@@ -847,9 +851,9 @@ def rank() -> dict:
         "selection_warning": strategy_description(strategy, configured_parameters(load_settings(), strategy)), "quality": "fixed_rule",
     }
     if not model:
-        raise RuntimeError("所选因子模型尚未训练，请先点击“一键训练”。")
+        raise RuntimeError("所选因子模型尚未训练，请先在网页开始训练。")
     if is_model and model.get("target_version") != ML_TARGET_VERSION:
-        raise RuntimeError("旧版非 AI 因子模型或当日收盘模型已停用；请重新点击“一键训练”。")
+        raise RuntimeError("旧版非 AI 因子模型或当日收盘模型已停用；请重新在网页开始训练。")
     started = now_cn()
     if not is_trading_time(started):
         raise RuntimeError("仅在 A 股交易时段 09:35–11:30、13:00–15:00 生成盘中排名。")
@@ -993,12 +997,12 @@ def status() -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="A股策略训练、回测和即时排名")
     parser.add_argument("action", choices=("train", "train-cached", "backtest", "backtest-all", "rank", "status"))
-    parser.add_argument("--strategy", choices=tuple(STRATEGIES), help="本次任务的策略；默认读取控制面板设置")
+    parser.add_argument("--strategy", choices=tuple(STRATEGIES), help="本次任务的策略；默认读取保存配置")
     parser.add_argument("--checkpoint", help="回测和部署使用的已训练 checkpoint ID")
     parser.add_argument("--start", help="本次训练或回测的起始日期 YYYY-MM-DD")
     parser.add_argument("--end", help="本次训练或回测的结束日期 YYYY-MM-DD")
     parser.add_argument("--parameters", help="本次策略的超参数 JSON 对象")
-    parser.add_argument("--scope", choices=("candidate_pool", "full_market"), default="candidate_pool", help="部署范围；控制面板使用全市场")
+    parser.add_argument("--scope", choices=("candidate_pool", "full_market"), default="candidate_pool", help="部署范围；网页使用全市场")
     args = parser.parse_args()
     global _STRATEGY_OVERRIDE, _CHECKPOINT_OVERRIDE, _SETTINGS_OVERRIDE
     _STRATEGY_OVERRIDE = args.strategy

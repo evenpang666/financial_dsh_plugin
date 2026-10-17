@@ -28,6 +28,7 @@ let portfolioStrategyChosen = false
 let portfolioAnalyzing = false
 let portfolioStarting = false
 const portfolioResults = new Map()
+document.addEventListener('portfolio-saved', () => { portfolioResults.clear(); portfolioContent.replaceChildren(); document.querySelector('#portfolioMeta').textContent = '持仓已更新，点击“分析我的持仓”查看新结果。' })
 const researchUpdateButton = document.querySelector('#researchUpdateButton')
 let publishedRanking = null
 let rankingPublicationId = ''
@@ -176,7 +177,7 @@ function showInsights(payload) {
     const saved = portfolioResults.get(currentMarket)
     if (saved && saved.selection === portfolioStrategy.value) renderPortfolioResult(saved.payload)
     else document.querySelector('#portfolioMeta').textContent = portfolioKind.value === 'model' && !portfolioStrategy.value
-      ? '没有已训练模型，请先在控制面板训练。' : '默认不读取持仓；点击后按当前公开数据分析。'
+      ? '没有已训练模型，请先在回测页训练模型。' : '默认不读取持仓；点击后按当前公开数据分析。'
   }
 }
 
@@ -265,7 +266,7 @@ async function loadPortfolioStrategies() {
     if (!portfolioStrategyChosen) portfolioKind.value = payload.selected_kind || (selected?.includes('@') ? 'model' : 'fixed')
     fillExecutionSelect(portfolioKind, portfolioStrategy, payload, selected)
     document.querySelector('#portfolioButton').disabled = portfolioStarting || portfolioAnalyzing || portfolioStrategy.disabled
-    if (portfolioStrategy.disabled) document.querySelector('#portfolioMeta').textContent = '没有已训练模型，请先在控制面板训练。'
+    if (portfolioStrategy.disabled) document.querySelector('#portfolioMeta').textContent = '没有已训练模型，请先在回测页训练模型。'
   } catch (error) {
     portfolioStrategy.replaceChildren()
     portfolioStrategy.disabled = true
@@ -277,13 +278,13 @@ portfolioKind.addEventListener('change', () => {
   if (portfolioOptions) fillExecutionSelect(portfolioKind, portfolioStrategy, portfolioOptions)
   document.querySelector('#portfolioButton').disabled = !portfolioStrategy.value
   portfolioContent.replaceChildren()
-  document.querySelector('#portfolioMeta').textContent = portfolioStrategy.value ? '请选择策略或 checkpoint 后分析持仓。' : '没有已训练模型，请先在控制面板训练。'
+  document.querySelector('#portfolioMeta').textContent = portfolioStrategy.value ? '请选择策略或 checkpoint 后分析持仓。' : '没有已训练模型，请先在回测页训练模型。'
 })
 portfolioStrategy.addEventListener('change', () => {
   portfolioStrategyChosen = true
   renderExecutionParameters("portfolio", portfolioStrategy, portfolioOptions)
   portfolioContent.replaceChildren()
-  document.querySelector('#portfolioMeta').textContent = '策略已切换，请重新点击分析；本页选择不会修改控制面板配置。'
+  document.querySelector('#portfolioMeta').textContent = '策略已切换，请重新点击分析；本页选择不会修改保存配置。'
 })
 
 function renderPositionSummary(payload) {
@@ -477,7 +478,7 @@ async function loadRankingStrategies(preferredId = '', force = false) {
     else if (!rankingStrategyChosen) rankingKind.value = payload.selected_kind || (previous?.includes('@') ? 'model' : 'fixed')
     fillExecutionSelect(rankingKind, rankingStrategy, payload, previous)
     rankMarketButton.disabled = rankingStrategy.disabled
-    document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.disabled ? '没有已训练模型，请先在控制面板训练。' : ''
+    document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.disabled ? '没有已训练模型，请先在回测页训练模型。' : ''
     return await loadRanking()
   } catch (error) {
     if (!rankingOptions) {
@@ -533,7 +534,7 @@ rankingKind.addEventListener('change', () => {
   if (rankingOptions) fillExecutionSelect(rankingKind, rankingStrategy, rankingOptions)
   rankMarketButton.disabled = !rankingStrategy.value
   rankingPage = 0; rankingPayload = null; rankingContent.replaceChildren()
-  document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.value ? '' : '没有已训练模型，请先在控制面板训练。'
+  document.querySelector('#rankingOptionsNote').textContent = rankingStrategy.value ? '' : '没有已训练模型，请先在回测页训练模型。'
   loadRanking()
 })
 

@@ -1,11 +1,16 @@
 #!/bin/sh
 # Check the whole pushed history, including a token added then removed later.
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$hook_dir/secret-patterns.sh"
 while read -r local_ref local_sha remote_ref remote_sha; do
     case "$local_sha" in
         0000000000000000000000000000000000000000) continue ;;
     esac
-    if git log --format= --name-only "$local_sha" | grep -Eiq '(^|/)[^/]+\.token$'; then
-        echo "Push blocked: reachable history contains a .token file. Remove it from history before pushing." >&2
+    if git log --format= --name-only "$local_sha" | grep -Ei '(^|/)([^/]+\.(token|secret|pem|key|p12|pfx)|\.env(\.[^/]+)?|\.?credentials(\.[^/]+)?|[^/]+\.credentials(\.[^/]+)?|secrets\.[^/]+|\.npmrc|\.pypirc|id_rsa|id_ed25519|id_ecdsa|id_dsa)$' | grep -Eiv '(^|[./])example([./]|$)' >/dev/null; then
+        echo "Push blocked: reachable history contains a credential file. Remove the sensitive history before pushing." >&2
         exit 1
     fi
+    if ! git rev-list "$local_sha" | while read -r revision; do
+        check_secret_content "$revision" || exit 1
+    done; then exit 1; fi
 done

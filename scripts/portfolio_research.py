@@ -175,7 +175,7 @@ def strategy_review(items, strategy, market, now=None, checkpoint_id=None, param
         model = selected_model(strategy, checkpoint_id or "") if strategy in MODEL_STRATEGIES else None
         if strategy in MODEL_STRATEGIES:
             if not model or model.get("target_version") != ML_TARGET_VERSION:
-                raise ValueError("所选模型尚未有效训练，请先在控制面板训练")
+                raise ValueError("所选模型尚未有效训练，请先在网页回测页训练")
             selected_at = datetime.fromisoformat(model["selected_at"])
             if selected_at.tzinfo is None:
                 selected_at = selected_at.replace(tzinfo=CHINA)

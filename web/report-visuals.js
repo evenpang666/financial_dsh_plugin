@@ -155,7 +155,29 @@
     const chips = el('div', null, 'coverage-chips')
     for (const [key, label] of Object.entries(labels)) chips.append(el('span', `${label} ${review.comparisons.filter(row => row.alignment === key).length}`, key === 'contradicted' ? 'coverage-missing' : 'coverage-ok'))
     const rows = review.comparisons.map(row => ({...row, change_pct: row.return_from_morning_pct}))
-    target.replaceChildren(chips, barFigure(rows, row => `${row.name || row.symbol} · ${labels[row.alignment] || '待核验'}`, '上午至下午价格变化'))
+    const scale = Math.max(1, ...rows.map(row => Math.abs(number(row.change_pct) ?? 0)))
+    const figure = el('figure', null, 'review-comparison'), heading = el('div', null, 'review-chart-heading')
+    const axis = el('div', null, 'review-axis')
+    for (const label of [`−${scale.toFixed(2)}%`, '0', `+${scale.toFixed(2)}%`]) axis.append(el('span', label))
+    heading.append(el('span', '上午 → 下午'), axis, el('span', '价格变化')); figure.append(heading)
+    const list = el('ul', null, 'review-rows')
+    for (const row of rows) {
+      const value = number(row.change_pct), item = el('li', null, 'review-row'), identity = el('div', null, 'review-identity')
+      const name = el('div'); name.append(el('strong', row.name || row.symbol), el('small', row.symbol || ''))
+      identity.append(name, el('span', labels[row.alignment] || '待核验', `review-status review-status-${row.alignment}`))
+      const track = el('div', null, 'review-track'); track.setAttribute('aria-hidden', 'true')
+      if (value != null) {
+        const bar = el('span', null, `review-bar ${value >= 0 ? 'is-up' : 'is-down'}`)
+        bar.style.width = `${Math.abs(value) / scale * 50}%`; track.append(bar)
+      }
+      item.title = `${row.quote_time || '行情时间未归档'} · ${value == null ? '价格数据不足' : signed(value)}`
+      item.append(identity, track, el('strong', signed(value), `review-value ${value == null ? '' : value >= 0 ? 'is-up' : 'is-down'}`)); list.append(item)
+    }
+    const caption = el('figcaption', null, 'review-caption')
+    // Reuse the archived SVG export while keeping the on-page layout responsive.
+    const download = barFigure(rows, row => `${row.name || row.symbol} · ${labels[row.alignment] || '待核验'}`, '上午至下午价格变化').querySelector('.chart-download')
+    caption.append(el('span', `${archiveLabel} · 归档快照`), download); figure.append(list, caption)
+    target.replaceChildren(chips, figure)
     target.append(el('p', review.threshold_note || '阈值口径未归档。', 'ranking-note'), el('p', review.method_note || '', 'ranking-note'))
   }
   function barFigure(rows, nameKey, title) {

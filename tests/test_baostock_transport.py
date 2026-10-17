@@ -74,6 +74,85 @@ class BaoStockTransportTests(unittest.TestCase):
                 prep._baostock_login(SimpleNamespace(login=login))
         self.assertEqual(socket.getdefaulttimeout(), previous)
 
+    def test_timeout_discards_connection_before_logout_can_read_stale_bytes(self):
+        connection = Mock()
+        connection.recv.side_effect = [b"partial", TimeoutError("timed out"), b"\x82stale"]
+        context = SimpleNamespace(default_socket=connection)
+
+        def sdk_send(message):
+            try:
+                context.default_socket.send(message.encode())
+                while True:
+                    context.default_socket.recv(8192)
+            except OSError:
+                return None
+
+        transport = SimpleNamespace(send_msg=sdk_send)
+        vendor = SimpleNamespace(logout=Mock(side_effect=lambda: transport.send_msg("logout")))
+        with patch.dict(sys.modules, {"baostock.common.context": context, "baostock.util.socketutil": transport}):
+            prep._install_baostock_transport()
+            with self.assertRaisesRegex(prep.BaoStockNetworkError, "timed out"):
+                transport.send_msg("request")
+            self.assertIsNone(context.default_socket)
+            prep._baostock_logout(vendor)
+        vendor.logout.assert_not_called()
+        self.assertEqual(connection.recv.call_count, 2)
+        connection.close.assert_called_once()
+
+    def test_sdk_swallowed_decode_failure_also_discards_connection(self):
+        connection = Mock()
+        context = SimpleNamespace(default_socket=connection)
+        transport = SimpleNamespace(send_msg=lambda message: None)
+        with patch.dict(sys.modules, {"baostock.common.context": context, "baostock.util.socketutil": transport}):
+            prep._install_baostock_transport()
+            with self.assertRaisesRegex(prep.BaoStockNetworkError, "完整响应"):
+                transport.send_msg("request")
+            self.assertIsNone(context.default_socket)
+        connection.close.assert_called_once()
+
+    def test_healthy_session_still_logs_out(self):
+        connection = Mock()
+        context = SimpleNamespace(default_socket=connection)
+        vendor = SimpleNamespace(logout=Mock())
+        with patch.dict(sys.modules, {"baostock.common.context": context}):
+            prep._baostock_logout(vendor)
+        vendor.logout.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_reconnect_login_failure_preserves_query_context(self):
+        query = Mock(side_effect=prep.BaoStockNetworkError("timed out"))
+        with (patch.dict(sys.modules, {"baostock.common.context": None}),
+              patch.object(prep, "_baostock_login", side_effect=prep.BaoStockNetworkError("login timed out")),
+              patch.object(prep, "_close_baostock_connection"), redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(prep.BaoStockNetworkError, "历史证券名单 20250818.*login timed out"):
+                prep._bs_query(SimpleNamespace(), "历史证券名单 20250818", query)
+        query.assert_called_once()
+
+    def test_historical_roster_retries_once_and_reports_failed_date(self):
+        vendor = SimpleNamespace()
+        query = Mock(side_effect=prep.BaoStockNetworkError("timed out"))
+        output = io.StringIO()
+        with (patch.dict(sys.modules, {"baostock.common.context": None}),
+              patch.object(prep, "_baostock_login") as login,
+              patch.object(prep, "_close_baostock_connection"), redirect_stdout(output)):
+            with self.assertRaisesRegex(prep.BaoStockNetworkError, "历史证券名单 20250818 重连重试后仍失败"):
+                prep._bs_query(vendor, "历史证券名单 20250818", query, day="2025-08-18")
+        self.assertEqual(query.call_count, 2)
+        login.assert_called_once_with(vendor)
+        self.assertIn("历史证券名单 20250818", output.getvalue())
+
+    def test_pagination_timeout_restarts_whole_query_without_partial_rows(self):
+        query = Mock(return_value=object())
+        complete = pd.DataFrame({"value": ["first", "second"]})
+        with (patch.dict(sys.modules, {"baostock.common.context": None}),
+              patch.object(prep, "_baostock_login"),
+              patch.object(prep, "_close_baostock_connection"),
+              patch.object(prep, "_bs_rows", side_effect=[prep.BaoStockNetworkError("page timed out"), complete]),
+              redirect_stdout(io.StringIO())):
+            result = prep._bs_query(SimpleNamespace(), "历史证券名单 20250818", query)
+        self.assertIs(result, complete)
+        self.assertEqual(query.call_count, 2)
+
     def test_pagination_error_cannot_publish_first_page_as_success(self):
         result = SimpleNamespace(error_code="0", fields=["value"], get_row_data=lambda: ["first page"])
 

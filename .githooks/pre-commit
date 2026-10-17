@@ -1,6 +1,9 @@
 #!/bin/sh
-# Reject token files even if someone stages them with git add -f.
-if git diff --cached --name-only --diff-filter=ACMR | grep -Eiq '(^|/)[^/]+\.token$'; then
-    echo "Commit blocked: a .token file is staged. Keep API tokens outside Git." >&2
+# Reject ignored files even when staged with git add -f.
+if git diff --cached --name-only --diff-filter=ACMR -z | git check-ignore --no-index --quiet -z --stdin; then
+    echo "Commit blocked: ignored credentials, local settings or generated files are staged. Unstage them and keep the local files." >&2
     exit 1
 fi
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$hook_dir/secret-patterns.sh"
+check_secret_content --cached || exit 1

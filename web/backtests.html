@@ -3,24 +3,47 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="独立的策略回测结果、历史记录、净值曲线与交易明细">
-  <title>策略回测结果 · 财务研究智能体</title>
+  <meta name="description" content="训练 XGBoost 与 Elastic Net 因子模型，比较策略回测结果、净值与模拟交易明细">
+  <title>策略与因子实验室 · 知衡</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/soft-ui.css">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
 </head>
 <body>
   <div class="ambient ambient-one" aria-hidden="true"></div>
   <div class="ambient ambient-two" aria-hidden="true"></div>
   <header class="topbar">
-    <a class="brand" href="/backtests" aria-label="策略回测首页"><span>策略回测</span></a>
-    <div class="topbar-meta"><a class="topbar-link" href="/">双时点日报</a><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
+    <a class="brand" href="/" aria-label="返回知衡研究首页"><span>知衡 · 策略实验室</span></a>
+    <div class="topbar-meta"><a class="topbar-link" href="/">研究</a><a class="topbar-link" href="/reports">日报</a><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
   </header>
   <main class="report-page backtest-page">
     <section id="pageTop" class="intro" aria-labelledby="pageTitle">
-      <p class="eyebrow">STRATEGY BACKTESTS</p>
+      <p class="eyebrow">STRATEGY & FACTOR LAB</p>
       <div class="intro-heading">
-        <div><h1 id="pageTitle">策略回测结果</h1><p>比较策略表现，查看历史记录与模拟交易明细。</p></div>
+        <div><h1 id="pageTitle">策略与因子实验室</h1><p>训练自己的因子模型，再用独立区间验证策略表现。</p></div>
         <div class="actions"><button id="refreshButton" type="button">刷新结果</button></div>
       </div>
+    </section>
+    <aside id="lanAccess" class="lan-access" aria-label="局域网访问" aria-live="polite">正在获取局域网访问地址…</aside>
+    <section id="strategyWorkbench" class="task-panel" aria-labelledby="runTitle">
+      <div class="workbench-tabs" role="tablist" aria-label="策略实验任务">
+        <button id="backtestTab" type="button" role="tab" data-mode="backtest" aria-selected="true" aria-controls="workbenchPanel">策略回测</button>
+        <button id="trainTab" type="button" role="tab" data-mode="train" aria-selected="false" aria-controls="workbenchPanel" tabindex="-1">训练因子模型</button>
+      </div>
+      <div id="workbenchPanel" role="tabpanel" aria-labelledby="backtestTab">
+        <h2 id="runTitle">验证你的策略</h2><p id="runDescription">选择经典策略或已训练模型，查看净值、回撤与交易明细。缺少历史数据时自动下载并验收。</p>
+        <form id="taskForm" data-kind="backtest" class="task-fields">
+          <input type="hidden" name="action" value="backtest">
+          <label><span id="strategyLabel">策略 / 已训练模型</span><select name="strategy" required><option value="">正在加载…</option></select></label>
+          <label><span id="startLabel">回测开始</span><input type="date" name="start" required></label>
+          <label><span id="endLabel">回测结束</span><input type="date" name="end" required></label>
+          <label><span id="slotLabel">信号时点</span><select name="slot"><option>09:35</option><option>10:30</option><option>11:30</option><option>13:30</option><option selected>14:00</option><option>14:30</option><option>14:50</option></select></label>
+          <details class="parameter-editor"><summary id="parameterTitle">策略超参数</summary><div id="taskParameters" class="task-fields"></div></details>
+          <button class="primary" type="submit" disabled>运行回测</button><button id="cancelTask" type="button" hidden>取消任务</button>
+        </form>
+      </div>
+      <pre id="taskLog" class="task-log" role="status" aria-live="polite"></pre>
+      <section id="trainedModels" class="trained-models" aria-labelledby="modelsTitle" hidden><div class="models-heading"><h3 id="modelsTitle">我的因子模型</h3><span id="modelsCount"></span></div><p>每次训练保存一个独立版本。选择模型后，可在训练区间之后运行回测。</p><div id="modelList" class="model-list"></div></section>
     </section>
     <div class="report-layout">
     <aside class="report-index" aria-label="回测索引列">
@@ -41,7 +64,9 @@
     </div>
     </div>
   </main>
-  <footer><span>仅限本机与局域网内访问</span><span>DSH Finance Agent</span></footer>
+  <footer><span>本地保存 · 仅供研究</span><span>知衡 · Financial Studio</span></footer>
   <script src="/backtests.js" defer></script>
+  <script src="/task-controls.js" defer></script>
+  <script src="/network-status.js" defer></script>
 </body>
 </html>

@@ -105,7 +105,7 @@ class FactorDataPrepTests(unittest.TestCase):
 
     def test_new_user_and_interrupted_download_prepare_all_first_day_features(self):
         import factor_lab
-        import control_panel
+        from backtest_cache import cache_issues
         symbols = ["601091", "002463"]
         dates = ["20260921", "20260922", "20260923"]
         calendar = pd.DataFrame([{"cal_date": date, "is_open": "1", "pretrade_date": previous}
@@ -192,11 +192,7 @@ class FactorDataPrepTests(unittest.TestCase):
                     count = len(calls)
                     prep.prepare("2026-09-22", "2026-09-23", raw, bars, store)
                     self.assertEqual(len(calls), count)  # Valid cache is reused.
-                with (patch.object(control_panel, "FACTOR_STORE", store),
-                      patch.object(control_panel, "FACTOR_UNIVERSE", store / "universe-history.csv"),
-                      patch.object(control_panel, "FACTOR_MARKET_STATE", store / "market-state.csv"),
-                      patch.object(control_panel, "FACTOR_MANIFEST", store / "source-manifest.json")):
-                    self.assertFalse(control_panel.backtest_data_missing())
+                self.assertFalse(cache_issues(store))
 
     def test_alternate_day_repair_preserves_evidence_and_only_fills_confirmed_no_trade_window(self):
         primary = self.minute_day()
@@ -234,7 +230,7 @@ class FactorDataPrepTests(unittest.TestCase):
                 _, failures = prep._fetch_minute_chunk([("600001", "2026-09-22")], "2026-09-22", bars,
                     {"600001": ["2026-09-22"]}, raw, {"600001": {"2026-09-22": 480000}})
             self.assertEqual(failures, [])
-            fake.query_history_k_data_plus.assert_called_once()
+            fake.query_history_k_data_plus.assert_not_called()  # The verified alternate fixes the cache directly.
             fake.query_history_k_data_plus.reset_mock()
             output = io.StringIO()
             with patch.dict(sys.modules, {"baostock": fake}), redirect_stdout(output):

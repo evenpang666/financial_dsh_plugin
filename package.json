@@ -1,0 +1,10 @@
+{
+  "name": "dsh-financial", "version": "0.6.0", "type": "module",
+  "description": "知衡 · 本地股票研究、双时点日报与策略回测，复用 DSH Web 智能体、模型与凭据。",
+  "icon": "./web/icon.svg", "main": "./index.mjs",
+  "exports": {".": "./index.mjs", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json"},
+  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+  "engines": {"node": ">=22.13.0"},
+  "scripts": {"start": "node scripts/launch.mjs", "dev": "node scripts/launch.mjs --no-open", "stop": "node scripts/stop.mjs", "dsh:register": "node scripts/register-plugin.mjs", "dsh": "node scripts/finance-dsh.mjs", "test": "node --test tests/web-*.test.mjs tests/git-hygiene.test.mjs tests/test_portfolio_tool.mjs tests/test_report_visuals.cjs"},
+  "keywords": ["dsh-plugin", "deepseek-harness", "finance"], "license": "MIT"
+}

@@ -298,6 +298,11 @@ class ReportHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 return self.send_json(200, {"status": "ok", "report_count": len(list_reports())})
+            if path == "/api/research-options":
+                from strategy_config import parameter_schema, default_ranges
+                return self.send_json(200, {"ranges": default_ranges(), "training": {
+                    key: {"name": STRATEGIES[key]["name"], "parameter_schema": parameter_schema(key, "training")}
+                    for key in ("xgboost", "elastic_net")}})
             if path == "/api/reports":
                 return self.send_json(200, {"reports": list_reports()})
             if path == "/api/ranking/latest":
@@ -359,7 +364,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 asset = "backtests.html"
             else:
                 asset = "index.html" if path in ("/", "/index.html") else path.lstrip("/")
-            if asset not in {"index.html", "styles.css", "app.js", "report-visuals.js", "backtests.html", "backtests.js"}:
+            if asset not in {"index.html", "styles.css", "app.js", "report-visuals.js", "backtests.html", "backtests.js", "soft-ui.css", "task-controls.js", "icon.svg"}:
                 return self.send_json(404, {"error": "Not found"})
             target = WEB_ROOT / asset
             content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
@@ -406,7 +411,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": str(exc)})
             try:
                 query = urlencode({"market": market, "strategy": strategy, "parameters": json.dumps(parameters)})
-                request = Request(f"http://127.0.0.1:8765/v1/portfolio-analysis?{query}",
+                request = Request(f"{os.getenv('FINANCE_DATA_URL', 'http://127.0.0.1:8765')}/v1/portfolio-analysis?{query}",
                                   headers={"Accept": "application/json"})
                 with urlopen(request, timeout=180) as response:
                     return self.send_json(200, json.loads(response.read().decode("utf-8")))

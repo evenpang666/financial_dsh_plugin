@@ -143,12 +143,19 @@ def _install_baostock_transport() -> None:
             context.default_socket = connection
         connection.failure = None
         connection.deadline = time.monotonic() + BAOSTOCK_MESSAGE_TIMEOUT
-        reply = original(message)
+        try:
+            reply = original(message)
+        except (OSError, UnicodeError) as exc:
+            _close_baostock_connection()
+            raise BaoStockNetworkError(f"BaoStock 响应接收或解析失败：{exc}") from exc
         # The SDK catches socket errors and otherwise returns None. Re-raise so
         # pagination cannot quietly publish a partial result as successful data.
         if connection.failure is not None:
-            raise BaoStockNetworkError(f"BaoStock 网络请求失败：{connection.failure}") from connection.failure
+            failure = connection.failure
+            _close_baostock_connection()
+            raise BaoStockNetworkError(f"BaoStock 网络请求失败：{failure}") from failure
         if reply is None:
+            _close_baostock_connection()
             raise BaoStockNetworkError("BaoStock 未返回完整响应。")
         return reply
 
@@ -168,6 +175,9 @@ def _close_baostock_connection() -> None:
 
 
 def _baostock_logout(bs) -> None:
+    context = sys.modules.get("baostock.common.context")
+    if context is not None and getattr(context, "default_socket", None) is None:
+        return
     try:
         bs.logout()
     except (OSError, BaoStockNetworkError):
@@ -256,7 +266,8 @@ def fetch_calendar_baostock(start: str, end: str) -> pd.DataFrame:
     _baostock_login(bs)
     try:
         first = (pd.Timestamp(start) - pd.Timedelta(days=21)).strftime("%Y-%m-%d")
-        frame = _bs_rows(bs.query_trade_dates(start_date=first, end_date=end), "交易日历")
+        frame = _bs_query(bs, f"交易日历 {first} 至 {end}", bs.query_trade_dates,
+                          start_date=first, end_date=end)
     finally:
         _baostock_logout(bs)
     open_days = frame.loc[frame.is_trading_day.astype(str).eq("1"), "calendar_date"].astype(str).tolist()
@@ -274,7 +285,7 @@ def fetch_stock_basic_baostock() -> pd.DataFrame:
 
     _baostock_login(bs)
     try:
-        frame = _bs_rows(bs.query_stock_basic(), "上市资料")
+        frame = _bs_query(bs, "上市资料", bs.query_stock_basic)
     finally:
         _baostock_logout(bs)
     frame = frame[frame.type.astype(str).eq("1")].copy()
@@ -398,7 +409,8 @@ def collect_public(start: str, end: str, raw: Path = RAW) -> tuple[list[str], st
         for index, day in enumerate(needed_days, 1):
             path = raw / "all-stock" / f"{day}.csv"
             if not path.exists():
-                result = _bs_rows(bs.query_all_stock(day=pd.Timestamp(day).strftime("%Y-%m-%d")), "历史证券名单")
+                result = _bs_query(bs, f"历史证券名单 {day}", bs.query_all_stock,
+                                   day=pd.Timestamp(day).strftime("%Y-%m-%d"))
                 _atomic_csv(result, path)
             roster = _read_csv(path)
             if not {"code", "tradeStatus"}.issubset(roster) or roster.code.duplicated().any():
@@ -426,9 +438,9 @@ def collect_public(start: str, end: str, raw: Path = RAW) -> tuple[list[str], st
             path = raw / "daily-public-symbols" / f"{symbol}_{previous}_{days[-1]}.csv"
             if not path.exists():
                 code = "sh." + symbol if symbol.startswith("6") else "sz." + symbol
-                history = _bs_rows(bs.query_history_k_data_plus(
+                history = _bs_query(bs, f"全市场未复权日线 {symbol} {first} 至 {last}", bs.query_history_k_data_plus,
                     code, "date,code,amount,tradestatus", start_date=first,
-                    end_date=last, frequency="d", adjustflag="3"), "全市场未复权日线")
+                    end_date=last, frequency="d", adjustflag="3")
                 _atomic_csv(history, path)
             history = _read_csv(path)
             normalized = _validated_public_daily(history, symbol)
@@ -613,12 +625,28 @@ def _bs_rows(result, label: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=result.fields)
 
 
+def _bs_query(bs, label: str, query, *args, **kwargs) -> pd.DataFrame:
+    """Retry the entire query, including pagination, on a fresh connection once."""
+    for attempt in range(2):
+        try:
+            context = sys.modules.get("baostock.common.context")
+            if attempt or (context is not None and getattr(context, "default_socket", None) is None):
+                _baostock_login(bs)
+            return _bs_rows(query(*args, **kwargs), label)
+        except BaoStockNetworkError as exc:
+            _close_baostock_connection()
+            if attempt == 1:
+                raise BaoStockNetworkError(f"{label} 重连重试后仍失败：{exc}") from exc
+            print(f"BaoStock {label} 连接中断或超时，正在重连后重试一次：{exc}", flush=True)
+    raise AssertionError("unreachable")
+
+
 def fetch_daily_status_baostock(symbols: list[str], start: str, end: str,
                                 raw: Path = RAW) -> pd.DataFrame:
     """Read historical ST, halt and previous close for each selected stock."""
     import baostock as bs
 
-    _baostock_login(bs)
+    connected = False
     frames = []
     try:
         for index, symbol in enumerate(symbols, 1):
@@ -626,18 +654,21 @@ def fetch_daily_status_baostock(symbols: list[str], start: str, end: str,
             if path.exists():
                 frame = _read_csv(path)
             else:
+                if not connected:
+                    _baostock_login(bs)
+                    connected = True
                 exchange = "sh" if symbol.startswith("6") else "sz"
-                frame = _bs_rows(bs.query_history_k_data_plus(
+                frame = _bs_query(bs, f"{symbol} 逐日状态 {start} 至 {end}", bs.query_history_k_data_plus,
                     f"{exchange}.{symbol}",
                     "date,code,preclose,high,low,tradestatus,isST",
-                    start_date=start, end_date=end, frequency="d", adjustflag="3"),
-                    f"{symbol} 逐日状态")
+                    start_date=start, end_date=end, frequency="d", adjustflag="3")
                 _atomic_csv(frame, path)
             frames.append(frame)
             if index % 20 == 0 or index == len(symbols):
                 print(f"已核对 {index}/{len(symbols)} 只股票的逐日状态", flush=True)
     finally:
-        _baostock_logout(bs)
+        if connected:
+            _baostock_logout(bs)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -721,7 +752,7 @@ def fetch_actions_baostock(symbols: list[str], years: list[int],
                            raw: Path = RAW) -> pd.DataFrame:
     import baostock as bs
 
-    _baostock_login(bs)
+    connected = False
     collected = []
     try:
         for index, symbol in enumerate(symbols, 1):
@@ -729,17 +760,21 @@ def fetch_actions_baostock(symbols: list[str], years: list[int],
             if path.exists():
                 frame = _read_csv(path)
             else:
+                if not connected:
+                    _baostock_login(bs)
+                    connected = True
                 exchange = "sh" if symbol.startswith("6") else "sz"
-                frames = [_bs_rows(bs.query_dividend_data(f"{exchange}.{symbol}", year=str(year),
-                                                           yearType="operate"),
-                                   f"{symbol} {year} 分红") for year in years]
+                frames = [_bs_query(bs, f"{symbol} {year} 分红", bs.query_dividend_data,
+                                    f"{exchange}.{symbol}", year=str(year), yearType="operate")
+                          for year in years]
                 frame = pd.concat(frames, ignore_index=True).drop_duplicates()
                 _atomic_csv(frame, path)
             collected.append(frame)
             if index % 20 == 0 or index == len(symbols):
                 print(f"已核对 {index}/{len(symbols)} 只股票的公司行为", flush=True)
     finally:
-        _baostock_logout(bs)
+        if connected:
+            _baostock_logout(bs)
     if not collected:
         raise RuntimeError("没有历史候选股票。")
     source = pd.concat(collected, ignore_index=True).drop_duplicates()
@@ -977,23 +1012,10 @@ def strip_zero_placeholders(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _minute_history(bs, symbol: str, start: str, end: str) -> pd.DataFrame:
     exchange = "sh" if symbol.startswith("6") else "sz"
-    for attempt in range(2):
-        try:
-            context = sys.modules.get("baostock.common.context")
-            if context is not None and getattr(context, "default_socket", None) is None:
-                _baostock_login(bs)
-            result = bs.query_history_k_data_plus(
-                f"{exchange}.{symbol}",
-                "date,time,code,open,high,low,close,volume,amount,adjustflag",
-                start_date=start, end_date=end, frequency="5", adjustflag="3")
-            return _bs_rows(result, f"{symbol} 五分钟线")
-        except BaoStockNetworkError as exc:
-            _close_baostock_connection()
-            if attempt == 1:
-                raise
-            print(f"{symbol} 分钟线连接中断或超时，正在重连后重试一次：{exc}", flush=True)
-            _baostock_login(bs)
-    raise AssertionError("unreachable")
+    return _bs_query(bs, f"{symbol} 五分钟线 {start} 至 {end}", bs.query_history_k_data_plus,
+                     f"{exchange}.{symbol}",
+                     "date,time,code,open,high,low,close,volume,amount,adjustflag",
+                     start_date=start, end_date=end, frequency="5", adjustflag="3")
 
 
 def _fetch_minute_chunk(items: list[tuple[str, str]], end: str,
@@ -1032,15 +1054,22 @@ def _fetch_minute_chunk(items: list[tuple[str, str]], end: str,
                 if len(clean_previous) != len(previous):
                     write_bars_cache(path, clean_previous)
                 previous = clean_previous
+                if not cached.empty and minute_quality_issues(cached, reference):
+                    print(f"{symbol}：核验并修复已缓存的分钟线异常…", flush=True)
+                    cached = repair_minute_days(symbol, cached, raw, reference)
+                    previous = normalized_bars(cached)
+                    write_bars_cache(path, previous)
                 if (required_days.get(symbol) and _minute_cache_complete(cached, required)
                         and not minute_quality_issues(cached, reference)):
                     outcome = "使用完整缓存"
                     continue
-                print(f"{symbol}：正在下载历史 5 分钟线；单次响应最多等待 {BAOSTOCK_MESSAGE_TIMEOUT} 秒…", flush=True)
+                missing = [day for day in required if not _minute_cache_complete(cached, [day])] if not cached.empty else required
+                fetch_start, fetch_end = (min(missing), max(missing)) if missing else (start, end)
+                print(f"{symbol}：正在补齐 {fetch_start} 至 {fetch_end} 的 5 分钟线；单次响应最多等待 {BAOSTOCK_MESSAGE_TIMEOUT} 秒…", flush=True)
                 if not session_ready:
                     _baostock_login(bs)
                     session_ready = True
-                frame = _minute_history(bs, symbol, start, end)
+                frame = _minute_history(bs, symbol, fetch_start, fetch_end)
                 if frame.empty and previous.empty:
                     raise RuntimeError("没有历史分钟线")
                 combined = previous
@@ -1122,7 +1151,10 @@ def quality_report(universe: pd.DataFrame, state: pd.DataFrame,
     amount_by_symbol = _daily_amounts(daily, symbols)
     missing_by_symbol = []
     execution = EXECUTION_BAR[slot]
-    for symbol in symbols:
+    expected_times = {day: set(_minute_times(day)) for day in set(days) | set(warmup_by_symbol.values())}
+    for index, symbol in enumerate(symbols, 1):
+        if index % 40 == 0 or index == len(symbols):
+            print(f"[历史验收] {index}/{len(symbols)} 只股票：{symbol}", flush=True)
         path = bars_dir / f"{symbol}.csv"
         if not path.exists():
             missing_by_symbol.append(symbol)
@@ -1139,11 +1171,12 @@ def quality_report(universe: pd.DataFrame, state: pd.DataFrame,
             continue
         frame["day"] = frame.time.astype(str).str[:10]
         frame["clock"] = frame.time.astype(str).str[11:16]
+        frame["moment"] = pd.to_datetime(frame.time, errors="coerce")
         group_by_day = {day: group for day, group in frame.groupby("day")}
         warmup_day = warmup_by_symbol[symbol]
         warmup = group_by_day.get(warmup_day)
         if (warmup is None or len(warmup) != 48
-                or set(pd.to_datetime(warmup.time, errors="coerce")) != set(_minute_times(warmup_day))):
+                or set(warmup.moment) != expected_times[warmup_day]):
             missing_warmup.append({"symbol": symbol, "day": warmup_day,
                                    "first_candidate_day": first_seen[symbol]})
         for day in (value for value in days if value >= first_seen[symbol]):
@@ -1155,7 +1188,7 @@ def quality_report(universe: pd.DataFrame, state: pd.DataFrame,
             group = group_by_day.get(day)
             bar_days += 1
             if (group is None or len(group) != 48
-                    or set(pd.to_datetime(group.time, errors="coerce")) != set(_minute_times(day))
+                    or set(group.moment) != expected_times[day]
                     or not {slot, execution, "15:00"}.issubset(set(group.clock))):
                 missing_bars += 1
     if missing_by_symbol:

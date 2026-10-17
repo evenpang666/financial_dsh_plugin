@@ -20,7 +20,6 @@ import factor_models as models
 import factor_backtest as replay
 import intraday_ranking as ranking
 import report_web_server as web
-import control_panel as panel_module
 
 
 def checkpoint(store, identity="version-a", algorithm="elastic_net", value=1):
@@ -170,18 +169,6 @@ class CheckpointTests(unittest.TestCase):
                 lab.write_json(store / "full-market-elastic_net-version-a.json", result)
                 self.assertTrue(web.latest_ranking("elastic_net@version-a", "full_market")["available"])
 
-    def test_no_checkpoint_disables_model_actions_but_training_remains_available(self):
-        train, backtest, rank = Mock(), Mock(), Mock()
-        panel = SimpleNamespace(busy=False, starting_services=False, closing=False,
-            factor_busy=False, action_buttons=[train, backtest, rank], utility_buttons=[], web_buttons=[],
-            factor_slot_box=None, strategy_box=Mock(), factor_train_button=train,
-            factor_backtest_button=backtest, factor_rank_button=rank, training_box=Mock(), strategy_kind_box=Mock(),
-            strategy_kind=SimpleNamespace(get=lambda: "多因子模型策略"), strategy_choice=SimpleNamespace(get=lambda: ""))
-        panel_module.ControlPanel._update_controls(panel)
-        train.configure.assert_called_with(state="normal")
-        backtest.configure.assert_called_with(state="disabled")
-        rank.configure.assert_called_with(state="disabled")
-        panel.training_box.configure.assert_called_with(state="readonly")
 
 
 if __name__ == "__main__":

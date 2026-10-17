@@ -17,7 +17,7 @@ STORE = lab.STORE
 def ranking_model(strategy, now, checkpoint_id):
     model = lab.selected_model(strategy, checkpoint_id)
     if not model:
-        raise ValueError("模型尚未完成有效训练，请在控制面板训练后刷新策略列表。")
+        raise ValueError("模型尚未完成有效训练，请在网页回测页训练后刷新策略列表。")
     try:
         selected = datetime.fromisoformat(model["selected_at"])
         if selected.tzinfo is None:

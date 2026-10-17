@@ -114,6 +114,7 @@ async function requestJson(url) {
 }
 
 let selectedBacktestRun = ''
+document.addEventListener('finance-backtest-completed', () => { selectedBacktestRun = '' })
 const percent = value => value == null || !Number.isFinite(Number(value)) ? '—' : `${(Number(value) * 100).toFixed(2)}%`
 
 function strategyChart(points, key, title, format) {
@@ -222,7 +223,7 @@ async function loadBacktest() {
     const runs = payload.runs || []
     backtestContent.replaceChildren()
     rebuildBacktestIndex()
-    backtestMeta.textContent = runs.length ? `已保存 ${runs.length} 次回测。表格展示各策略最新结果；可切换历史记录查看 checkpoint、净值、回撤与交易明细。` : '暂无已完成的策略回测。请在控制面板选择经典策略或已训练 checkpoint，或点击“回测全部经典策略”。'
+    backtestMeta.textContent = runs.length ? `已保存 ${runs.length} 次回测。表格展示各策略最新结果；可切换历史记录查看 checkpoint、净值、回撤与交易明细。` : '暂无已完成的策略回测。请在本页选择策略、日期和参数后点击“运行回测”。'
     const wrapper = document.createElement('div'); wrapper.className = 'table-wrap'
     const table = document.createElement('table'); const head = document.createElement('thead'); const header = document.createElement('tr')
     for (const label of ['策略', '评估期间 / 信号', '累计收益', '最大回撤', 'Sharpe', '交易', '数据图']) header.append(textNode('th', label))

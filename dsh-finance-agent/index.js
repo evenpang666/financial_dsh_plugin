@@ -85,7 +85,7 @@ export function apply(ctx, config = {}) {
     description: '按需读取当前市场的已保存持仓，比较个股研究配置1、指定策略在持仓池上的入场排序配置2和综合结果3。权重基于假设研究预算，非账户仓位。工具不调用LLM、不执行交易或写入日报；智能体需进一步解释证据差异。',
     parameters: { type: 'object', properties: {
       market: { type: 'string', enum: ['a', 'hk'] },
-      strategy: { type: 'string', enum: ['xgboost', 'elastic_net', 'mean_reversion', 'momentum', 'breakout', 'ma_crossover', 'macd', 'rsi_rebound', 'bollinger_reversion', 'donchian_breakout'], description: '不传时沿用控制面板设置；当前策略仅支持A股。' },
+      strategy: { type: 'string', enum: ['xgboost', 'elastic_net', 'mean_reversion', 'momentum', 'breakout', 'ma_crossover', 'macd', 'rsi_rebound', 'bollinger_reversion', 'donchian_breakout'], description: '不传时沿用保存配置；当前策略仅支持A股。' },
       parameters: { type: 'object', description: '本次策略超参数；字段与范围从 get_strategy_checkpoints 的 parameter_schema 读取。不传时使用保存配置及推荐默认值。', additionalProperties: { type: 'number' } },
       checkpoint: { type: 'string', description: '多因子模型策略必须指定已训练 checkpoint ID；先用 get_strategy_checkpoints 获取。经典策略不传。' },
     }, additionalProperties: false },

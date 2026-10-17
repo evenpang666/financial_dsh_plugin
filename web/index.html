@@ -4,18 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="本地股票双时点日报">
-  <title>股票双时点日报与全市场盘中策略部署</title>
+  <title>双时点日报 · 知衡</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/soft-ui.css">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
 </head>
 <body>
   <div class="ambient ambient-one" aria-hidden="true"></div>
   <div class="ambient ambient-two" aria-hidden="true"></div>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="股票双时点日报首页">
+    <a class="brand" href="/" aria-label="返回知衡研究首页">
       <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 28" fill="none"><path d="M5 19.5 10.1 14l3.6 3.1L23 7.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M18 7.5h5v5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-      <span>股票双时点日报</span>
+      <span>知衡 · 双时点日报</span>
     </a>
-    <div class="topbar-meta"><a class="topbar-link" href="/backtests">策略回测</a><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
+    <div class="topbar-meta"><a class="topbar-link" href="/">研究</a><a class="topbar-link" href="/backtests">回测</a><span class="live-dot" aria-hidden="true"></span><span id="connectionState">正在连接</span></div>
   </header>
   <main class="report-page">
     <section id="pageTop" class="intro" aria-labelledby="pageTitle">
@@ -23,12 +25,27 @@
       <div class="intro-heading">
         <div><h1 id="pageTitle">双时点日报</h1><p id="updatedAt">正在连接本地日报服务</p></div>
         <div class="actions">
+          <button id="portfolioEntryOpen" type="button">添加持仓</button>
           <button id="researchUpdateButton" type="button" hidden>部署结果已更新 · 查看</button>
           <label class="select-control" for="reportDate"><span>报告日期</span><select id="reportDate" aria-label="选择历史日报" disabled><option>暂无日报</option></select></label>
           <button id="refreshButton" type="button"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 7.25A6.5 6.5 0 1 0 16.2 11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16 3.75v3.5h-3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>刷新</button>
         </div>
       </div>
     </section>
+    <section class="task-panel" aria-labelledby="generateTitle"><h2 id="generateTitle">生成一份日报</h2><p>本地数据取证，DSH Agent 复核；交易日 09:20 / 14:30 自动生成。</p><form id="taskForm" data-kind="daily" class="task-fields"><label>市场<select name="market"><option value="a">A 股</option><option value="hk">港股</option></select></label><label>时段<select name="session"><option value="morning">日报 1 · 开盘前</option><option value="afternoon">日报 2 · 收盘前</option></select></label><button class="primary" type="submit">生成日报</button><button id="cancelTask" type="button" hidden>取消任务</button></form><pre id="taskLog" class="task-log" role="status" aria-live="polite"></pre></section>
+    <aside id="lanAccess" class="lan-access" aria-label="局域网访问" aria-live="polite">正在获取局域网访问地址…</aside>
+    <details id="portfolioEntry" class="task-panel portfolio-entry">
+      <summary>添加 / 更新持仓<span>代码 + 股数 · A股与港股可混合输入</span></summary>
+      <p>直接写股票代码和持有股数，DSH Web Agent 自动识别并补全名称。港股请注明“港股”或使用 .HK 后缀。</p>
+      <form id="portfolioEntryForm">
+        <label for="portfolioEntryText">我的持仓</label>
+        <textarea id="portfolioEntryText" name="text" rows="4" maxlength="6000" placeholder="600519 100股&#10;000858 200股&#10;港股 00700 300股" required></textarea>
+        <p class="ranking-note">数量按“股”填写，不按手。同市场同代码更新为本次股数，其他持仓保留；无需填写成本价。</p>
+        <div class="portfolio-entry-actions"><button class="primary" type="submit" value="save">DSH 识别并保存</button><button type="submit" value="preview">仅预览识别结果</button><button id="portfolioEntryCancel" type="button" hidden>取消任务</button></div>
+      </form>
+      <p id="portfolioEntryStatus" class="portfolio-entry-status" role="status" aria-live="polite"></p>
+      <div id="portfolioEntryResults"></div>
+    </details>
     <div class="report-layout">
     <aside class="report-index" aria-label="日报索引列">
       <details id="reportIndexPanel" class="index-panel" open>
@@ -90,8 +107,11 @@
     </div>
     </div>
   </main>
-  <footer><span>仅限本机与局域网内访问</span><span>DSH Finance Agent</span></footer>
+  <footer><span>本地保存 · 仅供研究</span><span>知衡 · Financial Studio</span></footer>
   <script src="/report-visuals.js" defer></script>
   <script src="/app.js" defer></script>
+  <script src="/task-controls.js" defer></script>
+  <script src="/network-status.js" defer></script>
+  <script src="/portfolio-entry.js" defer></script>
 </body>
 </html>
