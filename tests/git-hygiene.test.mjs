@@ -43,6 +43,17 @@ test('pre-commit rejects embedded provider tokens without printing their values'
   assert.notEqual(commit.status, 0); assert.match(commit.stderr, /possible credential content/);
   assert.equal((commit.stdout + commit.stderr).includes(secret), false);
 });
+test('pre-commit permits host URL test fixtures but still blocks embedded URL credentials', async t => {
+  const directory = await fixture(t);
+  await writeFile(join(directory, 'host-validation.test.mjs'), await readFile(join(root, 'tests/web-dsh-host.test.mjs')));
+  git(directory, ['add', 'host-validation.test.mjs']); git(directory, ['commit', '-qm', 'Public URL validation fixtures']);
+  const password = 'fixture-only-' + 'C'.repeat(36);
+  await writeFile(join(directory, 'settings.js'), `export const endpoint = ${JSON.stringify('https://user:' + password + '@example.invalid/')};\n`);
+  git(directory, ['add', 'settings.js']);
+  const commit = git(directory, ['commit', '-qm', 'Must be refused'], {fail: true});
+  assert.notEqual(commit.status, 0); assert.match(commit.stderr, /possible credential content/);
+  assert.equal((commit.stdout + commit.stderr).includes(password), false);
+});
 test('pre-push catches a secret added then removed from history', async t => {
   const directory = await fixture(t), secret = 'sk-' + 'B'.repeat(36), disabled = join(directory, 'disabled-hooks');
   await mkdir(disabled); await writeFile(join(directory, 'settings.js'), `export const apiKey = '${secret}';\n`);

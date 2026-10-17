@@ -5,19 +5,25 @@ import { apply as registerTools } from './dsh-finance-agent/index.js';
 import { startWorker } from './lib/workers.mjs';
 import { createResearchAgent } from './lib/agent.mjs';
 import { createFinanceServer, listen } from './lib/server.mjs';
+import { logWorkspaceAccess } from './lib/access-log.mjs';
+import { randomUUID } from 'node:crypto';
 
 export const name = 'financial';
-export const inject = ['agents', 'agentDefaultModel', 'sessions', 'tools', 'skills'];
+export const inject = ['agents', 'agentDefaultModel', 'sessions', 'tools', 'skills', 'profileContext', 'webServer'];
 export async function apply(ctx, config = {}) {
-  const root = fileURLToPath(new URL('./', import.meta.url)), owned = [];
+  const root = fileURLToPath(new URL('./', import.meta.url)), owned = [], instance = randomUUID();
   let site, scheduler, ownsState = false, statePath = join(root, '.runtime/web.json');
   const register = dataUrl => {
     const names = [];
     registerTools({ skills: ctx.skills, tools: { register(definition) { names.push(definition.name); return ctx.tools.register(definition); } } }, { baseUrl: dataUrl });
     return names;
   };
-  const cleanup = async () => { clearInterval(scheduler); if (site) await site.close(); for (const worker of owned.reverse()) worker.close(); if (ownsState) await unlink(statePath).catch(() => {}); };
-  ctx.on('dispose', cleanup);
+  let disposing;
+  const cleanup = () => disposing ??= (async () => {
+    clearInterval(scheduler); if (site) await site.close(); for (const worker of owned.reverse()) worker.close();
+    if (ownsState) { try { if (JSON.parse(await readFile(statePath, 'utf8')).instance === instance) await unlink(statePath); } catch {} }
+  })();
+  ctx.effect(() => cleanup);
   try {
     let existing;
     try {
@@ -26,15 +32,16 @@ export async function apply(ctx, config = {}) {
       const response = await fetch(state.url + '/api/status', { signal: AbortSignal.timeout(1000) });
       if (response.ok && (await response.json()).name === 'dsh-financial') existing = state;
     } catch {}
-    if (existing) { register(existing.dataUrl); console.log(`[DSH 插件] 知衡 · 复用已运行的工作台 ${existing.url}`); return; }
-    const data = await startWorker(root, 'data'); owned.push(data);
-    const reports = await startWorker(root, 'reports', { ...process.env, FINANCE_DATA_URL: data.url }); owned.push(reports);
+    if (existing) { register(existing.dataUrl); console.log('[DSH 插件] 知衡 · 复用已运行的工作台'); await logWorkspaceAccess(existing.url); return; }
+    const workerEnv = {...process.env, ...(config.python ? {FINANCE_PYTHON: config.python} : {})};
+    const data = await startWorker(root, 'data', workerEnv); owned.push(data);
+    const reports = await startWorker(root, 'reports', { ...workerEnv, FINANCE_DATA_URL: data.url }); owned.push(reports);
     const financeTools = register(data.url);
     const research = createResearchAgent(ctx, root, financeTools);
-    site = await createFinanceServer({ root, dataUrl: data.url, reportsUrl: reports.url, research, model: () => ctx.agentDefaultModel.currentSelection() });
+    site = await createFinanceServer({ root, dataUrl: data.url, reportsUrl: reports.url, research, env: workerEnv, model: () => ctx.agentDefaultModel.currentSelection() });
     const port = await listen(site.server, config.port ?? process.env.FINANCE_PORT ?? 3205, site.network ? '0.0.0.0' : '127.0.0.1');
     await mkdir(join(root, '.runtime'), { recursive: true });
-    await writeFile(statePath, JSON.stringify({ pid: process.pid, port, url: `http://127.0.0.1:${port}`, dataUrl: data.url, name: 'dsh-financial' })); ownsState = true;
+    await writeFile(statePath, JSON.stringify({ pid: process.pid, port, url: `http://127.0.0.1:${port}`, dataUrl: data.url, name: 'dsh-financial', profile: ctx.profileContext.name, home: ctx.profileContext.home, dshWebUrl: `http://127.0.0.1:${ctx.webServer.port}`, instance })); ownsState = true;
     // Scheduling shares the same DSH-backed job path as manual generation.
     const stateFile = join(root, 'data/web/schedules.json'); let completed = {};
     try { completed = JSON.parse(await readFile(stateFile, 'utf8')); } catch {}
@@ -60,7 +67,8 @@ export async function apply(ctx, config = {}) {
         }
       } catch (e) { console.error('[知衡调度] ' + e.message); } finally { ticking = false; }
     }, 30000); scheduler.unref();
-    console.log(`[DSH 插件] 知衡 (financial) · 已加载\n[DSH 插件] 本机：http://127.0.0.1:${port}/\n[DSH 插件] 研究：复用 DSH Web Agent、默认模型与凭据`);
-    if (site.network) console.log(`[DSH 插件] 局域网：http://${site.network.address}:${port}/ · ${site.network.adapter}`);
+    console.log('[DSH 插件] 知衡 (financial) · 已加载');
+    await logWorkspaceAccess(`http://127.0.0.1:${port}/`, {network: site.network});
+    console.log('[DSH 插件] 研究：复用 DSH Web Agent、默认模型与凭据');
   } catch (e) { await cleanup(); throw e; }
 }

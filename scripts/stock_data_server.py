@@ -397,6 +397,32 @@ def import_portfolio(payload: dict):
     return {**saved, "added": added, "updated": updated}
 
 
+def modify_portfolio(payload: dict, *, delete: bool = False):
+    if not isinstance(payload, dict):
+        raise ValueError("持仓参数无效。")
+    # Reuse strict market/code/quantity validation; deletion needs only identity.
+    target = import_holdings({"holdings": [{**payload, **({"shares": 1} if delete else {})}]})[0]
+    key = (target["market"], target["symbol"])
+    with PORTFOLIO_LOCK:
+        holdings = portfolio_response()["holdings"]
+        index = next((i for i, row in enumerate(holdings) if (row.get("market", "a"), row["symbol"]) == key), None)
+        if index is None:
+            raise ValueError("这条持仓已不存在，请刷新列表。")
+        if delete:
+            holdings.pop(index)
+        else:
+            holdings[index] = {**holdings[index], "shares": target["shares"]}
+        return save_portfolio({"holdings": holdings})
+
+
+def update_portfolio_holding(payload: dict):
+    return modify_portfolio(payload)
+
+
+def delete_portfolio_holding(payload: dict):
+    return modify_portfolio(payload, delete=True)
+
+
 def trading_day_response(day_text: str = "", market: str = "a"):
     market = normalize_market(market)
     target = pd.Timestamp(day_text).date() if day_text else date.today()
@@ -1771,7 +1797,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
-            handlers = {"/v1/portfolio": save_portfolio, "/v1/portfolio/resolve": resolve_portfolio, "/v1/portfolio/import": import_portfolio}
+            handlers = {"/v1/portfolio": save_portfolio, "/v1/portfolio/resolve": resolve_portfolio, "/v1/portfolio/import": import_portfolio,
+                        "/v1/portfolio/update": update_portfolio_holding, "/v1/portfolio/delete": delete_portfolio_holding}
             if parsed.path not in handlers:
                 return self.send_json(404, {"error": "Unknown endpoint"})
             content_length = int(self.headers.get("Content-Length", "0"))

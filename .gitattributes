@@ -1,3 +1,5 @@
 # Verified correction manifests hash the original LF bytes on every platform.
 data-corrections/minute/*.csv text eol=lf
 .githooks/* text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf

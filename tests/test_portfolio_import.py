@@ -38,6 +38,42 @@ class PortfolioImportTests(unittest.TestCase):
                 server.import_portfolio({"holdings":[{"market":"a","symbol":"600519","shares":100},{"market":"hk","symbol":"00700","shares":quantity}]})
             self.assertEqual(self.path.read_bytes(),original)
 
+    def test_edit_each_market_preserves_metadata_and_other_positions(self):
+        server.import_portfolio({"holdings":[{"market":"hk","symbol":"00700","shares":200,"name":"腾讯控股"}]})
+        for market, symbol, quantity in (("a","600519",125),("hk","00700",345)):
+            before = server.portfolio_response()["holdings"]
+            result = server.update_portfolio_holding({"market":market,"symbol":symbol,"shares":quantity,"name":"不应替换","cost_basis":0})
+            expected = [{**row,"shares":quantity} if (row.get("market","a"),row["symbol"]) == (market,symbol) else row for row in before]
+            self.assertEqual(result["holdings"],expected)
+            self.assertEqual(server.portfolio_response()["holdings"],expected)
+
+    def test_delete_both_markets_and_last_position(self):
+        server.save_portfolio({"holdings":[{"symbol":"000001","shares":100},{"market":"hk","symbol":"00001","shares":200}]})
+        result = server.delete_portfolio_holding({"market":"hk","symbol":"00001"})
+        self.assertEqual(result["holdings"],[{"symbol":"000001","shares":100.0}])
+        self.assertEqual(server.delete_portfolio_holding({"market":"a","symbol":"000001"})["holdings"],[])
+        self.assertEqual(server.portfolio_response()["holdings"],[])
+
+    def test_invalid_edit_or_identity_leaves_cache_unchanged(self):
+        original = self.path.read_bytes()
+        for quantity in (None,True,0,-1,1.5,float("nan"),float("inf"),"100",1_000_000_000_001):
+            with self.assertRaises(ValueError):
+                server.update_portfolio_holding({"market":"a","symbol":"600519","shares":quantity})
+            self.assertEqual(self.path.read_bytes(),original)
+        for identity in ({"symbol":"600519"},{"market":"hk","symbol":"600519"},{"market":"a","symbol":"000000"},{"market":"a","symbol":"６００５１９"}):
+            for operation in (server.update_portfolio_holding,server.delete_portfolio_holding):
+                with self.assertRaises(ValueError):
+                    operation({**identity,"shares":100})
+                self.assertEqual(self.path.read_bytes(),original)
+
+    def test_stale_or_wrong_market_identity_never_upserts_or_deletes_another_stock(self):
+        original = self.path.read_bytes()
+        for identity in ({"market":"hk","symbol":"00700"},{"market":"a","symbol":"000700"}):
+            for operation in (server.update_portfolio_holding,server.delete_portfolio_holding):
+                with self.assertRaisesRegex(ValueError,"已不存在"):
+                    operation({**identity,"shares":100})
+                self.assertEqual(self.path.read_bytes(),original)
+
     def test_name_lookup_is_batched_by_market_and_preview_does_not_write(self):
         original = self.path.read_bytes()
         frames = {"a":(pd.DataFrame({"code":["600519","000858"],"name":["贵州茅台","五粮液"]}),"code","name","test"),"hk":(pd.DataFrame({"code":["00700"],"name":["腾讯控股"]}),"code","name","test")}

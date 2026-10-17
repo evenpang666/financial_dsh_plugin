@@ -4,9 +4,26 @@
 
 ## 启动与插件
 
-需要 Node.js 22.13+、Python 3.11+。运行 `npm start`、Windows 的 `start.bat` 或 Linux/macOS 的 `bash start.sh`。首次运行会检查并安装 Python 数据依赖、兼容的 DSH 和 pnpm；项目不需要前端编译。`npm run dev` 不自动打开浏览器。
+Windows 双击 `start.bat`，Linux/macOS 运行 `bash start.sh`。入口先检查 Node.js 与 npm，缺失时自动下载项目内环境；Node 下载对照官方 SHA-256，安装失败保留原环境。已有合适 Node 的机器也可用 `npm start`；`npm run dev` 不自动打开浏览器，项目无需前端编译。
 
-默认监听 `127.0.0.1:3205`。占用时直接让操作系统分配空闲端口，终端输出实际地址。重复启动会复用已运行的知衡。`FINANCE_PORT` 可指定首选端口，`FINANCE_PYTHON` 可指定 Python。`npm stop` 停止当前工作台。启动和停止统一使用 `start.bat` / `start.sh`、`npm start` / `npm stop`，旧桌面入口已删除。
+每次启动（包括复用已运行的网页）都会检查版本，低于最低要求才升级，满足要求的高版本直接复用。版本策略集中在 `scripts/runtime-versions.json`：
+
+| 环境 | 最低要求与补齐策略 |
+| --- | --- |
+| Node.js | 22.13.0；缺失或过低时下载 22.23.3 到 `.runtime/node/current` |
+| npm | 10.9.2；较低版本升级到项目内工具目录 |
+| DSH | 0.2.0-rc.2；较低版本切换到共享兼容运行时，支持正式版与更高版本 |
+| pnpm | 12.3.4 与 DSH Web profile 所需版本中的较高者；缺失或过低时补齐 |
+| Python | 3.11.0；优先复用已有解释器，无合适版本时由 uv 准备项目内 Python 3.12 |
+| 数据依赖 | 逐项核对 `requirements.txt` 最低版本并尝试导入，只补齐缺失或过低依赖 |
+
+新增 Python 虚拟环境放在 `.runtime/venvs/`，验证成功后记录至 `.runtime/python.json`，独立启动和插件加载均能找到它；原 `.venv` 保留。uv 按[官方本地安装方式](https://docs.astral.sh/uv/reference/installer/)放入项目目录，Python 安装关闭注册表登记与全局命令链接。所有项目内运行环境与缓存均被 Git 忽略。
+
+默认端口 `3205`。占用时直接让操作系统分配空闲端口，终端输出实际地址。插件新建服务、复用已有服务时都输出本机与局域网 URL；后者使用服务选中的物理以太网地址及实际端口，无物理以太网时明确提示不可用。`FINANCE_PORT` 可指定首选端口，`FINANCE_PYTHON` 可指定 Python。旧桌面入口已删除。
+
+双击启动先检测本机 DSH Web：默认 `3080`，也会从 DSH 进程监听中识别自定义端口；`DSH_WEB_URL` / `DSH_WEB_PORT` 可明确指定已有 Web 地址。已有服务时在 `web` profile 注册并热加载知衡，不再启动独立金融宿主；没有服务时自动启动 DSH Web，Web 端口不可用时选择空闲端口。连续双击会串行配置并复用同一宿主。旧 `financial` profile 只有在确认身份且无运行任务时才迁移，运行中的任务会保留。
+
+`npm stop` 只停用知衡插件、释放其监听和 Python 工作进程，共享 DSH Web 与其他插件继续运行；再次双击会在原宿主中启用知衡。复用宿主时启动器退出不会结束原服务；启动器自己新建的 Web 服务由该启动窗口维护。已有 Web 未开启配置热加载时会明确报告插件未就绪，保留原宿主，不额外启动第二个服务。
 
 启动器使用 DSH 官方 `plugin --profile web add link:...` 注册根目录包 `dsh-financial`，并移除被其替代的 `dsh-finance-agent` 注册，避免重复工具。其他插件和其他四个项目不作修改。名称、简介、图标分别来自 `locale/`、`package.json` 和 `web/icon.svg`。
 
@@ -14,9 +31,9 @@
 
 ## Agent 和模型
 
-知衡在 DSH 内运行，通过 `ctx.agents.create` 创建研究会话，继承 `agentDefaultModel`。API Key、模型提供方、协议和端点由 DSH 管理。独立启动时采用应用 profile，直接引用用户 `DSH_HOME` 中的 `settings.yaml` 和 `.credentials.yaml`，不复制密钥、不提供单独 Key 输入框。
+知衡在共享 DSH Web 的 `web` profile 内运行，通过 `ctx.agents.create` 创建研究会话，继承 `agentDefaultModel`。API Key、模型提供方、协议和端点由 DSH Web 管理，不复制密钥、不提供单独 Key 输入框。
 
-在 DSH Web 的模型设置中配置凭据。应用 profile 观察配置更新；若宿主版本不热更新模型，请重启知衡。运行 `npm run dsh -- web` 可进入 DSH Web；已有 Web 进程需要在注册后加载插件或重启一次。网页的研究工具限制在金融工具范围内，不向研究会话开放任意终端执行。
+在 DSH Web 的模型设置中配置凭据。启动日志分别显示 DSH Web、知衡本机页和局域网页地址；认证链接不会写入项目状态或原样转发到启动日志。网页的研究工具限制在金融工具范围内，不向研究会话开放任意终端执行。
 
 DSH Web 插件与独立启动器共用项目的运行状态：已运行时复用网页和取数服务。原有 21 个研究工具和 8 个 Skills 仍然注册。研究结果包含会话 ID、实际模型和调用工具列表。任务在本地保存，支持取消；服务重启后，旧的运行中任务被标记为中断。
 
@@ -38,7 +55,7 @@ DSH Web 插件与独立启动器共用项目的运行状态：已运行时复用
 
 ## 文本录入持仓
 
-在日报页点击“添加持仓”，直接输入代码与当前持股数量，可混合 A 股和港股：
+在日报页点击“管理持仓”，直接输入代码与当前持股数量，可混合 A 股和港股：
 
 ```text
 600519 100股
@@ -52,6 +69,10 @@ DSH Web 插件与独立启动器共用项目的运行状态：已运行时复用
 
 保存位置为 `data/portfolio.json`，已被 Git 忽略。保存成功后已有持仓分析失效，点击“分析我的持仓”获取新结果。
 
+已保存列表支持“编辑股数”和“删除”，A 股、港股都适用。编辑填写当前总股数（正整数），保存后保留名称、成本和备注；清仓后点击“删除”即可移除该条持仓。操作按市场与代码定位，其他股票保留，直接更新本地缓存，无需调用模型。编辑时按 Esc 或“取消”放弃修改；识别预览中点击“查看已保存持仓”返回管理列表。
+
+![持仓管理：A 股与港股编辑、删除，图中为验收示例数据](assets/workspace-portfolio-management.png)
+
 ![文本持仓录入示例：识别预览，尚未保存](assets/workspace-portfolio.png)
 
 ![因子训练与独立模型版本](assets/workspace-training.png)
@@ -59,7 +80,7 @@ DSH Web 插件与独立启动器共用项目的运行状态：已运行时复用
 
 ## 本地数据与访问
 
-`data/reports/` 存日报，`data/factor-lab/` 存历史数据、模型与回测，`data/web/` 存任务和调度记录。`.runtime/` 为启动状态和临时 profile。这些目录均忽略提交。内部 Python 服务使用随机回环端口，由插件管理；主进程关闭后工作进程自动退出。
+`data/reports/` 存日报，`data/factor-lab/` 存历史数据、模型与回测，`data/web/` 存任务和调度记录。`.runtime/` 为启动状态和项目内运行环境。这些目录均忽略提交。内部 Python 服务使用随机回环端口，由插件管理，停用插件或宿主退出时自动清理。
 
 启动时识别已连接的物理以太网 IPv4，排除 VMware、Hyper-V、VPN、虚拟网卡、无线网卡和自动分配的 `169.254.*` 地址；多块物理以太网优先使用默认路由度量最低的网卡。首页、日报和回测页均显示局域网 URL 与复制按钮，端口使用实际监听端口（包括占用后自动分配的端口）。没有符合条件的网卡时仅保留本机访问并显示原因；网卡地址变化后重启工作台。
 

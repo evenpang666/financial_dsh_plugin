@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { ensureDshVersion } from './dsh-version.mjs';
+import { ensureDshVersion, compareVersions } from './dsh-version.mjs';
 
 export const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 export const versions = JSON.parse(await readFile(new URL('./runtime-versions.json', import.meta.url), 'utf8'));
@@ -28,7 +28,8 @@ async function cliPath(candidate, shimEntry) {
     if (/\.(cmd|ps1)$/i.test(path)) {
       const parts = shimEntry.split('/');
       const packageName = parts.slice(0, parts[0].startsWith('@') ? 2 : 1).join('/');
-      const entry = await packageCli(dirname(path), packageName, shimEntry);
+      const directory = dirname(path);
+      const entry = await packageCli(basename(directory) === '.bin' ? resolve(directory, '../..') : directory, packageName, shimEntry);
       await access(entry); return entry;
     }
     return path;
@@ -128,12 +129,25 @@ async function profileTools(env) {
 }
 
 export async function ensureEnvironment({ root = projectRoot, env = process.env, locateDsh = findDsh, locateNpm = findNpm,
-  inspect = versionOf, install = installTool, upgrade = ensureDshVersion, log = console.log } = {}) {
-  if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('需要 Node.js 22+，请运行 start.sh / Start.bat 自动补齐项目运行环境。');
+  inspect = versionOf, install = installTool, upgrade = ensureDshVersion, locatePnpm = env => onPath('pnpm', 'pnpm/bin/pnpm.cjs', env), nodeVersion = process.versions.node, log = console.log } = {}) {
+  if (compareVersions(nodeVersion, versions.nodeMinimum) < 0) throw new Error(`需要 Node.js ${versions.nodeMinimum}+，请运行 start.sh / start.bat 自动升级项目运行环境。`);
   env = { ...env, PATH: [dirname(process.execPath), ...pathDirs(env)].join(delimiter), npm_config_update_notifier: 'false', PNPM_DISABLE_SELF_UPDATE_CHECK: '1' };
-  log(`[环境] 检查 Node.js ${process.versions.node}、npm、DSH 最低版本和 pnpm`);
-  const npm = await locateNpm(env);
-  log(`[环境] 复用 npm ${await inspect(npm, env)}`);
+  log(`[环境] 复用 Node.js ${nodeVersion}；检查 npm、DSH 和 pnpm 最低版本`);
+  let npm = await locateNpm(env), npmVersion = await inspect(npm, env);
+  if (compareVersions(npmVersion, versions.npm) < 0) {
+    const directory = join(root, '.runtime/tools', `npm-${versions.npm}`);
+    const managed = await packageCli(directory, 'npm', 'npm/bin/npm-cli.js');
+    let installed; try { installed = await inspect(managed, env); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (!installed || compareVersions(installed, versions.npm) < 0) {
+      log(`[环境] npm ${npmVersion} 低于 ${versions.npm}，升级项目内 npm…`);
+      await install({name: 'npm', version: versions.npm, entry: 'npm/bin/npm-cli.js', directory, npm, env});
+    }
+    npm = managed; npmVersion = await inspect(npm, env);
+    if (compareVersions(npmVersion, versions.npm) < 0) throw new Error('npm 升级后的版本校验失败。');
+    env.PATH = [resolve(dirname(npm), '../../.bin'), ...pathDirs(env)].join(delimiter);
+  }
+  env.npm_execpath = npm;
+  log(`[环境] 复用 npm ${npmVersion}`);
   let dsh;
   try { dsh = await locateDsh(env, root); }
   catch (error) { if (error.code !== 'DSH_MISSING') throw error; }
@@ -149,21 +163,23 @@ export async function ensureEnvironment({ root = projectRoot, env = process.env,
   log(`[环境] 复用 DSH ${checked.version}`);
   const metadata = await profileTools(env);
   const required = metadata.packageManager?.match(/^pnpm@(\d+\.\d+\.\d+(?:-[\w.-]+)?)/)?.[1];
-  const directory = join(root, '.runtime/tools', `pnpm-${required || versions.pnpm}`);
-  const candidates = [await onPath('pnpm', 'pnpm/bin/pnpm.cjs', env), await packageCli(directory, 'pnpm', 'pnpm/bin/pnpm.cjs')];
+  const minimum = required && compareVersions(required, versions.pnpm) > 0 ? required : versions.pnpm;
+  const directory = join(root, '.runtime/tools', `pnpm-${minimum}`);
+  const candidates = [await locatePnpm(env), await packageCli(directory, 'pnpm', 'pnpm/bin/pnpm.cjs')];
   let pnpm, pnpmVersion;
   for (const cli of candidates.filter(Boolean)) {
     try {
       const version = await inspect(cli, env);
-      if (required && version.split('.')[0] !== required.split('.')[0]) continue;
+      if (compareVersions(version, minimum) < 0) continue;
       pnpm = cli; pnpmVersion = version; break;
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   if (!pnpm) {
-    log(`[环境] 补齐项目内 pnpm ${required || versions.pnpm}…`);
-    await install({ name: 'pnpm', version: required || versions.pnpm, entry: 'pnpm/bin/pnpm.cjs', directory, npm, env });
+    log(`[环境] pnpm 缺失或低于 ${minimum}，补齐项目内版本…`);
+    await install({ name: 'pnpm', version: minimum, entry: 'pnpm/bin/pnpm.cjs', directory, npm, env });
     pnpm = await packageCli(directory, 'pnpm', 'pnpm/bin/pnpm.cjs');
     pnpmVersion = await inspect(pnpm, env);
+    if (compareVersions(pnpmVersion, minimum) < 0) throw new Error('pnpm 升级后的版本校验失败。');
   }
   // pnpm must be visible to DSH's child process without changing the global PATH.
   const pnpmBin = basename(pnpm).startsWith('pnpm.') ? resolve(dirname(pnpm), '../../.bin') : dirname(pnpm);

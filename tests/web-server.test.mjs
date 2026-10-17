@@ -109,6 +109,46 @@ test('text portfolio job uses DSH, resolves metadata and saves mixed markets thr
   const preview=await fetch(base+'/api/jobs',{method:'POST',body:JSON.stringify({kind:'portfolio',text:'600519 100股\n港股 00700 200股',preview:true})});
   const previewJob=await finished(base,(await preview.json()).id);assert.equal(previewJob.result.preview,true);assert.equal(imports,1);
 });
+test('saved portfolio edits and deletions route exact market identities without invoking DSH', async t => {
+  const calls = []; let agentCalls = 0;
+  const {base} = await fixture(t, async () => {agentCalls++;}, {dataHandler: async (req,res) => {
+    if (!req.url.startsWith('/v1/portfolio/')) return false;
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    calls.push({path:req.url,method:req.method,payload:JSON.parse(Buffer.concat(chunks))});
+    res.end(JSON.stringify({saved:true,holdings:[]})); return true;
+  }});
+  for (const [market,symbol] of [['a','000001'],['hk','00001']]) {
+    const response = await fetch(`${base}/api/portfolio/${market}/${symbol}`, {method:'PATCH',headers:{Origin:base},body:JSON.stringify({shares:345,note:'ignore',symbol:'600519'})});
+    assert.equal(response.status,200); assert.equal((await response.json()).saved,true);
+    assert.equal((await fetch(`${base}/api/portfolio/${market}/${symbol}`, {method:'DELETE',headers:{Origin:base}})).status,200);
+  }
+  assert.deepEqual(calls, [
+    {path:'/v1/portfolio/update',method:'POST',payload:{market:'a',symbol:'000001',shares:345}},
+    {path:'/v1/portfolio/delete',method:'POST',payload:{market:'a',symbol:'000001'}},
+    {path:'/v1/portfolio/update',method:'POST',payload:{market:'hk',symbol:'00001',shares:345}},
+    {path:'/v1/portfolio/delete',method:'POST',payload:{market:'hk',symbol:'00001'}}
+  ]);
+  assert.equal(agentCalls,0);
+});
+test('invalid portfolio edits and foreign origins never reach the data service', async t => {
+  let calls = 0;
+  const {base} = await fixture(t, undefined, {dataHandler:async (_req,res) => {calls++;res.end('{}');return true;}});
+  for (const shares of [null,true,0,-1,1.5,'100',1e12+1]) assert.equal((await fetch(base+'/api/portfolio/a/600519',{method:'PATCH',body:JSON.stringify({shares})})).status,400);
+  for (const path of ['/hk/600519','/a/000000','/unknown/600519','/a/１２３４５６']) assert.equal((await fetch(base+'/api/portfolio'+path,{method:'DELETE'})).status,400);
+  for (const method of ['PATCH','DELETE']) assert.equal((await fetch(base+'/api/portfolio/hk/00700',{method,headers:{Origin:'https://evil.example'},body:method==='PATCH'?'{}':undefined})).status,403);
+  assert.equal(calls,0);
+});
+test('edits wait for running portfolio imports and propagate missing holding errors', async t => {
+  let calls = 0;
+  const {base,site} = await fixture(t, (_prompt,{signal}) => new Promise((_,reject) => signal.addEventListener('abort',()=>reject(Error('cancelled')),{once:true})), {dataHandler:async (_req,res) => {calls++;res.statusCode=400;res.end(JSON.stringify({error:'这条持仓已不存在，请刷新列表。'}));return true;}});
+  const missing = await fetch(base+'/api/portfolio/hk/00700',{method:'DELETE'});
+  assert.equal(missing.status,400); assert.match((await missing.json()).error,/已不存在/);
+  const job = site.startJob({kind:'portfolio',text:'600519 100股'});
+  await new Promise(done => setTimeout(done,20));
+  for (const method of ['PATCH','DELETE']) assert.equal((await fetch(base+'/api/portfolio/a/600519',{method,body:method==='PATCH'?JSON.stringify({shares:100}):undefined})).status,409);
+  assert.equal(calls,1);
+  await fetch(base+`/api/jobs/${job.id}/cancel`,{method:'POST'}); await finished(base,job.id);
+});
 test('daily generation preserves original evidence, appends agent review and archives only on success', async t => {
   const { base, root, site } = await fixture(t); const job = site.startJob({ kind: 'daily', market: 'a', session: 'morning' });
   const result = await finished(base, job.id); assert.equal(result.status, 'completed');
