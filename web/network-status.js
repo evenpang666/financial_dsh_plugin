@@ -10,7 +10,7 @@
     try {
       const response = await fetch('/api/network', {cache: 'no-store'}); if (!response.ok) throw Error();
       const data = await response.json();
-      if (!data.lanUrl) { target.replaceChildren(element('span', '局域网访问', 'lan-label'), element('span', '未检测到已连接的物理以太网；连接网线后重启工作台。', 'lan-note')); return; }
+      if (!data.lanUrl) { target.replaceChildren(element('span', '局域网访问', 'lan-label'), element('span', '未检测到已连接的物理以太网 IPv4，或已设置 FINANCE_LAN=0。连接以太网后重启服务可自动获取。', 'lan-note')); return; }
       const link = element('a', data.lanUrl); link.href = data.lanUrl;
       const button = element('button', '复制地址'); button.type = 'button'; button.setAttribute('aria-label', '复制局域网访问地址');
       button.addEventListener('click', async () => { try { await copy(data.lanUrl); button.textContent = '已复制'; } catch (error) { button.textContent = error.message; } });

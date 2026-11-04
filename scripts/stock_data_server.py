@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Read-only local A-share data adapter for dsh-finance-agent.
+"""Read-only local A-share data adapter for dsh-financial.
 
 Run on Windows: .\\.venv\\Scripts\\python.exe .\\scripts\\stock_data_server.py
 The server intentionally binds only to 127.0.0.1 and contains no broker API.
@@ -11,14 +11,18 @@ import json
 import importlib
 import math
 import logging
+import re
 import sys
+import us_market as us
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -30,17 +34,18 @@ from data_diagnostics import readable_issues
 try:
     import akshare as ak
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit("Missing dependency. Activate .venv and run: pip install -r requirements.txt") from exc
+    raise SystemExit("Missing dependency. Run npm run setup in the plugin directory (uses local uv).") from exc
 
 
 HOST, PORT = "127.0.0.1", 8765
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PORTFOLIO_FILE = PROJECT_ROOT / "data" / "portfolio.json"
 PORTFOLIO_LOCK = RLock()
+HISTORY_SINA_LOCK = RLock()
 EVENT_ARCHIVE_FILE = PROJECT_ROOT / "data" / "market-events.json"
 REPORT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "report-snapshots"
 REFLECTION_FILE = PROJECT_ROOT / "data" / "research-reflections.json"
-REPORT_SESSIONS = {"morning", "afternoon"}
+REPORT_SESSIONS = {"morning", "afternoon", "manual"}
 
 
 def normalize_report_session(value: str = "morning") -> str:
@@ -48,7 +53,7 @@ def normalize_report_session(value: str = "morning") -> str:
     aliases = {"am": "morning", "preopen": "morning", "日报1": "morning", "pm": "afternoon", "preclose": "afternoon", "日报2": "afternoon"}
     session = aliases.get(session, session)
     if session not in REPORT_SESSIONS:
-        raise ValueError("session 必须是 morning（日报1）或 afternoon（日报2）。")
+        raise ValueError("session 必须是 morning（上午日报）、afternoon（下午日报）或 manual（手动报告）。")
     return session
 
 
@@ -66,7 +71,7 @@ def load_json_object(path: Path, default=None):
 
 
 def save_report_snapshot(payload: dict):
-    target = snapshot_path(payload.get("as_of", str(date.today())), payload.get("market", "a"), payload.get("session", "morning"))
+    target = (REPORT_SNAPSHOT_DIR / f"{payload['report_id']}.json") if payload.get("session") == "manual" else snapshot_path(payload.get("as_of", str(date.today())), payload.get("market", "a"), payload.get("session", "morning"))
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return target
@@ -161,7 +166,7 @@ def clean_record(record):
     return {str(key): to_number(value) for key, value in record.items()}
 
 
-MARKETS = {"a", "hk"}
+MARKETS = {"a", "hk", "us"}
 
 
 def normalize_market(value: str = "a") -> str:
@@ -169,11 +174,12 @@ def normalize_market(value: str = "a") -> str:
     text = str(value or "a").strip().lower().replace("-", "_")
     aliases = {
         "a": "a", "ashare": "a", "a_share": "a", "cn": "a", "中国a股": "a", "a股": "a",
+        "us": "us", "usa": "us", "美股": "us", "nyse": "us", "nasdaq": "us",
         "hk": "hk", "hongkong": "hk", "hong_kong": "hk", "港股": "hk",
     }
     market = aliases.get(text)
     if market not in MARKETS:
-        raise ValueError("market 必须是 a（A股）或 hk（港股）。")
+        raise ValueError("market 必须是 a（A股）、hk（港股）或 us（美股）。")
     return market
 
 
@@ -203,7 +209,7 @@ def normalize_hk_symbol(value):
 
 def normalize_symbol(value, market: str = "a") -> str:
     market = normalize_market(market)
-    symbol = normalize_a_symbol(value) if market == "a" else normalize_hk_symbol(value)
+    symbol = us.normalize_symbol(value) if market == "us" else normalize_a_symbol(value) if market == "a" else normalize_hk_symbol(value)
     if not symbol:
         rule = "6 位 A 股代码，例如 600519" if market == "a" else "1–5 位港股代码，例如 00700"
         raise ValueError(f"symbol 必须是{rule}。")
@@ -211,7 +217,7 @@ def normalize_symbol(value, market: str = "a") -> str:
 
 
 def market_label(market: str) -> str:
-    return "A股" if normalize_market(market) == "a" else "港股"
+    return {"a":"A股", "hk":"港股", "us":"美股"}[normalize_market(market)]
 
 
 def normalize_holding(item: dict) -> dict:
@@ -274,6 +280,8 @@ def save_portfolio(payload: dict):
 
 
 def stock_catalog(market: str):
+    if normalize_market(market) == "us":
+        raise ValueError("美股使用在线 search 查询，不枚举 SEC 公司表作为完整股票全集。")
     market = normalize_market(market)
     if market == "a":
         frame = ak.stock_info_a_code_name().copy()
@@ -292,6 +300,7 @@ def stock_catalog(market: str):
 
 
 def stock_search_response(query: str, limit: int, market: str = "a"):
+    if normalize_market(market) == "us": return us.search(query, limit)
     query = str(query or "").strip()
     if not query:
         raise ValueError("query 不能为空。")
@@ -311,19 +320,19 @@ def import_holdings(payload: dict) -> list[dict]:
         raise ValueError("请提供1–100条持仓。")
     result, seen = [], set()
     for item in payload["holdings"]:
-        if not isinstance(item, dict) or item.get("market") not in ("a", "hk"):
-            raise ValueError("每条持仓必须标明 a 或 hk 市场。")
+        if not isinstance(item, dict) or item.get("market") not in ("a", "hk", "us"):
+            raise ValueError("每条持仓必须标明 a、hk 或 us 市场。")
         market, symbol, shares = item["market"], item.get("symbol"), item.get("shares")
         size = 6 if market == "a" else 5
-        if not isinstance(symbol, str) or len(symbol) != size or not symbol.isascii() or not symbol.isdigit() or int(symbol) == 0:
+        if not isinstance(symbol, str) or (market == "us" and us.normalize_symbol(symbol) != symbol) or (market != "us" and (len(symbol) != size or not symbol.isascii() or not symbol.isdigit() or int(symbol) == 0)):
             raise ValueError("股票代码无效。")
-        if isinstance(shares, bool) or not isinstance(shares, (int, float)) or not 0 < shares <= 1_000_000_000_000 or not float(shares).is_integer():
+        if isinstance(shares, bool) or not isinstance(shares, (int, float)) or not 0 < shares <= 1_000_000_000_000 or (market != "us" and not float(shares).is_integer()):
             raise ValueError("股数必须是正整数。")
         key = (market, symbol)
         if key in seen:
             raise ValueError("本次输入包含重复持仓代码。")
         seen.add(key)
-        holding = {"market": market, "symbol": symbol, "shares": int(shares)}
+        holding = {"market": market, "symbol": symbol, "shares": float(shares) if market == "us" else int(shares)}
         if item.get("name"):
             holding["name"] = str(item["name"])[:80]
         result.append(holding)
@@ -364,6 +373,11 @@ def resolve_portfolio(payload: dict):
 
 
 def portfolio_name_fallback(symbol: str, market: str) -> str | None:
+    if market == "us":
+        try:
+            matches = us.search(symbol, 5)["matches"]
+            return next((r["name"] for r in matches if r["symbol"] == symbol), None)
+        except Exception: return None
     prefix = "hk" if market == "hk" else "bj" if symbol.startswith(("4", "8", "92")) else "sh" if symbol.startswith(("5", "6", "9")) else "sz"
     try:
         response = requests.get(f"https://qt.gtimg.cn/q={prefix}{symbol}", timeout=8)
@@ -424,6 +438,7 @@ def delete_portfolio_holding(payload: dict):
 
 
 def trading_day_response(day_text: str = "", market: str = "a"):
+    if normalize_market(market) == "us": return us.trading_day(day_text)
     market = normalize_market(market)
     target = pd.Timestamp(day_text).date() if day_text else date.today()
     if market == "a":
@@ -445,6 +460,7 @@ def trading_day_response(day_text: str = "", market: str = "a"):
 
 
 def market_brief_response(event_limit: int, market: str = "a"):
+    if normalize_market(market) == "us": return us.brief(event_limit)
     market = normalize_market(market)
     sources, errors = [], []
     indices, events = [], []
@@ -479,7 +495,8 @@ def market_brief_response(event_limit: int, market: str = "a"):
     }
 
 
-def market_events_response(days: int, limit: int):
+def market_events_response(days: int, limit: int, market: str = "a"):
+    if normalize_market(market) == "us": return us.market_events(days, limit)
     frame = ak.stock_info_global_cls(symbol="全部").copy()
     title_key = next((key for key in ["标题", "title", "内容"] if key in frame.columns), None)
     date_key = next((key for key in ["发布日期", "日期", "date"] if key in frame.columns), None)
@@ -592,7 +609,7 @@ def market_breadth_response(frame=None, market: str = "a"):
     """Calculate auditable cross-sectional breadth for the selected market."""
     market = normalize_market(market)
     if frame is None:
-        frame = (ak.stock_zh_a_spot_tx() if market == "a" else ak.stock_hk_spot_em()).copy()
+        frame = (us.cross_section() if market == "us" else ak.stock_zh_a_spot_tx() if market == "a" else ak.stock_hk_spot_em()).copy()
     else:
         frame = frame.copy()
     aliases = {
@@ -625,7 +642,7 @@ def market_breadth_response(frame=None, market: str = "a"):
     label = "强势扩散" if score >= 70 else ("偏强" if score >= 57 else ("均衡" if score >= 43 else ("偏弱" if score >= 30 else "弱势扩散")))
     return {
         "market": market,
-        "source": ("AKShare stock_zh_a_spot_tx" if market == "a" else "AKShare stock_hk_spot_em") + " cross-section", "as_of": str(date.today()),
+        "source": ("Yahoo Finance US screener sample (not full market)" if market == "us" else "AKShare stock_zh_a_spot_tx" if market == "a" else "AKShare stock_hk_spot_em") + " cross-section", "as_of": (str(frame["更新时间"].max()) if market == "us" and "更新时间" in frame else str(date.today())),
         "valid_stocks": valid, "advancing": advancing, "declining": declining, "unchanged": unchanged,
         "advance_ratio": round(advance_ratio, 4), "advance_decline_ratio": round(ad_ratio, 4),
         "median_pct_change": round(median_change, 3),
@@ -702,6 +719,7 @@ def calibrate_buy_sell(base_buy_percentage: int, panorama: dict | None):
 
 
 def market_panorama_response(market: str = "a"):
+    if normalize_market(market) == "us": return us_panorama_response()
     """Combine events, policy, breadth and sentiment into one market risk regime."""
     market = normalize_market(market)
     unavailable = []
@@ -768,6 +786,31 @@ def market_panorama_response(market: str = "a"):
         "unavailable": unavailable,
         "method": "市场分=宽度55%+情绪25%+中性基准10分+国内正向政策加分-国际负向事件扣分；风险分=100-市场分。个股买入倾向按风险档统一调整-20至+12个百分点。",
     }
+
+
+def us_panorama_response():
+    unavailable = []
+    try:
+        breadth = market_breadth_response(market="us")
+        breadth["scope"] = "Yahoo US screener sample; not exchange-wide breadth"
+    except Exception as exc:
+        breadth = {"score": None, "label": "数据不足"}
+        unavailable.append(f"大盘宽度不可用：{exc}")
+    try:
+        events = us.market_events(7, 40)["events"]
+    except Exception as exc:
+        events = []
+        unavailable.append(f"事件与政策不可用：{exc}")
+    score = breadth.get("score")
+    risk = "未知" if score is None else "高" if score < 40 else "较低" if score > 65 else "中"
+    return {**us.metadata("Yahoo Finance US screener sample + dated news"),
+            "market_breadth": breadth, "international_events": events,
+            "domestic_policies": [], "other_events": [],
+            "social_sentiment": {"label": "未接入独立社交数据", "score": None},
+            "market_state": {"risk_level": risk, "score": score, "regime": "neutral",
+                             "buy_tendency_adjustment": 0, "reference_position": "待独立研究确认",
+                             "summary": "美股样本行情与新闻仅作研究线索，不套用A股政策或社交情绪评分。"},
+            "unavailable": unavailable, "method": "不以样本宽度冒充全市场；个股评分无额外美股风险校准。"}
 
 
 def latest_event_date(events):
@@ -888,7 +931,7 @@ def related_enterprises_response(symbol: str, days: int = 30, limit: int = 3):
 
 def market_movers_response(limit: int, market: str = "a"):
     market = normalize_market(market)
-    frame = (ak.stock_zh_a_spot_tx() if market == "a" else ak.stock_hk_spot_em()).copy()
+    frame = (us.cross_section() if market == "us" else ak.stock_zh_a_spot_tx() if market == "a" else ak.stock_hk_spot_em()).copy()
     change_key = next((key for key in ["zdf", "涨跌幅"] if key in frame.columns), None)
     if not change_key:
         raise ValueError("上游数据未提供涨跌幅字段。")
@@ -898,7 +941,7 @@ def market_movers_response(limit: int, market: str = "a"):
     up = [clean_record(item) for item in frame.nlargest(limit, change_key)[fields].to_dict("records")]
     down = [clean_record(item) for item in frame.nsmallest(limit, change_key)[fields].to_dict("records")]
     return {
-        "market": market, "source": "AKShare stock_zh_a_spot_tx" if market == "a" else "AKShare stock_hk_spot_em", "as_of": str(date.today()),
+        "market": market, "source": "Yahoo Finance US screener sample (not full market)" if market == "us" else "AKShare stock_zh_a_spot_tx" if market == "a" else "AKShare stock_hk_spot_em", "as_of": (str(frame["更新时间"].max()) if market == "us" and "更新时间" in frame else str(date.today())),
         "top_gainers": up, "top_losers": down,
         "note": "异动列表仅用于生成待研究候选池；涨跌幅和成交信息本身不构成推荐或预测。",
     }
@@ -906,7 +949,7 @@ def market_movers_response(limit: int, market: str = "a"):
 
 def candidate_ranking_response(limit: int, panorama=None, market: str = "a"):
     market = normalize_market(market)
-    frame = (ak.stock_zh_a_spot_tx() if market == "a" else ak.stock_hk_spot_em()).copy()
+    frame = (us.cross_section() if market == "us" else ak.stock_zh_a_spot_tx() if market == "a" else ak.stock_hk_spot_em()).copy()
     aliases = {
         "symbol": ["code", "代码", "股票代码", "证券代码"], "name": ["name", "名称", "股票名称", "证券简称"], "price": ["zxj", "最新价", "现价"],
         "day": ["zdf", "涨跌幅"], "day5": ["zdf_d5", "5日涨跌幅"],
@@ -919,7 +962,7 @@ def candidate_ranking_response(limit: int, panorama=None, market: str = "a"):
     rows = []
     for item in frame.to_dict("records"):
         raw_symbol = str(item.get(columns["symbol"], ""))
-        symbol = (normalize_a_symbol(raw_symbol) if market == "a" else normalize_hk_symbol(raw_symbol))
+        symbol = (us.normalize_symbol(raw_symbol) if market == "us" else normalize_a_symbol(raw_symbol) if market == "a" else normalize_hk_symbol(raw_symbol))
         name = str(item.get(columns["name"], ""))
         day = safe_float(item.get(columns["day"])) if columns["day"] else None
         day5 = safe_float(item.get(columns["day5"])) if columns["day5"] else None
@@ -966,7 +1009,7 @@ def candidate_ranking_response(limit: int, panorama=None, market: str = "a"):
         item["recommendation"] = "建议买入" if item["buy_percentage"] >= 65 else ("建议卖出" if item["sell_percentage"] >= 65 else "建议持有观察")
     return {
         "market": market,
-        "source": ("AKShare stock_zh_a_spot_tx" if market == "a" else "AKShare stock_hk_spot_em") + " + transparent local scoring", "as_of": str(date.today()),
+        "source": ("Yahoo Finance US screener sample (not full market)" if market == "us" else "AKShare stock_zh_a_spot_tx" if market == "a" else "AKShare stock_hk_spot_em") + " + transparent local scoring", "as_of": (str(frame["更新时间"].max()) if market == "us" and "更新时间" in frame else str(date.today())),
         "ranking": ranked, "market_state": (panorama or {}).get("market_state"),
         "market_context": market_context_summary(panorama),
         "unavailable": list((panorama or {}).get("unavailable", [])),
@@ -976,6 +1019,7 @@ def candidate_ranking_response(limit: int, panorama=None, market: str = "a"):
 
 
 def history(symbol: str, start: str = "", end: str = "", adjust: str = "qfq", market: str = "a") -> pd.DataFrame:
+    if normalize_market(market) == "us": return us.history(symbol, start, end, adjust)
     market = normalize_market(market)
     symbol = normalize_symbol(symbol, market)
     today = date.today()
@@ -993,8 +1037,11 @@ def history(symbol: str, start: str = "", end: str = "", adjust: str = "qfq", ma
         except Exception as primary_error:
             if symbol.startswith(("4", "8")):
                 raise primary_error
-            exchange_symbol = ("sh" if symbol.startswith(("5", "6", "9")) else "sz") + symbol
-            frame = ak.stock_zh_a_daily(symbol=exchange_symbol, start_date=start_date, end_date=end_date, adjust=adjust or "")
+            exchange_symbol = ("bj" if symbol.startswith("92") else "sh" if symbol.startswith(("5", "6", "9")) else "sz") + symbol
+            # Sina's native JS runtime can abort the process when initialized by
+            # several holding-chart requests concurrently. Keep this fallback serial.
+            with HISTORY_SINA_LOCK:
+                frame = ak.stock_zh_a_daily(symbol=exchange_symbol, start_date=start_date, end_date=end_date, adjust=adjust or "")
             source = "AKShare stock_zh_a_daily (Sina fallback)"
     if frame.empty:
         raise ValueError("未返回历史行情；请确认代码、日期区间和数据源状态。")
@@ -1024,7 +1071,7 @@ def bars_response(symbol: str, start: str, end: str, adjust: str, market: str = 
         bars.append(clean_record(row))
     return {
         "symbol": symbol, "market": market, "source": frame.attrs.get("source", "AKShare history"), "as_of": bars[-1]["date"],
-        "adjust": adjust or "none", "bars": bars,
+        "adjust": frame.attrs.get("adjustment", adjust or "none"), "currency": "USD" if market == "us" else "HKD" if market == "hk" else "CNY", "bars": bars,
     }
 
 
@@ -1058,6 +1105,7 @@ def indicators_response(symbol: str, lookback: int, adjust: str, market: str = "
 
 
 def spot_row(symbol: str, market: str = "a") -> dict:
+    if normalize_market(market) == "us": return us.quote(symbol)
     market = normalize_market(market)
     symbol = normalize_symbol(symbol, market)
     if market == "hk":
@@ -1115,6 +1163,8 @@ def quote_response(symbol: str, market: str = "a"):
     source = row.pop("_source", "AKShare spot")
     return {
         "symbol": symbol, "market": market, "source": source, "as_of": str(row.get("更新时间") or date.today()),
+        "currency": "USD" if market == "us" else "HKD" if market == "hk" else "CNY",
+        "timezone": "America/New_York" if market == "us" else "Asia/Shanghai",
         "note": "数据源快照，不是券商逐笔实时行情。", "quote": row,
     }
 
@@ -1133,6 +1183,7 @@ def valuation_response(symbol: str, market: str = "a"):
 
 
 def fundamentals_response(symbol: str, market: str = "a"):
+    if normalize_market(market) == "us": return us.fundamentals(symbol)
     market = normalize_market(market)
     symbol = normalize_symbol(symbol, market)
     if market == "hk":
@@ -1158,6 +1209,7 @@ def fundamentals_response(symbol: str, market: str = "a"):
 
 
 def announcements_response(symbol: str, start: str, end: str, limit: int, market: str = "a"):
+    if normalize_market(market) == "us": return us.announcements(symbol, start, end, limit)
     market = normalize_market(market)
     symbol = normalize_symbol(symbol, market)
     if market == "hk":
@@ -1193,6 +1245,9 @@ def analyze_stock_response(symbol: str, announcement_days: int = 180, panorama=N
         "symbol": symbol, "market": market, "enterprises": [],
         "unavailable": ["港股同行比较尚未接入；不会将 A 股行业成分或巨潮公告套用于港股。"],
     })
+
+    if market == "us" and deep_research:
+        related_enterprises = attempt("美股同行", lambda: us.peers(symbol, 30, 3))
 
     quote_row = quote.get("quote", {})
     if quote_row:
@@ -1392,7 +1447,7 @@ def build_intraday_review(morning: dict, afternoon: dict, market: str) -> dict:
         else:
             lesson = "本次变化不足以确认或否定日报1；保留原权重并继续收集可验证样本。"
         record = {
-            **baseline, "date": afternoon.get("as_of", str(date.today())), "market": market,
+            **baseline, "date": afternoon.get("as_of", str((us.today() if market == 'us' else date.today()))), "market": market,
             "afternoon_price": current_price, "return_from_morning_pct": return_pct, "daily_change_pct": daily_change,
             "alignment": alignment, "market_score_change": round(market_delta, 2) if market_delta is not None else None,
             "reason_analysis": reasons, "reflection": lesson, "unavailable": unavailable,
@@ -1525,18 +1580,140 @@ def horizon_recommendations(candidates: dict, market: str, panorama: dict):
             "horizons": result, "note": "仅为有限候选池的研究观察名单；证据不足时留空，不代表全市场最优或个性化买入建议。"}
 
 
+@lru_cache(maxsize=256)
+def portfolio_history_data(market: str, symbol: str, end_day: str, years: int = 1):
+    if years not in (1, 5):
+        raise ValueError("历史范围仅支持1年或5年。")
+    start = (pd.Timestamp(end_day) - pd.Timedelta(days=365 * years + 55)).date().isoformat()
+    frame = history(symbol, start, end_day, "qfq", market)
+    source = frame.attrs.get("source", "AKShare history")
+    adjustment = frame.attrs.get("adjustment", "split_dividend" if market == "us" else "qfq")
+    frame = frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame[frame.date.notna() & (frame.date <= pd.Timestamp(end_day)) & np.isfinite(frame.close) & (frame.close > 0)]
+    frame = frame.sort_values("date").drop_duplicates("date", keep="last").tail(260 * years)
+    points = []
+    for row in frame.to_dict("records"):
+        volume = safe_float(row.get("volume"))
+        ohlc = {key: safe_float(row.get(key)) for key in ("open", "high", "low")}
+        ohlc = {key: value if value is not None and value > 0 else None for key, value in ohlc.items()}
+        if all(value is not None for value in ohlc.values()) and not (ohlc["low"] <= min(ohlc["open"], row["close"]) <= max(ohlc["open"], row["close"]) <= ohlc["high"]):
+            ohlc = dict.fromkeys(ohlc)
+        points.append({"date": iso_date(row["date"]), **ohlc, "close": float(row["close"]),
+                       "volume": volume if volume is not None and volume >= 0 else None})
+    if len(points) < 2:
+        raise ValueError("已完成交易日的有效历史行情不足两条，暂不能绘制走势。")
+    return {"available": True, "symbol": symbol, "market": market, "points": points,
+            "history_from": start, "history_through": end_day, "history_years": years,
+            "as_of": points[-1]["date"], "source": source, "adjust": adjustment,
+            "currency": {"a": "CNY", "hk": "HKD", "us": "USD"}[market],
+            "volume_unit": frame.attrs.get("volume_unit", "股" if market == "us" or "stock_zh_a_daily" in source else "原始单位"),
+            "note": "仅展示已完成交易日的复权收盘价；最新行情与历史走势的价格口径可能不同。"}
+
+
+def portfolio_history_response(market: str, symbol: str, years: int = 1):
+    market = normalize_market(market)
+    symbol = normalize_symbol(symbol, market)
+    if years not in (1, 5):
+        raise ValueError("历史范围仅支持1年或5年。")
+    if not any((row.get("market", "a"), row["symbol"]) == (market, symbol) for row in portfolio_response()["holdings"]):
+        raise ValueError("该股票不在当前市场的已保存持仓中。")
+    return stock_history_response(market, symbol, years)
+
+
+def stock_history_response(market: str, symbol: str, years: int = 1):
+    """Read-only price history for report stocks, independently of saved holdings."""
+    market = normalize_market(market)
+    pattern = r"\d{6}" if market == "a" else r"\d{1,5}" if market == "hk" else r"[A-Z][A-Z0-9]{0,9}(?:[.-][A-Z0-9]{1,3})?"
+    if not re.fullmatch(pattern, str(symbol)) or (market != "us" and int(symbol) == 0):
+        raise ValueError("市场与股票代码无效。")
+    symbol = normalize_symbol(symbol, market)
+    if years not in (1, 5):
+        raise ValueError("历史范围仅支持1年或5年。")
+    zone = ZoneInfo("America/New_York" if market == "us" else "Asia/Hong_Kong" if market == "hk" else "Asia/Shanghai")
+    end_day = (datetime.now(zone).date() - timedelta(days=1)).isoformat()
+    return portfolio_history_data(market, symbol, end_day, years) if years != 1 else portfolio_history_data(market, symbol, end_day)
+
+
+def portfolio_quote_batch(holdings: list[dict], market: str) -> dict:
+    if not holdings or market == "us":
+        return {}
+    tokens = {}
+    for row in holdings:
+        symbol = row["symbol"]
+        prefix = "hk" if market == "hk" else "bj" if symbol.startswith(("4", "8", "92")) else "sh" if symbol.startswith(("5", "6", "9")) else "sz"
+        tokens[prefix + symbol] = symbol
+    response = requests.get("https://qt.gtimg.cn/q=" + ",".join(tokens), timeout=(5, 12))
+    response.raise_for_status()
+    response.encoding = "gbk"
+    quotes = {}
+    zone = ZoneInfo("Asia/Hong_Kong" if market == "hk" else "Asia/Shanghai")
+    for statement in response.text.split(";"):
+        if '=\"' not in statement:
+            continue
+        key, body = statement.strip().split('=\"', 1)
+        symbol = tokens.get(key.removeprefix("v_"))
+        fields = body.rsplit('\"', 1)[0].split("~")
+        if not symbol or len(fields) <= 32 or fields[2] != symbol:
+            continue
+        price, previous, change = (safe_float(fields[i]) for i in (3, 4, 32))
+        if price is None or price <= 0 or previous is None or previous <= 0 or change is None or abs((price / previous - 1) * 100 - change) > .1:
+            continue
+        raw_time = fields[30]
+        quote_time = pd.to_datetime(raw_time, format="%Y%m%d%H%M%S", errors="coerce") if raw_time.isdigit() else pd.to_datetime(raw_time, errors="coerce")
+        if pd.isna(quote_time):
+            continue
+        quotes[symbol] = {"symbol": symbol, "price": price, "change_pct": change,
+                          "as_of": quote_time.to_pydatetime().replace(tzinfo=zone).isoformat(),
+                          "source": "Tencent quote snapshot (qt.gtimg.cn)"}
+    return quotes
+
+
+def portfolio_quotes_response(market: str = "a", holdings=None):
+    market = normalize_market(market)
+    if holdings is None:
+        holdings = [row for row in portfolio_response()["holdings"] if row.get("market", "a") == market]
+    try:
+        batch = portfolio_quote_batch(holdings, market)
+    except Exception:
+        batch = {}
+
+    def load(holding):
+        symbol = holding["symbol"]
+        if symbol in batch:
+            return batch[symbol]
+        try:
+            snapshot = quote_response(symbol, market)
+            quote = snapshot.get("quote", {})
+            return {"symbol": symbol, "price": report_item_price(snapshot),
+                    "change_pct": safe_float(first_value(quote, "涨跌幅", "zdf")),
+                    "as_of": snapshot.get("as_of"), "source": snapshot.get("source")}
+        except Exception as exc:
+            return {"symbol": symbol, "price": None, "error": "；".join(readable_issues([str(exc)]))}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        quotes = list(executor.map(load, holdings))
+    return {"market": market, "currency": {"a": "CNY", "hk": "HKD", "us": "USD"}[market], "quotes": quotes}
+
+
 def portfolio_analysis_response(market: str = "a", strategy: str = "", checkpoint_id: str = "", parameters=None):
     from portfolio_research import strategy_review, build_position_summary
     market = normalize_market(market)
     from model_checkpoints import resolve_selection
     from factor_lab import load_settings, STORE
-    if not strategy:
-        settings = load_settings()
-        strategy, checkpoint_id = settings["strategy"], checkpoint_id or settings.get("checkpoint_id", "")
-    strategy, checkpoint_id, _ = resolve_selection(strategy, checkpoint_id, STORE)
     holdings = [item for item in portfolio_response()["holdings"] if item.get("market", "a") == market]
     if not holdings:
         return {"market": market, "available": False, "holdings": [], "note": "未保存该市场持仓，无法分析。"}
+    if not strategy and market == "us": strategy = "momentum"
+    if not strategy:
+        settings = load_settings()
+        strategy, checkpoint_id = settings["strategy"], checkpoint_id or settings.get("checkpoint_id", "")
+    if market == "us":
+        strategy = strategy or "momentum"
+        if "@" in strategy: strategy, checkpoint_id = strategy.split("@", 1)
+    else:
+        strategy, checkpoint_id, _ = resolve_selection(strategy, checkpoint_id, STORE)
     try:
         panorama = market_panorama_response(market)
     except Exception as error:
@@ -1600,10 +1777,13 @@ def daily_digest_markdown(panorama: dict, candidates: dict, weekly: dict, warnin
 def daily_report_response(candidate_limit: int = 5, market: str = "a", session: str = "morning"):
     market = normalize_market(market)
     session = normalize_report_session(session)
+    local_time = datetime.now(ZoneInfo("America/New_York" if market == "us" else "Asia/Shanghai"))
+    report_day = str(local_time.date())
+    manual_id = f"{local_time:%Y-%m-%d}-{market}-manual-{local_time:%H%M%S}" if session == "manual" else None
     calendar = trading_day_response(market=market)
     if not calendar["is_trading_day"]:
         return {
-            "as_of": str(date.today()), "market": market, "session": session, "is_trading_day": False, "has_holdings": False,
+            "as_of": report_day, "market": market, "session": session, "is_trading_day": False, "has_holdings": False,
             "empty_reason": "non_trading_day", "markdown": "", "source": calendar["source"],
             "note": "今日不是交易日，不生成日报。",
         }
@@ -1621,13 +1801,13 @@ def daily_report_response(candidate_limit: int = 5, market: str = "a", session: 
         global_markets = {"indices": [], "source": "AKShare index_global_spot_em"}
         report_warnings.append(f"全球指数不可用：{exc}")
     try:
-        sectors = sector_focus_response()
+        sectors = {"boards": [], "source": "US sectors not inferred from A-share themes", "note": "美股不使用A股概念板块。"} if market == "us" else sector_focus_response()
     except Exception as exc:
         sectors = {"boards": [], "missing_themes": ["半导体", "存储", "光通信"], "source": "AKShare stock_board_concept_name_em"}
         report_warnings.append(f"主题板块不可用：{exc}")
     try:
-        weekly = market_events_response(7, 20)
-        monthly = market_events_response(30, 40)
+        weekly = market_events_response(7, 20, market)
+        monthly = market_events_response(30, 40, market)
     except Exception as exc:
         report_warnings.append(f"市场事件不可用：{exc}")
         weekly = {"events": []}
@@ -1642,11 +1822,12 @@ def daily_report_response(candidate_limit: int = 5, market: str = "a", session: 
     except Exception as exc:
         horizons = {"horizons": {key: [] for key in ("long", "short", "ultra_short")}, "pool_size": 0}
         report_warnings.append(f"分周期分析不可用：{exc}")
-    report_number = "日报1" if session == "morning" else "日报2"
-    timing = "09:20开始汇总，目标于09:30开盘前送达" if session == "morning" else "14:30开始汇总，收盘前进行盘中复盘"
-    phase_title = "开盘前" if session == "morning" else "收盘前"
+    report_number = "手动报告" if session == "manual" else "日报1" if session == "morning" else "日报2"
+    timing = f"{local_time:%H:%M:%S}手动生成，{'纽约' if market == 'us' else '北京'}时间" if session == "manual" else "09:20开始汇总，目标于09:30开盘前送达" if session == "morning" else "14:30开始汇总，收盘前进行盘中复盘"
+    if market == "us" and session != "manual": timing = "纽约时间09:20（盘前，行情可能为上个交易日）" if session == "morning" else "纽约时间15:30（提前收市日按实际收市状态解释）"
+    phase_title = "即时" if session == "manual" else "开盘前" if session == "morning" else "收盘前"
     lines = [
-        f"# {market_label(market)}{report_number}｜{phase_title}研究简报", "", f"数据日期：{date.today()}（{timing}）", "",
+        f"# {market_label(market)}{report_number}｜{phase_title}研究简报", "", f"数据日期：{report_day}（{timing}）", "",
         *daily_digest_markdown(panorama, candidates, weekly, report_warnings),
         "## 市场全景", "",
         f"- 市场状态：{panorama.get('market_state', {}).get('summary', '数据不足')}",
@@ -1700,15 +1881,18 @@ def daily_report_response(candidate_limit: int = 5, market: str = "a", session: 
         for item in historical[:5]:
             lines.append(f"- {item.get('date')} {item.get('symbol')}：{item.get('reflection')}（一致性：{item.get('alignment')}）")
     payload = {
-        "as_of": str(date.today()), "market": market, "session": session, "report_number": report_number,
+        "as_of": report_day, "market": market, "session": session, "report_number": report_number,
         "is_trading_day": True, "has_holdings": False, "market_panorama": panorama, "portfolio": [],
         "global_markets": global_markets, "sectors": sectors, "horizon_recommendations": horizons,
         "weekly_events": weekly, "monthly_events": monthly, "candidates": candidates,
         "historical_reflections": historical, "warnings": report_warnings,
         "note": "持仓分析仅在日报网页点击持仓分析按钮后按需生成，不写入定时日报。",
     }
+    if manual_id:
+        payload["report_id"] = manual_id
+        payload["generated_at"] = local_time.isoformat(timespec="seconds")
     if session == "afternoon":
-        morning = load_json_object(snapshot_path(str(date.today()), market, "morning"), {})
+        morning = load_json_object(snapshot_path(report_day, market, "morning"), {})
         review = build_intraday_review(morning, payload, market)
         payload["intraday_review"] = review
         lines.extend(intraday_review_markdown(review))
@@ -1734,17 +1918,26 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query)
+        parsed, query = urlparse(self.path), parse_qs(urlparse(self.path).query, keep_blank_values=True)
         value = lambda key, default="": query.get(key, [default])[0]
         try:
             if parsed.path == "/health":
                 return self.send_json(200, {"status": "ok", "bind": f"{HOST}:{PORT}", "mode": "research-only; local portfolio storage"})
             if parsed.path == "/v1/portfolio":
                 return self.send_json(200, portfolio_response())
+            if parsed.path == "/v1/portfolio-quotes":
+                return self.send_json(200, portfolio_quotes_response(value("market", "a")))
+            if parsed.path == "/v1/portfolio-history":
+                return self.send_json(200, portfolio_history_response(value("market", "a"), value("symbol"), int(value("years", "1"))))
+            if parsed.path == "/v1/stock-history":
+                return self.send_json(200, stock_history_response(value("market", "a"), value("symbol"), int(value("years", "1"))))
             if parsed.path == "/v1/portfolio-analysis":
                 return self.send_json(200, portfolio_analysis_response(value("market", "a"), value("strategy"), value("checkpoint"),
                                                                            json.loads(value("parameters", "null"))))
             if parsed.path == "/v1/strategy-options":
+                if normalize_market(value("market", "a")) == "us":
+                    from us_strategy import options
+                    return self.send_json(200, options())
                 from model_checkpoints import execution_options
                 from factor_lab import load_settings, STORE
                 return self.send_json(200, execution_options(STORE, load_settings()))
@@ -1759,7 +1952,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/market-events":
                 days = min(max(int(value("days", "7")), 1), 90)
                 limit = min(max(int(value("limit", "20")), 1), 100)
-                return self.send_json(200, market_events_response(days, limit))
+                return self.send_json(200, market_events_response(days, limit, value("market", "a")))
             if parsed.path == "/v1/market-movers":
                 limit = min(max(int(value("limit", "20")), 1), 50)
                 return self.send_json(200, market_movers_response(limit, value("market", "a")))
@@ -1783,6 +1976,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/v1/announcements": payload = announcements_response(symbol, value("start"), value("end"), min(max(int(value("limit", "20")), 1), 100), market)
             elif parsed.path == "/v1/valuation": payload = valuation_response(symbol, market)
             elif parsed.path == "/v1/related-enterprises":
+                if market == "us":
+                    return self.send_json(200, us.peers(symbol, int(value("days", "30")), int(value("limit", "3"))))
                 if market != "a":
                     raise ValueError("港股同行比较尚未接入；不会将 A 股行业成分用于港股。")
                 payload = related_enterprises_response(
@@ -1797,8 +1992,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
+            from paper_snapshot import paper_snapshot
             handlers = {"/v1/portfolio": save_portfolio, "/v1/portfolio/resolve": resolve_portfolio, "/v1/portfolio/import": import_portfolio,
-                        "/v1/portfolio/update": update_portfolio_holding, "/v1/portfolio/delete": delete_portfolio_holding}
+                        "/v1/portfolio/update": update_portfolio_holding, "/v1/portfolio/delete": delete_portfolio_holding,
+                        "/v1/paper-snapshot": paper_snapshot}
             if parsed.path not in handlers:
                 return self.send_json(404, {"error": "Unknown endpoint"})
             content_length = int(self.headers.get("Content-Length", "0"))

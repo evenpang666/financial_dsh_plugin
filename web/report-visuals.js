@@ -110,7 +110,7 @@
     target.append(el('p', panorama.method || '规则评分仅反映归档输入，不是涨跌概率。', 'ranking-note'))
   }
   function heatLevel(value) { return number(value) == null ? 'heat-missing' : number(value) === 0 ? 'heat-flat' : `heat-${number(value) > 0 ? 'up' : 'down'}-${Math.min(4, Math.ceil(Math.abs(number(value)) / 5))}` }
-  function renderCandidates(candidates) {
+  function renderCandidates(candidates, market) {
     const target = document.querySelector('#candidateVisual'), rows = candidates?.ranking || []
     if (!rows.length) return empty(target, '本期无可绘制的候选排行。历史纯文字日报请查看正文。')
     const wrap = el('div', null, 'table-wrap heatmap-wrap'), table = el('table', null, 'heatmap')
@@ -118,7 +118,7 @@
     for (const label of ['候选', '1 日', '5 日', '20 日', '方向倾向（买 / 卖）']) header.append(el('th', label))
     head.append(header); const body = el('tbody')
     for (const row of rows) {
-      const tr = el('tr'), name = el('th'); name.scope = 'row'; name.append(el('strong', row.name || row.symbol), el('small', row.symbol)); tr.append(name)
+      const tr = el('tr'), name = el('th'); name.scope = 'row'; name.append(root.ReportStocks ? root.ReportStocks.button(row, market) : el('strong', row.name || row.symbol), el('small', row.symbol)); tr.append(name)
       for (const key of ['pct_change_1d', 'pct_change_5d', 'pct_change_20d']) tr.append(el('td', signed(row[key]), heatLevel(row[key])))
       const tendency = el('td'), buy = number(row.buy_percentage), sell = number(row.sell_percentage)
       tendency.append(el('strong', buy == null || sell == null ? '—' : `${buy}% / ${sell}%`), el('small', row.recommendation || '待核验')); tr.append(tendency); body.append(tr)
@@ -146,8 +146,9 @@
     target.replaceChildren(chips, list)
     document.querySelector('#eventMeta').textContent = `${events.length} 条去重归档线索 · 展示最近 ${Math.min(6, events.length)} 条 · ${view.weekly_events?.source || view.market_panorama?.source || '来源未归档'} · 日期未核验的线索不代表当日新闻`
   }
-  function renderReview(review, session) {
+  function renderReview(review, session, market) {
     const target = document.querySelector('#reviewVisual')
+    if (session === 'manual') return empty(target, '手动报告不参与定时上午／下午日报的盘中复盘。')
     if (session !== 'afternoon') return empty(target, '上午日报提供研究基线；下午日报生成后展示两次快照的对比。')
     if (review?.status !== 'completed') return empty(target, review?.note || '本期未取得复盘快照。')
     if (!review.comparisons?.length) return empty(target, '上午候选池为空，本期没有可比较标的；不计算一致性比例。')
@@ -163,7 +164,7 @@
     const list = el('ul', null, 'review-rows')
     for (const row of rows) {
       const value = number(row.change_pct), item = el('li', null, 'review-row'), identity = el('div', null, 'review-identity')
-      const name = el('div'); name.append(el('strong', row.name || row.symbol), el('small', row.symbol || ''))
+      const name = el('div'); name.append(root.ReportStocks ? root.ReportStocks.button(row, market) : el('strong', row.name || row.symbol), el('small', row.symbol || ''))
       identity.append(name, el('span', labels[row.alignment] || '待核验', `review-status review-status-${row.alignment}`))
       const track = el('div', null, 'review-track'); track.setAttribute('aria-hidden', 'true')
       if (value != null) {
@@ -207,9 +208,9 @@
     archiveLabel = payload.label || payload.id || '日报'
     const view = payload.view || {}
     renderOverview(view, payload); renderBreadth(view.market_panorama?.market_breadth || {})
-    renderScores(view.market_panorama || {}); renderCandidates(view.candidates)
+    renderScores(view.market_panorama || {}); renderCandidates(view.candidates, payload.market || 'a')
     document.querySelector('#eventMeta').textContent = '按归档日期排列；标题与可能影响路径仍需复核原文'
-    renderEvents(view); renderReview(view.intraday_review, payload.session)
+    renderEvents(view); renderReview(view.intraday_review, payload.session, payload.market || 'a')
   }
   const api = {number, signed, breadthParts, scoreData, coverage, heatLevel, eventRows, renderBars, render}
   if (typeof module !== 'undefined' && module.exports) module.exports = api

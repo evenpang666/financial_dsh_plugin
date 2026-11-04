@@ -27,7 +27,7 @@ test('portfolio review tool supports selected strategy, market, timeout and bund
     const query = new URL(requests[2].url).searchParams
     assert.deepEqual(JSON.parse(query.get('parameters')), {threshold: 0.01, top_n: 3})
     await tools.get('get_strategy_checkpoints').execute({})
-    assert.match(requests[3].url, /\/v1\/strategy-options$/)
+    assert.match(requests[3].url, /\/v1\/strategy-options\?market=a$/)
     assert.ok(skills.get('portfolio-daily-review').content.includes('get_portfolio_position_review'))
   } finally { globalThis.fetch = originalFetch }
 })

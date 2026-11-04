@@ -15,6 +15,24 @@ spec.loader.exec_module(report_web)
 
 
 class ReportWebServerTests(unittest.TestCase):
+    def test_holding_backtests_do_not_mix_with_custom_results(self):
+        records = [{"run_id": "holding", "pool": {"id": "portfolio"}}, {"run_id": "custom", "pool": {"id": "custom"}}, {"run_id": "legacy"}]
+        with patch.object(report_web, "backtest_runs", return_value=records):
+            handler = self.handler("/api/backtests?pool=portfolio"); handler.do_GET()
+            self.assertEqual([row["run_id"] for row in handler.send_json.call_args.args[1]["runs"]], ["holding"])
+            handler = self.handler("/api/backtests"); handler.do_GET()
+            self.assertEqual([row["run_id"] for row in handler.send_json.call_args.args[1]["runs"]], ["custom", "legacy"])
+
+    def test_holding_deployment_lookup_does_not_fall_back_to_custom(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(report_web, "PROJECT_ROOT", Path(directory)):
+            target = Path(directory) / "data/bar-deployments"; target.mkdir(parents=True)
+            (target / "latest-us-daily-momentum-custom.json").write_text(json.dumps({"available": True, "pool": {"id": "custom"}}))
+            handler = self.handler("/api/bar-deployment?market=us&timeframe=daily&strategy=momentum&pool=portfolio"); handler.do_GET()
+            self.assertEqual(handler.send_json.call_args.args, (200, {"available": False}))
+            (target / "latest-us-daily-momentum-portfolio.json").write_text(json.dumps({"available": True, "pool": {"id": "portfolio"}}))
+            handler.do_GET()
+            self.assertEqual(handler.send_json.call_args.args[1]["pool"]["id"], "portfolio")
+
     def handler(self, path, headers=None):
         handler = object.__new__(report_web.ReportHandler)
         handler.path = path
@@ -22,6 +40,14 @@ class ReportWebServerTests(unittest.TestCase):
         handler.send_json = Mock()
         handler.send_bytes = Mock()
         return handler
+
+    def test_bar_options_do_not_shadow_shared_strategy_catalog(self):
+        for path in ("/api/bar-strategies?market=hk&timeframe=weekly", "/api/research-options", "/api/backtests"):
+            with self.subTest(path=path):
+                handler = self.handler(path)
+                handler.do_GET()
+                self.assertEqual(handler.send_json.call_args.args[0], 200)
+        self.assertEqual(handler.send_json.call_args.args[1]["strategies"], report_web.STRATEGIES)
 
     def test_portfolio_strategy_menu_reads_only_public_strategy_settings(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(report_web, "PROJECT_ROOT", Path(directory)):
@@ -158,7 +184,7 @@ class ReportWebServerTests(unittest.TestCase):
             path.write_text(json.dumps({"status": "running", "job_id": "a"*32}))
             with patch.object(report_web.subprocess, "run", side_effect=report_web.subprocess.TimeoutExpired("rank", 1200)), patch.object(report_web, "publish_ranking_event") as publish:
                 report_web.run_ranking_worker("a"*32, "momentum")
-            self.assertEqual(json.loads(path.read_text())["status"], "failed")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "failed")
             self.assertEqual(report_web.ACTIVE_RANKING_JOB, "")
             publish.assert_not_called()
 
@@ -178,8 +204,10 @@ class ReportWebServerTests(unittest.TestCase):
                 handler.send_json.assert_not_called()
 
     def test_daily_page_and_script_do_not_load_backtests(self):
-        html = (report_web.WEB_ROOT / "index.html").read_text()
-        script = (report_web.WEB_ROOT / "app.js").read_text()
+        html = (report_web.WEB_ROOT / "index.html").read_text(encoding="utf-8")
+        script = (report_web.WEB_ROOT / "app.js").read_text(encoding="utf-8")
+        self.assertIn('生成手动报告', html)
+        self.assertNotIn('name="session"', html)
         self.assertIn('href="/backtests"', html)
         self.assertNotIn('id="backtestContent"', html)
         self.assertNotIn("/api/backtests", script)
@@ -220,7 +248,26 @@ class ReportWebServerTests(unittest.TestCase):
             reports = report_web.list_reports()
             self.assertEqual([item["session"] for item in reports], ["afternoon", "morning"])
             self.assertEqual(reports[0]["id"], "2026-09-15-a-afternoon")
-            self.assertIn("日报2", reports[0]["label"])
+            self.assertIn("下午日报", reports[0]["label"])
+            self.assertIn("触发方式未记录", reports[0]["label"])
+
+    def test_scheduled_and_manual_reports_have_distinct_labels_and_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports, snapshots = root / "reports", root / "snapshots"
+            reports.mkdir(); snapshots.mkdir()
+            scheduled = "2026-11-02-a-scheduled-morning"
+            manual = "2026-11-02-a-manual-114530"
+            (reports / f"{scheduled}.md").write_text("# 上午日报", encoding="utf-8")
+            (reports / f"{manual}.md").write_text("# 手动报告", encoding="utf-8")
+            (snapshots / "2026-11-02-a-morning.json").write_text(json.dumps({"warnings": ["scheduled"]}), encoding="utf-8")
+            (snapshots / f"{manual}.json").write_text(json.dumps({"warnings": ["manual"]}), encoding="utf-8")
+            with patch.object(report_web, "REPORT_DIR", reports), patch.object(report_web, "SNAPSHOT_DIR", snapshots):
+                listed = {row["id"]: row for row in report_web.list_reports()}
+                self.assertIn("定时上午日报", listed[scheduled]["label"])
+                self.assertIn("11:45:30 手动报告", listed[manual]["label"])
+                self.assertEqual(report_web.read_report(f"{scheduled}.md")["view"]["warnings"], ["scheduled"])
+                self.assertEqual(report_web.read_report(f"{manual}.md")["view"]["warnings"], ["manual"])
 
     def test_rejects_invalid_report_path(self):
         with self.assertRaises(ValueError):
@@ -272,6 +319,19 @@ class ReportWebServerTests(unittest.TestCase):
                                                            "kind": "point_in_time_backtest",
                                                            "slot": "10:30", "stats": {"total_return": 0.2}}))
             self.assertEqual(report_web.latest_backtest()["slot"], "10:30")
+
+    def test_version_three_bar_backtest_is_visible_without_accepting_other_new_schemas(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(report_web, "BACKTEST_DIR", Path(directory)):
+            bar = Path(directory) / "a-daily-xgboost-test"; bar.mkdir()
+            summary = {"schema_version": 3, "kind": "bar_backtest", "slot": "日线收盘",
+                       "stats": {"initial_cash": 100000, "total_return": -.015},
+                       "run_id": bar.name, "strategy_id": "xgboost"}
+            (bar / "summary.json").write_text(json.dumps(summary))
+            self.assertTrue(report_web.read_backtest(bar.name)["available"])
+            self.assertEqual(report_web.backtest_runs()[0]["run_id"], bar.name)
+            summary["kind"] = "point_in_time_backtest"
+            (bar / "summary.json").write_text(json.dumps(summary))
+            self.assertFalse(report_web.read_backtest(bar.name)["available"])
 
     def test_structured_report_view_excludes_portfolio_data(self):
         with tempfile.TemporaryDirectory() as directory:

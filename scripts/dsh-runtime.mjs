@@ -38,7 +38,7 @@ async function cliPath(candidate, shimEntry) {
 
 async function onPath(name, entry, env) {
   for (const dir of pathDirs(env)) {
-    for (const suffix of process.platform === 'win32' ? ['.cmd', ''] : ['']) {
+    for (const suffix of process.platform === 'win32' ? ['.cmd', '.exe', ''] : ['']) {
       const found = await cliPath(join(dir, name + suffix), entry);
       if (found) return found;
     }
@@ -131,7 +131,12 @@ async function profileTools(env) {
 export async function ensureEnvironment({ root = projectRoot, env = process.env, locateDsh = findDsh, locateNpm = findNpm,
   inspect = versionOf, install = installTool, upgrade = ensureDshVersion, locatePnpm = env => onPath('pnpm', 'pnpm/bin/pnpm.cjs', env), nodeVersion = process.versions.node, log = console.log } = {}) {
   if (compareVersions(nodeVersion, versions.nodeMinimum) < 0) throw new Error(`需要 Node.js ${versions.nodeMinimum}+，请运行 start.sh / start.bat 自动升级项目运行环境。`);
-  env = { ...env, PATH: [dirname(process.execPath), ...pathDirs(env)].join(delimiter), npm_config_update_notifier: 'false', PNPM_DISABLE_SELF_UPDATE_CHECK: '1' };
+  const inheritedPath = pathDirs(env);
+  env = { ...env };
+  // Windows treats these keys as one variable; child processes must receive one
+  // canonical value rather than a stale Path beside our prepared PATH.
+  if (process.platform === 'win32') for (const key of Object.keys(env)) if (key.toLowerCase() === 'path') delete env[key];
+  env = { ...env, PATH: [dirname(process.execPath), ...inheritedPath].join(delimiter), npm_config_update_notifier: 'false', PNPM_DISABLE_SELF_UPDATE_CHECK: '1' };
   log(`[环境] 复用 Node.js ${nodeVersion}；检查 npm、DSH 和 pnpm 最低版本`);
   let npm = await locateNpm(env), npmVersion = await inspect(npm, env);
   if (compareVersions(npmVersion, versions.npm) < 0) {
@@ -182,7 +187,9 @@ export async function ensureEnvironment({ root = projectRoot, env = process.env,
     if (compareVersions(pnpmVersion, minimum) < 0) throw new Error('pnpm 升级后的版本校验失败。');
   }
   // pnpm must be visible to DSH's child process without changing the global PATH.
-  const pnpmBin = basename(pnpm).startsWith('pnpm.') ? resolve(dirname(pnpm), '../../.bin') : dirname(pnpm);
+  // pnpm 12 can publish a native pnpm.exe directly in its package directory.
+  // Only JavaScript entries need the node_modules/.bin command shim.
+  const pnpmBin = /\.[cm]?js$/i.test(pnpm) ? resolve(dirname(pnpm), '../../.bin') : dirname(pnpm);
   env.PATH = [pnpmBin, ...pathDirs(env)].join(delimiter);
   if (metadata.storeDir) {
     const store = /^v\d+$/.test(basename(metadata.storeDir)) ? dirname(metadata.storeDir) : metadata.storeDir;

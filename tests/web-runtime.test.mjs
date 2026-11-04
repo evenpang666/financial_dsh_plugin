@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp, mkdir, writeFile, readFile, rm} from 'node:fs/promises';
-import {join, resolve, dirname} from 'node:path';
+import {mkdtemp, mkdir, writeFile, readFile, rm, copyFile} from 'node:fs/promises';
+import {join, resolve, dirname, delimiter} from 'node:path';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {ensureEnvironment, versions} from '../scripts/dsh-runtime.mjs';
 import {ensurePython, installManagedPython} from '../scripts/python-runtime.mjs';
 import {pythonPath} from '../lib/workers.mjs';
@@ -26,6 +28,30 @@ async function environment(t, {npmVersion='11.19.0',pnpmVersion='13.0.0',nodeVer
 test('higher Node/npm/pnpm and supported DSH are reused without installation',async t=>{
   const {installed,options}=await environment(t);const result=await ensureEnvironment(options);
   assert.equal(result.npm,'system-npm');assert.equal(result.pnpm,'system-pnpm');assert.equal(result.version,'0.2.0');assert.equal(installed.length,0);
+});
+
+test('native pnpm uses its executable directory, while JavaScript pnpm uses its command shim', async t => {
+  for (const entry of ['pnpm.exe', 'pnpm', 'bin/pnpm.cjs']) {
+    const {root, options} = await environment(t);
+    const pnpm = join(root, 'node_modules/pnpm', entry), inspect = options.inspect;
+    options.locatePnpm = async () => pnpm;
+    options.inspect = cli => cli === pnpm ? '12.3.4' : inspect(cli);
+    const runtime = await ensureEnvironment(options);
+    assert.equal(runtime.env.PATH.split(delimiter)[0], entry.endsWith('.cjs') ? join(root, 'node_modules/.bin') : dirname(pnpm));
+  }
+});
+
+test('Windows child commands find native pnpm in a path with spaces and no global pnpm', {skip: process.platform !== 'win32'}, async t => {
+  const {root, options} = await environment(t), pnpm = join(root, 'native package with spaces/node_modules/pnpm/pnpm.exe');
+  await mkdir(dirname(pnpm), {recursive: true}); await copyFile(process.execPath, pnpm);
+  const inspect = options.inspect;
+  options.env = {SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec, PATHEXT: '.COM;.EXE;.BAT;.CMD', Path: 'unavailable', DSH_HOME: root};
+  options.locatePnpm = async () => pnpm;
+  options.inspect = cli => cli === pnpm ? '12.3.4' : inspect(cli);
+  const {env} = await ensureEnvironment(options);
+  assert.deepEqual(Object.keys(env).filter(key => key.toLowerCase() === 'path'), ['PATH']);
+  const {stdout} = await promisify(execFile)(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'pnpm -p 6*7'], {env, windowsHide: true});
+  assert.equal(stdout.trim(), '42');
 });
 test('low npm and pnpm are upgraded only in the project and rechecked',async t=>{
   const {root,installed,options}=await environment(t,{npmVersion:'9.0.0',pnpmVersion:'10.0.0',required:'12.4.2'});

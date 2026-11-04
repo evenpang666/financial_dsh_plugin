@@ -97,6 +97,14 @@ section[id] { scroll-margin-top:4.5rem; }
 .research-tools { margin:1.5rem 0; }
 .research-tools > summary { cursor:pointer; font-weight:600; color:#475467; padding:1rem; background:#e8edf3; border-radius:.8rem; }
 .research-tools[open] > summary { margin-bottom:1rem; }
+.model-list .model-actions { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:auto; }
+.model-list .model-actions button { margin-top:.5rem; }
+.model-list .model-remove { background:#f3e6ec; color:#9e4b65; }
+.model-list .model-remove:hover { background:#ead5df; }
+.model-list details { width:100%; }
+.model-list details summary { color:var(--blue-deep); cursor:pointer; font-size:.75rem; }
+.model-list details p { margin:.4rem 0 0; overflow-wrap:anywhere; }
+.model-manage-status:not(:empty) { color:var(--blue-deep); font-size:.8rem; }
 button:disabled { cursor:default; opacity:.6; }
 @media (max-width:760px) {
   .intro { padding-top:2.5rem; }.daily-overview { padding:1.4rem; border-radius:1.3rem; }

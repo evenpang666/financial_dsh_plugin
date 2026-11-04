@@ -9,15 +9,15 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CHROME = shutil.which('google-chrome') or shutil.which('chromium')
+CHROME = shutil.which('google-chrome') or shutil.which('chromium') or next((str(path) for path in (Path('C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'), Path('C:/Program Files/Microsoft/Edge/Application/msedge.exe')) if path.exists()), None)
 
 
 @unittest.skipUnless(CHROME and os.getenv('FINANCE_BROWSER_TESTS') == '1', 'Set FINANCE_BROWSER_TESTS=1 to run headless browser checks')
 class ReportLiveUpdateTests(unittest.TestCase):
-    def test_external_deployment_and_pending_portfolio_survive_report_updates(self):
-        html = (ROOT/'web/index.html').read_text()
-        html = html.replace('<link rel="stylesheet" href="/styles.css">', '<style>'+(ROOT/'web/styles.css').read_text()+'</style>')
-        html = html.replace('<script src="/report-visuals.js" defer></script>', '<script>'+(ROOT/'web/report-visuals.js').read_text()+'</script>')
+    def test_external_deployment_survives_report_updates(self):
+        html = (ROOT/'web/index.html').read_text(encoding='utf-8')
+        html = html.replace('<link rel="stylesheet" href="/styles.css">', '<style>'+(ROOT/'web/styles.css').read_text(encoding='utf-8')+'</style>')
+        html = html.replace('<script src="/report-visuals.js" defer></script>', '<script>'+(ROOT/'web/report-visuals.js').read_text(encoding='utf-8')+'</script>')
         setup = r'''
 window.EventSource = class {
   constructor(){window.events=this;this.listeners={};}
@@ -39,7 +39,7 @@ window.fetch=async(url,options={})=>{
  if(url==='/api/ranking/strategies'&&window.failMenuOnce){window.failMenuOnce=false;throw Error('transient metadata failure');}
  if(url==='/api/reports')payload={reports:[window.report]};
  else if(url.startsWith('/api/reports/'))payload=window.report;
- else if(url==='/api/ranking/strategies'||url==='/api/portfolio-strategies')payload=window.menu;
+ else if(url==='/api/ranking/strategies'||url.startsWith('/api/portfolio-strategies?'))payload=window.menu;
  else if(url==='/api/ranking/update')payload=window.latestNotice;
  else if(url==='/api/ranking/active')payload=window.activeJob||{available:false};
  else if(url.startsWith('/api/ranking/latest?'))payload=window.results[new URL(url,'http://local').searchParams.get('strategy')]||{available:false};
@@ -56,22 +56,10 @@ window.fetch=async(url,options={})=>{
  try{
   await pause();document.querySelector('#researchTools').open=true;
   check(!calls.some(call=>call.url==='/api/portfolio-analysis'),'initial page read private holdings');
-  const button=document.querySelector('#portfolioButton');button.click();
-  button.dispatchEvent(new MouseEvent('click',{bubbles:true}));await pause();
-  check(calls.filter(call=>call.url==='/api/portfolio-analysis').length===1,'duplicate portfolio request');
+  check(document.querySelector('a[href="/portfolio"]'),'holding page link is missing');
   window.report={...window.report,id:'2026-10-13-a-afternoon'};
   events.emit('report',{id:window.report.id});await pause();
-  check(displayedReportId===window.report.id,'report did not change while analysis pending');
-  finishPortfolio({available:true,market:'a',as_of:'2026-10-13T10:30:00+08:00',note:'已完成样例分析',holdings:[{holding:{symbol:'600001'},analysis:{name:'测试持仓',short_term:{evidence:['测试证据']}},strategy:'测试研究结果'}],position_summary:{rows:[{symbol:'600001',name:'测试持仓',suggestion1:{weight_pct:20},suggestion2:{weight_pct:10},suggestion3:{weight_pct:15}}],cash_reserve_pct:{suggestion1:80,suggestion2:90,suggestion3:85},stock_allocation_total_pct:{suggestion1:20,suggestion2:10,suggestion3:15}}});
-  await pause();
-  check(portfolioContent.textContent.includes('测试持仓')&&portfolioContent.textContent.includes('15.00%'),'analysis result was discarded on report change');
-  check(!button.disabled,'portfolio button stayed disabled');
-  showReport({...window.report,id:'2026-10-12-a-afternoon'});
-  check(portfolioContent.textContent.includes('测试持仓'),'same market history cleared live analysis');
-  showReport({...window.report,id:'2026-10-13-hk-afternoon',market:'hk'});
-  check(!portfolioContent.textContent.includes('测试持仓'),'A holdings leaked into HK section');
-  showReport(window.report);
-  check(portfolioContent.textContent.includes('测试持仓'),'authorized A analysis was not restored');
+  check(displayedReportId===window.report.id,'report did not change after publication');
   const selection='elastic_net@test-checkpoint';
   window.results[selection]=marketResult(selection,'external-model-result');
   events.emit('ranking',{type:'ranking',scope:'full_market',id:'external-model-result',selection_id:selection,strategy_name:'Elastic Net'});await pause();
@@ -101,17 +89,19 @@ window.fetch=async(url,options={})=>{
   window.jobComplete=true;await pollRankingJob();
   check(!rankingJob&&!rankMarketButton.disabled&&rankingContent.textContent.includes('retry-event-result'),'reattached result not rendered');
   check(!calls.some(call=>call.url==='/api/ranking/start'),'reattach restarted computation');
-  check(calls.filter(call=>call.url==='/api/portfolio-analysis').length===1,'updates reread holdings');
+  check(!calls.some(call=>call.url==='/api/portfolio-analysis'),'updates read private holdings');
   check(document.documentElement.scrollWidth<=innerWidth,'page overflow');
   document.body.dataset.liveUpdateCheck='passed';
  }catch(error){document.body.dataset.liveUpdateCheck=error.message;}
 })();
 '''
-        html=html.replace('<script src="/app.js" defer></script>','<script>'+setup+(ROOT/'web/app.js').read_text()+checks+'</script>')
+        html=html.replace('<script src="/app.js" defer></script>','<script>'+setup+(ROOT/'web/report-stocks.js').read_text(encoding='utf-8')+(ROOT/'web/app.js').read_text(encoding='utf-8')+checks+'</script>')
+        html=re.sub(r'<link rel="stylesheet" href="/([^"]+)">', lambda match: '<style>'+(ROOT/'web'/match.group(1)).read_text(encoding='utf-8')+'</style>', html)
+        html=re.sub(r'<script src="/[^"]+"[^>]*></script>', '', html)
         for width, height in ((1440,900),(390,844)):
             with self.subTest(width=width), tempfile.TemporaryDirectory(prefix='akagent-live-update-') as folder:
-                fixture=Path(folder)/'fixture.html';fixture.write_text(html)
-                result=subprocess.run([CHROME,'--headless','--no-sandbox','--disable-gpu','--disable-dev-shm-usage',f'--user-data-dir={folder}/profile','--virtual-time-budget=5000',f'--window-size={width},{height}','--dump-dom',fixture.as_uri()],capture_output=True,text=True,timeout=30)
+                fixture=Path(folder)/'fixture.html';fixture.write_text(html, encoding='utf-8')
+                result=subprocess.run([CHROME,'--headless','--no-sandbox','--disable-gpu','--disable-dev-shm-usage',f'--user-data-dir={folder}/profile','--virtual-time-budget=5000',f'--window-size={width},{height}','--dump-dom',fixture.as_uri()],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=30)
                 marker=re.search(r'data-live-update-check="([^"]+)"',result.stdout)
                 self.assertIsNotNone(marker,result.stderr[-1000:])
                 self.assertEqual(marker.group(1),'passed')

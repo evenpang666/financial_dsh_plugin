@@ -1,6 +1,5 @@
 const backtestMeta = document.querySelector('#backtestMeta')
 const backtestContent = document.querySelector('#backtestContent')
-const connectionState = document.querySelector('#connectionState')
 const backtestIndex = document.querySelector('#backtestIndex')
 const backtestIndexPanel = document.querySelector('#backtestIndexPanel')
 const backtestIndexSections = document.querySelector('#backtestIndexSections')
@@ -163,22 +162,26 @@ async function loadBacktestDetail(runId, target) {
   try {
     const payload = await requestJson(`/api/backtests/${encodeURIComponent(runId)}`)
     if (selectedBacktestRun !== runId || !target.isConnected) return
-    const stats = payload.stats || {}
+    const stats = payload.stats || {}; const currency = payload.currency || 'CNY'
     target.replaceChildren(textNode('h3', payload.strategy_name))
-    if (payload.engine_version !== 6) target.append(textNode('p', '这是旧版引擎的历史结果。旧版经典策略可能扣除了 120 日预备期，早期模型回测可能滚动拟合；当前引擎按所选日期与参数评估，并冻结模型权重，请按各自口径比较。', 'ranking-note'))
-    target.append(textNode('p', `${payload.first_day} 至 ${payload.last_day} · ${payload.days} 日 · ${payload.slot} 信号 / ${payload.execution} 成交 · ${new Date(payload.generated_at).toLocaleString('zh-CN')}`, 'insight-meta'))
+    if (payload.kind === 'bar_backtest' && Number(payload.schema_version || 0) < 3) target.append(textNode('p', '旧口径归档：当时的 A股 科创板买入数量与历史指数成分处理规则尚未修正，绩效仅供历史核对；请重新训练和回测。', 'ranking-note'))
+    if (payload.kind !== 'bar_backtest' && payload.market !== 'us' && payload.engine_version !== 6) target.append(textNode('p', '这是旧版引擎的历史结果。旧版经典策略可能扣除了 120 日预备期，早期模型回测可能滚动拟合；当前引擎按所选日期与参数评估，并冻结模型权重，请按各自口径比较。', 'ranking-note'))
+    target.append(textNode('p', `${payload.first_day} 至 ${payload.last_day} · ${payload.days} 根${payload.period_label || '日'}K线 · ${payload.slot} / ${payload.execution || '模拟'} · ${new Date(payload.generated_at).toLocaleString('zh-CN')}`, 'insight-meta'))
     if (payload.requested_start) target.append(textNode('p', `所选日期：${payload.requested_start} 至 ${payload.requested_end} · 候选/持仓上限：${payload.top_n} 只`, 'ranking-note'))
     if (payload.strategy_description) target.append(textNode('p', payload.strategy_description, 'ranking-note'))
-    if (payload.checkpoint_id) target.append(textNode('p', `checkpoint：${payload.checkpoint_id} · 训练时间：${payload.checkpoint_trained_at} · 训练标签截至：${payload.training_label_end} · 回测期间不重新拟合`, 'ranking-note'))
+    if (payload.checkpoint_id) target.append(textNode('p', `checkpoint：${payload.checkpoint_id} · 训练时间：${payload.checkpoint_trained_at || '旧记录未保存'} · 训练标签截至：${payload.training_label_end || '旧记录未保存'} · 回测期间不重新拟合`, 'ranking-note'))
+    for (const note of payload.limitations || []) target.append(textNode('p', note, 'ranking-note'));
     if (payload.holding_policy) target.append(textNode('p', payload.holding_policy, 'ranking-note'))
     if (payload.audit?.selection_bias) target.append(textNode('p', payload.audit.selection_bias, 'ranking-note'))
     const metrics = [
       ['累计收益', percent(stats.total_return)], ['年化收益', percent(stats.annualized_return)],
       ['最大回撤', percent(stats.max_drawdown)], ['Sharpe', stats.sharpe ?? '—'],
-      ['模拟交易', `${stats.trades ?? '—'} 笔`], ['显式费用', `${Number(stats.costs || 0).toLocaleString('zh-CN')} 元`],
-      ['估计滑点', `${Number(stats.slippage_costs || 0).toLocaleString('zh-CN')} 元`], ['样本外 Rank IC', payload.oos_rank_ic?.rank_ic ?? '不适用'],
+      ['模拟交易', `${stats.trades ?? '—'} 笔`], ['显式费用', `${Number(stats.costs || 0).toLocaleString('zh-CN')} ${currency}`],
+      ['估计滑点', Number.isFinite(stats.slippage_costs) ? `${Number(stats.slippage_costs).toLocaleString('zh-CN')} ${currency}` : '旧记录未保存'],
+      ['样本外平均 Rank IC', payload.oos_rank_ic?.rank_ic ?? '未计算'],
+      ['前五名相对股票池均值', Number.isFinite(payload.oos_rank_ic?.top5_excess_return) ? percent(payload.oos_rank_ic.top5_excess_return) : '未计算'],
       ['未成交 / 受限订单', stats.blocked_orders ?? '—'], ['部分成交', stats.partial_fills ?? '—'],
-      ['分红税预留', `${Number(stats.dividend_tax_reserved || 0).toLocaleString('zh-CN')} 元`],
+      ['分红税预留', `${Number(stats.dividend_tax_reserved || 0).toLocaleString('zh-CN')} ${currency}`],
       ['最高成交参与率', percent(stats.max_fill_participation)],
     ]
     const grid = document.createElement('div'); grid.className = 'backtest-grid'; grid.id = 'backtestMetrics'
@@ -220,7 +223,9 @@ async function loadBacktestDetail(runId, target) {
 async function loadBacktest() {
   try {
     const payload = await requestJson('/api/backtests')
-    const runs = payload.runs || []
+    const selectedMarket = document.querySelector('#taskForm [name=market]')?.value || 'a'
+    const selectedTimeframe = document.querySelector('#taskForm [name=timeframe]')?.value || 'daily'
+    const runs = (payload.runs || []).filter(run => (run.market || 'a') === selectedMarket && (run.timeframe || (run.market === 'us' ? 'daily' : 'intraday')) === selectedTimeframe)
     backtestContent.replaceChildren()
     rebuildBacktestIndex()
     backtestMeta.textContent = runs.length ? `已保存 ${runs.length} 次回测。表格展示各策略最新结果；可切换历史记录查看 checkpoint、净值、回撤与交易明细。` : '暂无已完成的策略回测。请在本页选择策略、日期和参数后点击“运行回测”。'
@@ -231,12 +236,13 @@ async function loadBacktest() {
     const body = document.createElement('tbody')
     const detail = document.createElement('div'); detail.className = 'backtest-detail'
     const selector = document.createElement('select'); selector.id = 'backtestRun'
-    for (const run of runs) selector.add(new Option(`${run.strategy_name}${run.checkpoint_id ? ` · checkpoint ${run.checkpoint_id}` : ''} · ${run.slot} · ${new Date(run.generated_at).toLocaleString('zh-CN')}`, run.run_id))
+    for (const run of runs) selector.add(new Option(`${run.strategy_name}${run.kind === 'bar_backtest' && Number(run.schema_version || 0) < 3 ? '（旧口径）' : ''}${run.checkpoint_id ? ` · checkpoint ${run.checkpoint_id}` : ''} · ${run.slot} · ${new Date(run.generated_at).toLocaleString('zh-CN')}`, run.run_id))
     selector.addEventListener('change', () => loadBacktestDetail(selector.value, detail))
     for (const [id, strategy] of Object.entries(payload.strategies || {})) {
       const run = runs.find(item => item.strategy_id === id)
       const row = document.createElement('tr')
-      row.append(textNode('td', strategy.name), textNode('td', run ? `${run.first_day} 至 ${run.last_day} / ${run.slot}` : '尚未回测'))
+      const barName = id === 'momentum' ? 'K线动量' : id === 'breakout' ? '区间突破' : strategy.name
+      row.append(textNode('td', run ? `${run.strategy_name}${run.kind === 'bar_backtest' && Number(run.schema_version || 0) < 3 ? '（旧口径）' : ''}` : barName), textNode('td', run ? `${run.first_day} 至 ${run.last_day} / ${run.slot}` : '尚未回测'))
       for (const value of [percent(run?.stats?.total_return), percent(run?.stats?.max_drawdown), run?.stats?.sharpe ?? '—', run?.stats?.trades ?? '—']) row.append(textNode('td', String(value)))
       const action = document.createElement('td')
       if (run) {
@@ -253,7 +259,7 @@ async function loadBacktest() {
       selector.value = selectedBacktestRun
       await loadBacktestDetail(selectedBacktestRun, detail)
     }
-    const method = textNode('p', '各策略统一使用前一交易日股票池、T+1、涨跌停、费用与延后 VWAP 成交；经典策略按所选日期评估，模型回测使用训练集及标签结束后的区间。不同日期、时点或数据版本的记录请分别比较。固定规则仅在触发条件时入场，无信号时保持现金。', 'ranking-note')
+    const method = textNode('p', '三市场均按所选日线、周线或月线的完整K线收盘生成信号，在下一根K线执行；A股日线按 T+1 延后一日退出。使用指定股票池和复权历史价格，固定费率与滑点，仅供研究；A股历史指数预设使用研究起始日成分并固定名单，自定股票池可能有幸存者偏差。未模拟涨跌停、停牌及税费细项。不同市场与周期的收益不可直接比较。', 'ranking-note')
     method.id = 'backtestMethod'
     backtestContent.append(method)
     rebuildBacktestIndex(true)
@@ -266,5 +272,6 @@ setInterval(loadBacktest, 30_000)
 
 const backtestEvents = new EventSource('/api/events')
 backtestEvents.addEventListener('backtest', loadBacktest)
-backtestEvents.addEventListener('open', () => { connectionState.textContent = '实时连接' })
-backtestEvents.addEventListener('error', () => { connectionState.textContent = '自动刷新中' })
+
+document.querySelector('#taskForm [name=market]')?.addEventListener('change', loadBacktest);
+document.querySelector('#taskForm [name=timeframe]')?.addEventListener('change', loadBacktest);

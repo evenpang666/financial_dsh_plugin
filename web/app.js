@@ -1,7 +1,6 @@
 const reportElement = document.querySelector('#report')
 const statusCard = document.querySelector('#statusCard')
 const updatedAt = document.querySelector('#updatedAt')
-const connectionState = document.querySelector('#connectionState')
 const reportDate = document.querySelector('#reportDate')
 const refreshButton = document.querySelector('#refreshButton')
 const requestedReport = new URLSearchParams(window.location.search).get('report') || ''
@@ -20,15 +19,6 @@ let rankingPage = 0
 const globalChart = document.querySelector('#globalChart')
 const sectorChart = document.querySelector('#sectorChart')
 const horizonContent = document.querySelector('#horizonContent')
-const portfolioContent = document.querySelector('#portfolioContent')
-const portfolioStrategy = document.querySelector('#portfolioStrategy')
-const portfolioKind = document.querySelector('#portfolioKind')
-let portfolioOptions = null
-let portfolioStrategyChosen = false
-let portfolioAnalyzing = false
-let portfolioStarting = false
-const portfolioResults = new Map()
-document.addEventListener('portfolio-saved', () => { portfolioResults.clear(); portfolioContent.replaceChildren(); document.querySelector('#portfolioMeta').textContent = '持仓已更新，点击“分析我的持仓”查看新结果。' })
 const researchUpdateButton = document.querySelector('#researchUpdateButton')
 let publishedRanking = null
 let rankingPublicationId = ''
@@ -146,7 +136,9 @@ function renderHorizon() {
   const list = document.createElement('div'); list.className = 'watch-grid'
   for (const row of rows) {
     const card = document.createElement('article'); card.className = 'watch-card'
-    card.append(textNode('h3', `${row.name || row.symbol} · ${row.symbol}`))
+    const heading = document.createElement('h3')
+    heading.append(ReportStocks.button(row, currentMarket, `${row.name || row.symbol} · ${row.symbol}`))
+    card.append(heading)
     card.append(textNode('p', row.basis || '证据不足'))
     card.append(textNode('small', `财报期 ${row.financial_period || '未取得'} · PE ${row.pe_ttm ?? '未取得'} · ${row.risk}`))
     list.append(card)
@@ -155,10 +147,10 @@ function renderHorizon() {
 }
 
 function showInsights(payload) {
-  const changedMarket = (payload.market || 'a') !== currentMarket
   displayedReportId = payload.id || ''
   currentView = payload.view || {}
   currentMarket = payload.market || 'a'
+  ReportStocks.setReport(payload)
   ReportVisuals.render(payload)
   const global = currentView.global_markets || {}
   document.querySelector('#globalMeta').textContent = `${global.source || '数据未归档'} · 各市场行情时间不同，请查看日报明细`
@@ -172,13 +164,6 @@ function showInsights(payload) {
   document.querySelector('#sectorMeta').textContent = `${sectors.source || '数据未归档'} · 仅 A 股概念板块`
   renderBars(sectorChart, sectors.boards || [], row => `${row.theme} · ${row.name}`)
   renderHorizon()
-  if (changedMarket) {
-    portfolioContent.replaceChildren()
-    const saved = portfolioResults.get(currentMarket)
-    if (saved && saved.selection === portfolioStrategy.value) renderPortfolioResult(saved.payload)
-    else document.querySelector('#portfolioMeta').textContent = portfolioKind.value === 'model' && !portfolioStrategy.value
-      ? '没有已训练模型，请先在回测页训练模型。' : '默认不读取持仓；点击后按当前公开数据分析。'
-  }
 }
 
 document.querySelectorAll('[data-horizon]').forEach(button => button.addEventListener('click', () => {
@@ -253,126 +238,8 @@ function fillExecutionSelect(kind, select, payload, selected = '') {
   for (const [id, item] of Object.entries(items || {})) select.add(new Option(item.name, id))
   if ([...select.options].some(option => option.value === selected)) select.value = selected
   select.disabled = !select.options.length
-  renderExecutionParameters(select === rankingStrategy ? "ranking" : "portfolio", select, payload)
+  renderExecutionParameters("ranking", select, payload)
 }
-
-async function loadPortfolioStrategies() {
-  if (portfolioAnalyzing) return
-  try {
-    const payload = await requestJson('/api/portfolio-strategies')
-    if (portfolioAnalyzing) return
-    const selected = portfolioStrategyChosen ? portfolioStrategy.value : payload.selected
-    portfolioOptions = payload
-    if (!portfolioStrategyChosen) portfolioKind.value = payload.selected_kind || (selected?.includes('@') ? 'model' : 'fixed')
-    fillExecutionSelect(portfolioKind, portfolioStrategy, payload, selected)
-    document.querySelector('#portfolioButton').disabled = portfolioStarting || portfolioAnalyzing || portfolioStrategy.disabled
-    if (portfolioStrategy.disabled) document.querySelector('#portfolioMeta').textContent = '没有已训练模型，请先在回测页训练模型。'
-  } catch (error) {
-    portfolioStrategy.replaceChildren()
-    portfolioStrategy.disabled = true
-    document.querySelector('#portfolioButton').disabled = true
-  }
-}
-portfolioKind.addEventListener('change', () => {
-  portfolioStrategyChosen = true
-  if (portfolioOptions) fillExecutionSelect(portfolioKind, portfolioStrategy, portfolioOptions)
-  document.querySelector('#portfolioButton').disabled = !portfolioStrategy.value
-  portfolioContent.replaceChildren()
-  document.querySelector('#portfolioMeta').textContent = portfolioStrategy.value ? '请选择策略或 checkpoint 后分析持仓。' : '没有已训练模型，请先在回测页训练模型。'
-})
-portfolioStrategy.addEventListener('change', () => {
-  portfolioStrategyChosen = true
-  renderExecutionParameters("portfolio", portfolioStrategy, portfolioOptions)
-  portfolioContent.replaceChildren()
-  document.querySelector('#portfolioMeta').textContent = '策略已切换，请重新点击分析；本页选择不会修改保存配置。'
-})
-
-function renderPositionSummary(payload) {
-  const summary = payload.position_summary
-  if (!summary?.rows?.length) return
-  const title = textNode('h3', '仓位总结｜三组研究配置')
-  const meta = textNode('p', `${payload.strategy_review?.strategy_name || '策略未取得'} · ${payload.strategy_review?.scope || ''} · 信号 ${payload.strategy_review?.as_of || '未取得'}`, 'ranking-note')
-  const note = textNode('p', summary.basis, 'ranking-note')
-  const percentValue = value => value == null || !Number.isFinite(Number(value)) ? '待补充' : `${Number(value).toFixed(2)}%`
-  const wrap = document.createElement('div'); wrap.className = 'table-wrap position-summary'
-  const table = document.createElement('table'), head = document.createElement('thead'), header = document.createElement('tr')
-  for (const label of ['持仓 / 数据日', '当前股票市值占比（不含现金）', '研究建议1', '策略建议2', '综合结果3']) header.append(textNode('th', label))
-  head.append(header)
-  const body = document.createElement('tbody')
-  for (const row of summary.rows) {
-    const tr = document.createElement('tr'), name = document.createElement('td')
-    name.append(textNode('strong', `${row.name || row.symbol} · ${row.symbol}`), textNode('small', `研究 ${row.analysis_as_of || '未取得'} / 策略 ${row.strategy_as_of || '未取得'}`))
-    tr.append(name, textNode('td', percentValue(row.current_holding_share_pct)))
-    for (const [key, subtitle] of [['suggestion1', row.suggestion1?.action], ['suggestion2', row.suggestion2?.rank ? `策略入场排名 ${row.suggestion2.rank} · 分数 ${row.suggestion2.score}` : row.suggestion2?.status === 'not_triggered' ? '未触发新增入场' : '策略证据不足'], ['suggestion3', '综合复核']]) {
-      const item = row[key] || {}, cell = document.createElement('td')
-      cell.append(textNode('strong', percentValue(item.weight_pct)), textNode('small', subtitle || '待核验'), textNode('small', item.reason || '证据不足'))
-      tr.append(cell)
-    }
-    body.append(tr)
-  }
-  for (const [label, key] of [['股票配置合计', 'stock_totals_pct'], ['预留现金', 'cash_reserve_pct']]) {
-    const tr = document.createElement('tr'); tr.className = 'position-total'
-    tr.append(textNode('th', label), textNode('td', '—'))
-    for (const suggestion of ['suggestion1', 'suggestion2', 'suggestion3']) tr.append(textNode('td', percentValue(summary[key]?.[suggestion])))
-    body.append(tr)
-  }
-  table.append(head, body); wrap.append(table)
-  portfolioContent.append(title, meta, note, wrap)
-  const methods = document.createElement('details'); methods.className = 'position-methods'
-  methods.append(textNode('summary', '查看三组计算方法与限制'))
-  for (const value of [summary.method1, summary.method2, summary.method3, `研究股票配置上限 ${percentValue(summary.exposure_limit_pct)}；单股上限 ${percentValue(summary.single_name_limit_pct)}。缺失关键证据时不生成数值配置。`]) methods.append(textNode('p', value, 'ranking-note'))
-  portfolioContent.append(methods)
-}
-
-function renderPortfolioResult(payload) {
-  portfolioContent.replaceChildren()
-  const stamp = payload.as_of ? `分析完成 ${new Date(payload.as_of).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}（北京时间） · ` : ''
-  document.querySelector('#portfolioMeta').textContent = stamp + (payload.note || '')
-  if (payload.strategy_review?.checkpoint_id) document.querySelector('#portfolioMeta').textContent += ` · checkpoint ${payload.strategy_review.checkpoint_id} · 训练 ${payload.strategy_review.checkpoint_trained_at}`
-  if (!payload.available) { portfolioContent.append(textNode('p', '当前市场没有已保存持仓。', 'empty-note')); return }
-  renderPositionSummary(payload)
-  const list = document.createElement('div'); list.className = 'watch-grid'
-  for (const item of payload.holdings || []) {
-    const analysis = item.analysis || {}
-    const card = document.createElement('article'); card.className = 'watch-card'
-    card.append(textNode('h3', `${analysis.name || item.holding?.name || item.holding?.symbol} · ${item.holding?.symbol}`))
-    card.append(textNode('p', item.strategy))
-    card.append(textNode('small', `财报期 ${analysis.latest_report_period || '未取得'} · ${analysis.long_term?.evidence?.join('；') || '基本面待补充'}`))
-    card.append(textNode('small', `技术面：${analysis.short_term?.evidence?.join('；') || '待补充'}`))
-    card.append(textNode('small', `缺失：${friendlyMissing(analysis.unavailable)}`))
-    list.append(card)
-  }
-  portfolioContent.append(list)
-}
-
-document.querySelector('#portfolioButton').addEventListener('click', async event => {
-  if (portfolioStarting || portfolioAnalyzing) return
-  const button = event.currentTarget
-  const requestedMarket = currentMarket
-  portfolioStarting = true
-  button.disabled = true
-  try {
-    if (!portfolioStrategyChosen) await loadPortfolioStrategies()
-    if (!portfolioStrategy.value || requestedMarket !== currentMarket) return
-    const selectedStrategy = portfolioStrategy.value
-    const parameters = executionParameters('portfolio')
-    portfolioStrategy.disabled = true; portfolioKind.disabled = true
-    portfolioStarting = false; portfolioAnalyzing = true
-    document.querySelector('#portfolioMeta').textContent = '正在分析财报、估值、技术面与所选策略，生成三组研究配置…'
-    portfolioContent.replaceChildren()
-    const response = await fetch('/api/portfolio-analysis', {method: 'POST', headers: {'X-Report-Market': requestedMarket, 'X-Portfolio-Strategy': selectedStrategy, 'X-Strategy-Parameters': JSON.stringify(parameters)}})
-    const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`)
-    portfolioResults.set(requestedMarket, {selection: selectedStrategy, payload})
-    if (requestedMarket === currentMarket) renderPortfolioResult(payload)
-  } catch (error) {
-    if (requestedMarket === currentMarket) document.querySelector('#portfolioMeta').textContent = `持仓分析失败：${error.message}`
-  } finally {
-    portfolioStarting = false; portfolioAnalyzing = false
-    button.disabled = !portfolioStrategy.value
-    portfolioStrategy.disabled = !portfolioStrategy.options.length; portfolioKind.disabled = false
-  }
-})
 
 function escapeHtml(value) {
   return String(value)
@@ -454,6 +321,7 @@ function showReport(payload) {
   statusCard.hidden = true
   updatedAt.textContent = `${payload.label || payload.date} · 更新于 ${new Date(payload.updated_at).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}（北京时间）`
   showInsights(payload)
+  ReportStocks.decorateReport(reportElement, currentView, currentMarket)
   rebuildReportIndex()
   if (!initialSectionApplied) {
     initialSectionApplied = true
@@ -510,6 +378,7 @@ researchUpdateButton.addEventListener('click', async () => {
     rankingStrategyChosen = true
   }
   document.querySelector('#researchTools').open = true
+  document.querySelector('#rankingTools').closest('details').open = true
   jumpToSection(document.querySelector('#rankingTools'))
 })
 
@@ -675,19 +544,16 @@ async function loadIndex(preferredId = '') {
       reportDate.value = selected
       showReport(await requestJson(`/api/reports/${encodeURIComponent(selected)}`))
     }
-    connectionState.textContent = '已连接'
   } catch (error) {
-    connectionState.textContent = '连接失败'
     updatedAt.textContent = '无法连接本地日报服务'
     showEmpty('日报服务不可用', '请确认启动器正在运行，并检查局域网或防火墙设置。', true)
   }
 }
 
 reportDate.addEventListener('change', () => loadIndex(reportDate.value))
-refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRankingStrategies(); loadPortfolioStrategies() })
+refreshButton.addEventListener('click', () => { loadIndex(reportDate.value); loadRankingStrategies() })
 loadIndex(requestedReport)
 loadRankingStrategies().then(async () => { await restoreRankingJob(); await refreshRankingPublication() })
-loadPortfolioStrategies()
 setInterval(() => loadIndex(reportDate.value), 30_000)
 setInterval(loadRanking, 30_000)
 setInterval(refreshRankingPublication, 30_000)
@@ -698,5 +564,4 @@ reportEvents.addEventListener('report', event => {
   loadIndex(payload.id || payload.date)
 })
 reportEvents.addEventListener('ranking', event => handleRankingPublication(JSON.parse(event.data)))
-reportEvents.addEventListener('open', () => { connectionState.textContent = '实时连接'; refreshRankingPublication(); restoreRankingJob() })
-reportEvents.addEventListener('error', () => { connectionState.textContent = '自动刷新中' })
+reportEvents.addEventListener('open', () => { refreshRankingPublication(); restoreRankingJob() })

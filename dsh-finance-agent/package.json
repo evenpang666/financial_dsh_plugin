@@ -1,11 +1,27 @@
 {
   "name": "dsh-finance-agent",
-  "version": "0.5.0",
-  "description": "Local read-only A-share and Hong Kong stock analysis tools with evidence-based buy/sell tendency scores and scheduled reports.",
+  "version": "0.7.0",
+  "description": "Local A-share, Hong Kong and US stock research tools and evidence-based skills.",
   "type": "module",
   "main": "index.js",
-  "files": ["index.js", "cordis.patch.yml", "skills"],
-  "keywords": ["dsh-plugin", "deepseek-harness", "a-share", "hong-kong-stock", "finance", "research"],
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "skills"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "a-share",
+    "hong-kong-stock",
+    "finance",
+    "research",
+    "us-stock"
+  ],
   "license": "MIT",
-  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
 }

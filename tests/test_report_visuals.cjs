@@ -1,6 +1,28 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const visuals = require('../web/report-visuals.js')
+const stocks = require('../web/report-stocks.js')
+
+test('report stock identities retain their market and normalize HK and US tickers', () => {
+  assert.deepEqual(stocks.identity({symbol: '700', name: '腾讯'}, 'hk'), {market: 'hk', symbol: '00700', name: '腾讯'})
+  assert.equal(stocks.identity({symbol: 'BRK.B'}, 'us').symbol, 'BRK-B')
+  assert.equal(stocks.identity({symbol: '00700', market: 'hk'}, 'a').market, 'hk')
+  for (const row of [{symbol: ''}, {symbol: '600519/inject'}, {symbol: '000000'}, {symbol: 'AAPL'}, {symbol: '123456', market: 'bad'}]) assert.equal(stocks.identity(row, 'a'), null)
+})
+
+test('legacy report tables identify stocks only in explicit security-code columns', () => {
+  assert.equal(stocks.tableIdentity(['排名', '代码', '名称'], ['1', '002946', '新乳业'], 'a').symbol, '002946')
+  assert.equal(stocks.tableIdentity(['日期', '成交量'], ['2026-11-03', '600519'], 'a'), null)
+  assert.equal(stocks.tableIdentity(['代码', '名称'], ['1', '排名'], 'a'), null)
+})
+
+test('report stock mentions respect ticker boundaries and avoid ambiguous names', () => {
+  const rows = [stocks.identity({symbol: 'AAPL', name: 'Apple'}, 'us'), stocks.identity({symbol: 'BRK.B'}, 'us')]
+  assert.deepEqual(stocks.mentions('AAPL、BRK.B / BRK-B；XAAPL、AAPL2、AAPL.O', rows).map(m => m.stock.symbol), ['AAPL', 'BRK-B', 'BRK-B'])
+  const ambiguous = [stocks.identity({symbol: '600519', name: '同名'}, 'a'), stocks.identity({symbol: '00700', name: '同名'}, 'hk')]
+  assert.equal(stocks.mentions('同名', ambiguous).length, 0)
+  assert.equal(stocks.mentions('持仓600519，金额16005190', ambiguous).length, 1)
+})
 
 test('missing and non-finite values never become zero returns', () => {
   for (const value of [null, undefined, '', ' ', false, Infinity, NaN, 'invalid']) {

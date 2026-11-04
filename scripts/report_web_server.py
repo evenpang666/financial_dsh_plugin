@@ -39,7 +39,7 @@ BACKTEST_DIR = PROJECT_ROOT / "data" / "factor-lab" / "backtests"
 SNAPSHOT_DIR = PROJECT_ROOT / "data" / "report-snapshots"
 HOST = os.getenv("FINANCE_REPORT_HOST", "0.0.0.0")
 PORT = int(os.getenv("FINANCE_REPORT_PORT", "8766"))
-REPORT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}(?:-(?:a|hk)-(?:morning|afternoon))?\.md$")
+REPORT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}(?:-(?:a|hk|us)-(?:morning|afternoon|scheduled-(?:morning|afternoon)|manual-\d{6}))?\.md$")
 SUBSCRIBERS: set[queue.Queue] = set()
 SUBSCRIBERS_LOCK = threading.Lock()
 RANKING_JOB_LOCK = threading.Lock()
@@ -165,8 +165,8 @@ def read_backtest(run_id: str, curve: bool = False) -> dict:
     try:
         path = directory / "summary.json"
         summary = json.loads(path.read_text(encoding="utf-8"))
-        if (not isinstance(summary, dict) or summary.get("schema_version") != 2
-                or summary.get("kind") != "point_in_time_backtest"
+        if (not isinstance(summary, dict) or summary.get("kind") not in ("point_in_time_backtest", "us_daily_backtest", "bar_backtest")
+                or summary.get("schema_version") not in ((2, 3) if summary.get("kind") == "bar_backtest" else (2,))
                 or "stats" not in summary or "slot" not in summary):
             return {"available": False}
         payload = {**summary, "available": True, "run_id": run_id,
@@ -221,13 +221,25 @@ def publish_backtest_event():
 
 def report_metadata(report_id: str) -> dict:
     parts = report_id.split("-")
-    if len(parts) == 5 and parts[3] in {"a", "hk"} and parts[4] in {"morning", "afternoon"}:
-        day, market, session = "-".join(parts[:3]), parts[3], parts[4]
+    day, market, session, source = report_id, "a", "legacy", "legacy"
+    if len(parts) >= 5 and parts[3] in {"a", "hk", "us"}:
+        day, market = "-".join(parts[:3]), parts[3]
+        if len(parts) == 6 and parts[4] == "scheduled" and parts[5] in {"morning", "afternoon"}:
+            session, source = parts[5], "scheduled"
+        elif len(parts) == 6 and parts[4] == "manual" and re.fullmatch(r"\d{6}", parts[5]):
+            session, source = "manual", "manual"
+        elif len(parts) == 5 and parts[4] in {"morning", "afternoon"}:
+            session, source = parts[4], "unknown"
+    market_label = "美股" if market == "us" else "港股" if market == "hk" else "A股"
+    if source == "manual":
+        stamp = parts[5]
+        session_label = f"{stamp[:2]}:{stamp[2:4]}:{stamp[4:]} 手动报告（{'纽约' if market == 'us' else '北京'}时间）"
+    elif session in {"morning", "afternoon"}:
+        session_label = f"{'定时' if source == 'scheduled' else ''}{'上午' if session == 'morning' else '下午'}日报"
+        if source == "unknown": session_label += "（旧记录，触发方式未记录）"
     else:
-        day, market, session = report_id, "a", "legacy"
-    market_label = "港股" if market == "hk" else "A股"
-    session_label = "日报2·收盘前" if session == "afternoon" else ("日报1·开盘前" if session == "morning" else "历史日报")
-    return {"id": report_id, "date": day, "market": market, "session": session, "label": f"{day} · {market_label}{session_label}"}
+        session_label = "历史日报"
+    return {"id": report_id, "date": day, "market": market, "session": session, "source": source, "label": f"{day} · {market_label} · {session_label}"}
 
 
 def list_reports():
@@ -243,8 +255,8 @@ def list_reports():
             "updated_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
             "size": stat.st_size,
         })
-    session_order = {"afternoon": 2, "morning": 1, "legacy": 0}
-    return sorted(reports, key=lambda item: (item["date"], session_order.get(item["session"], 0), item["updated_at"]), reverse=True)
+    session_order = {"afternoon": 2, "morning": 1, "manual": 0, "legacy": 0}
+    return sorted(reports, key=lambda item: (item["date"], item["updated_at"], session_order.get(item["session"], 0)), reverse=True)
 
 
 def read_report(filename: str):
@@ -255,8 +267,10 @@ def read_report(filename: str):
         return None
     stat = path.stat()
     snapshot = {}
+    metadata = report_metadata(path.stem)
+    snapshot_id = f"{metadata['date']}-{metadata['market']}-{metadata['session']}" if metadata["source"] == "scheduled" else path.stem
     try:
-        snapshot = json.loads((SNAPSHOT_DIR / f"{path.stem}.json").read_text(encoding="utf-8"))
+        snapshot = json.loads((SNAPSHOT_DIR / f"{snapshot_id}.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         pass
     if not isinstance(snapshot, dict):
@@ -267,7 +281,7 @@ def read_report(filename: str):
         "intraday_review", "candidates", "weekly_events", "warnings",
     ) if key in snapshot}
     return {
-        "available": True, **report_metadata(path.stem),
+        "available": True, **metadata,
         "updated_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
         "markdown": without_backtest_section(path.read_text(encoding="utf-8")), "view": view,
     }
@@ -303,6 +317,25 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ranges": default_ranges(), "training": {
                     key: {"name": STRATEGIES[key]["name"], "parameter_schema": parameter_schema(key, "training")}
                     for key in ("xgboost", "elastic_net")}})
+            if path == "/api/bar-strategies":
+                from bar_strategy import options
+                query = parse_qs(urlparse(self.path).query)
+                return self.send_json(200, options(query.get("market", ["a"])[0], query.get("timeframe", ["daily"])[0]))
+            if path == "/api/bar-deployment":
+                query = parse_qs(urlparse(self.path).query)
+                market, timeframe, strategy, checkpoint = (query.get(key, [""])[0] for key in ("market", "timeframe", "strategy", "checkpoint"))
+                pool = query.get("pool", ["custom"])[0]
+                from bar_strategy import PERIODS, ZONES
+                if market not in ZONES or timeframe not in PERIODS or strategy not in STRATEGIES or not re.fullmatch(r"[A-Za-z0-9-]{0,100}", checkpoint) or pool not in {"custom", "portfolio", "csi300", "csi500", "all"} or (market != "a" and pool not in {"custom", "portfolio"}):
+                    return self.send_json(400, {"error": "部署查询参数无效。"})
+                suffix = f"-{checkpoint}" if checkpoint else ""
+                target = PROJECT_ROOT / "data" / "bar-deployments" / f"latest-{market}-{timeframe}-{strategy}{suffix}-{pool}.json"
+                if pool == "custom" and not target.exists():
+                    target = PROJECT_ROOT / "data" / "bar-deployments" / f"latest-{market}-{timeframe}-{strategy}{suffix}.json"
+                try:
+                    return self.send_json(200, json.loads(target.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    return self.send_json(200, {"available": False})
             if path == "/api/reports":
                 return self.send_json(200, {"reports": list_reports()})
             if path == "/api/ranking/latest":
@@ -323,6 +356,9 @@ class ReportHandler(BaseHTTPRequestHandler):
                 state = ranking_job(path.removeprefix("/api/ranking/jobs/"))
                 return self.send_json(200, state) if state else self.send_json(404, {"error": "未找到排序任务。"})
             if path == "/api/portfolio-strategies":
+                if parse_qs(urlparse(self.path).query).get("market", ["a"])[0] == "us":
+                    from us_strategy import options
+                    return self.send_json(200, options())
                 try:
                     settings = json.loads((PROJECT_ROOT / "config" / "factor-lab.json").read_text(encoding="utf-8"))
                 except (OSError, ValueError):
@@ -332,7 +368,9 @@ class ReportHandler(BaseHTTPRequestHandler):
             if path == "/api/backtest/latest":
                 return self.send_json(200, latest_backtest())
             if path == "/api/backtests":
-                return self.send_json(200, {"runs": backtest_runs(), "strategies": STRATEGIES})
+                portfolio = parse_qs(urlparse(self.path).query).get("pool", [""])[0] == "portfolio"
+                runs = [run for run in backtest_runs() if (run.get("pool", {}).get("id") == "portfolio") == portfolio]
+                return self.send_json(200, {"runs": runs, "strategies": STRATEGIES})
             if path.startswith("/api/backtests/"):
                 parts = path.removeprefix("/api/backtests/").split("/")
                 if not RUN_ID.fullmatch(parts[0]):
@@ -364,7 +402,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 asset = "backtests.html"
             else:
                 asset = "index.html" if path in ("/", "/index.html") else path.lstrip("/")
-            if asset not in {"index.html", "styles.css", "app.js", "report-visuals.js", "backtests.html", "backtests.js", "soft-ui.css", "task-controls.js", "icon.svg"}:
+            if asset not in {"index.html", "styles.css", "app.js", "deployment.js", "report-visuals.js", "backtests.html", "backtests.js", "soft-ui.css", "dark-ui.css", "theme.js", "theme.css", "task-controls.js", "icon.svg"}:
                 return self.send_json(404, {"error": "Not found"})
             target = WEB_ROOT / asset
             content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
@@ -396,16 +434,21 @@ class ReportHandler(BaseHTTPRequestHandler):
             if origin and urlparse(origin).netloc != host:
                 return self.send_json(403, {"error": "同源页面才可请求持仓分析。"})
             market = str(self.headers.get("X-Report-Market", "a"))
-            if market not in {"a", "hk"}:
+            if market not in {"a", "hk", "us"}:
                 return self.send_json(400, {"error": "市场参数无效。"})
             strategy = str(self.headers.get("X-Portfolio-Strategy", ""))
             try:
                 if strategy:
-                    resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+                    if market == "us":
+                        from us_strategy import options
+                        if strategy not in options()["strategies"]: raise ValueError("请选择有效美股策略或checkpoint。")
+                    else:
+                        resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
                 parameters = json.loads(self.headers.get("X-Strategy-Parameters", "null"))
                 if parameters is not None:
                     from strategy_config import validate_parameters
-                    algorithm, _, _ = resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
+                    if market == "us": algorithm = strategy.split("@", 1)[0]
+                    else: algorithm, _, _ = resolve_selection(strategy, store=PROJECT_ROOT / "data" / "factor-lab")
                     parameters = validate_parameters(algorithm, parameters)
             except ValueError as exc:
                 return self.send_json(400, {"error": str(exc)})

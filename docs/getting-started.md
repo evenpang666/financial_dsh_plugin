@@ -17,3 +17,5 @@ Windows 可双击 `start.bat`；Linux/macOS 使用 `bash start.sh`。浏览器�
 更新代码前运行 `npm stop`，然后使用 Git 获取更新，再运行 `npm start`。启动器会检查缺失依赖。保留自己的未提交修改；不要用强制重置更新项目。
 
 更多环境变量和数据目录见[网页指南](web-workspace.md)。
+
+知衡支持 A股、港股与美股。设置页可为知衡选择 DSH 已配置模型和可用推理强度；默认跟随宿主，凭据在 DSH Web 中管理。美股 SEC 披露需在启动环境设置 `SEC_USER_AGENT` 联系方式；具体数据限制见[工具与市场](tools-and-markets.md)。

@@ -10,6 +10,7 @@ import sys
 import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -57,7 +58,7 @@ def load_config(path: Path) -> dict:
 
 
 def get_json(url: str, timeout: int = 120) -> dict:
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "dsh-finance-agent/0.2"})
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": "dsh-financial/0.2"})
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -67,7 +68,7 @@ def webhook_payload(kind: str, markdown: str) -> dict:
     heading = str(markdown).lstrip()
     is_hk = heading.startswith("# 港股")
     is_afternoon = "日报2" in heading.splitlines()[0] if heading else False
-    market_name = "港股" if is_hk else "A股"
+    market_name = "美股" if heading.startswith("# 美股") else "港股" if is_hk else "A股"
     title = f"{market_name}{'收盘前' if is_afternoon else '开盘前'}研究简报"
     if kind == "feishu":
         return {"msg_type": "text", "content": {"text": markdown}}
@@ -75,7 +76,7 @@ def webhook_payload(kind: str, markdown: str) -> dict:
         return {"msgtype": "markdown", "markdown": {"content": markdown}}
     if kind == "dingtalk":
         return {"msgtype": "markdown", "markdown": {"title": title, "text": markdown}}
-    report_type = ("hk" if is_hk else "a_share") + ("_afternoon_review" if is_afternoon else "_morning_research")
+    report_type = ("us" if heading.startswith("# 美股") else "hk" if is_hk else "a_share") + ("_afternoon_review" if is_afternoon else "_morning_research")
     return {"text": markdown, "content": markdown, "type": report_type}
 
 
@@ -129,6 +130,7 @@ def archive_report(report_id: str, markdown: str) -> Path:
 
 def normalize_schedules(config: dict) -> dict[str, str]:
     supplied = config.get("schedules")
+    if config.get("market") == "us" and supplied is None: supplied = {"morning":"09:20", "afternoon":"15:30"}
     schedules = supplied if isinstance(supplied, dict) else {"morning": config.get("scheduled_time", "09:20"), "afternoon": "14:30"}
     result = {}
     for session in ("morning", "afternoon"):
@@ -139,7 +141,7 @@ def normalize_schedules(config: dict) -> dict[str, str]:
 
 
 def session_for_now(config: dict, now: datetime | None = None) -> str:
-    now = now or datetime.now(CHINA_TZ)
+    now = now or datetime.now(ZoneInfo("America/New_York") if config.get("market") == "us" else CHINA_TZ)
     schedules = normalize_schedules(config)
     afternoon_hour, afternoon_minute = parse_hhmm(schedules["afternoon"])
     boundary = now.replace(hour=afternoon_hour, minute=afternoon_minute, second=0, microsecond=0)
@@ -157,8 +159,9 @@ def run_once(config: dict, force: bool = False, session: str = "morning", manual
     today = datetime.now(CHINA_TZ).date().isoformat()
     state = load_state()
     selected_market = str(config.get("market", "a")).strip().lower()
-    if selected_market not in {"a", "hk"}:
+    if selected_market not in {"a", "hk", "us"}:
         raise ValueError("market 必须是 a（A股）或 hk（港股）。")
+    if selected_market == "us": today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     state_key = f"{today}:{selected_market}:{session}"
     completed = state.get("completed", {}) if isinstance(state.get("completed"), dict) else {}
     legacy_done = session == "morning" and state.get("last_success_date") == today
@@ -224,7 +227,7 @@ def seconds_until_schedule(hhmm: str, now: datetime | None = None) -> float:
 
 
 def next_scheduled_run(config: dict, now: datetime | None = None) -> tuple[float, str]:
-    now = now or datetime.now(CHINA_TZ)
+    now = now or datetime.now(ZoneInfo("America/New_York") if config.get("market") == "us" else CHINA_TZ)
     candidates = [(seconds_until_schedule(hhmm, now), session) for session, hhmm in normalize_schedules(config).items()]
     return min(candidates, key=lambda item: item[0])
 

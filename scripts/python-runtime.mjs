@@ -18,7 +18,7 @@ export async function inspectPython(command, env, args = []) {
 }
 const dependencyCheck = `import importlib, importlib.metadata as metadata, json, sys
 from pip._vendor.packaging.requirements import Requirement
-modules = {"scikit-learn": "sklearn"}
+modules = {"scikit-learn": "sklearn", "exchange-calendars": "exchange_calendars"}
 issues = []
 for line in open(sys.argv[1], encoding="utf-8"):
     if not line.strip() or line.lstrip().startswith("#"): continue

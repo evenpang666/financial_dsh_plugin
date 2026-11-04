@@ -145,6 +145,9 @@ def load_signal_record(item, strategy, asof, previous_day, deadline=None, parame
 
 
 def strategy_review(items, strategy, market, now=None, checkpoint_id=None, parameters=None):
+    if market == "us":
+        from us_strategy import portfolio_review
+        return portfolio_review(items, strategy, checkpoint_id or "", parameters)
     from strategy_config import validate_parameters, configured_parameters
     from factor_lab import load_settings
     parameters = (configured_parameters(load_settings(), strategy) if parameters is None

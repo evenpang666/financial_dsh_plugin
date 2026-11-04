@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="管理已保存持仓，分析当前股票数据，回测与部署持仓股票池">
+  <title>我的持仓 · 知衡</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/soft-ui.css">
+  <link rel="stylesheet" href="/portfolio.css">
+  <link rel="stylesheet" href="/dark-ui.css">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+<script src="/theme.js"></script><link rel="stylesheet" href="/theme.css"><link rel="stylesheet" href="/workspace.css"><script src="/workspace.js" defer></script></head>
+<body>
+  <header class="topbar workspace-header">
+    <a class="workspace-brand" href="/" aria-label="返回知衡研究首页"><img src="/icon.svg" width="32" height="32" alt=""><strong>知衡</strong></a>
+    <nav class="workspace-navigation" aria-label="工作台导航"><a href="/">研究</a><a href="/reports">日报</a><a href="/portfolio" aria-current="page">持仓</a><a href="/backtests">回测</a><a href="/simulation">模拟</a><a href="/strategy-guide">策略解读</a><a href="/settings">设置</a></nav>
+    <span class="workspace-connection" data-state="pending" role="status" aria-live="polite" aria-label="本地服务连接状态">正在连接</span>
+  </header>
+  <main class="report-page portfolio-page">
+    <section class="intro" aria-labelledby="pageTitle">
+      <div class="intro-heading"><div><h1 id="pageTitle">持仓</h1><p>查看和编辑持仓，并以当前持仓池进行分析、回测或部署。</p></div><div class="actions"><button id="portfolioEntryOpen" type="button">添加 / 管理持仓</button><button id="portfolioRefresh" type="button">刷新持仓</button></div></div>
+    </section>
+    <section class="insight-card" aria-labelledby="holdingsTitle">
+      <div class="section-heading"><div><p class="eyebrow">CURRENT HOLDINGS</p><h2 id="holdingsTitle">仓内股票</h2><p id="holdingsMeta" class="insight-meta" role="status">正在读取已保存持仓…</p></div><label class="select-control" for="holdingsMarket"><span>当前市场</span><select id="holdingsMarket"><option value="a">A股 · CNY</option><option value="hk">港股 · HKD</option><option value="us">美股 · USD</option></select></label></div>
+      <div class="holdings-display-controls"><div class="holding-range" role="group" aria-label="股票走势图区间"><button type="button" data-trend-window="20" aria-pressed="false">20日</button><button type="button" data-trend-window="60" aria-pressed="true">60日</button><button type="button" data-trend-window="120" aria-pressed="false">120日</button></div><label class="select-control holdings-sort" for="holdingsSort"><span>卡片排序</span><select id="holdingsSort"><option value="position-desc" selected>仓位从高到低</option><option value="change-desc">涨跌幅从高到低</option><option value="change-asc">涨跌幅从低到高</option></select></label><p class="holding-color-legend"><span class="is-up">↑ 红涨</span><span class="is-down">↓ 绿跌</span><span class="is-flat">— 平盘</span></p></div>
+      <div id="holdingsOverview" class="portfolio-overview" aria-live="polite"></div>
+      <p class="ranking-note">持仓数量来自本地保存记录，打开页面后读取行情；可点击“刷新行情”更新价格、涨跌幅和数据时间，各市场市值按原币种显示。</p>
+      <p class="ranking-note">默认按本市场仓位从高到低排列（持股数 × 当前价格）；也可按当日涨跌幅排序。行情缺失的股票排在最后，行情刷新后自动更新顺序。</p>
+      <p class="ranking-note">走势仅使用已完成交易日的复权收盘价，按所选区间涨跌着色，与当天涨跌分别展示；成交量以本段最大值为 100%。市值占比仅计算本市场已登记股票，不含现金。</p>
+      <button id="portfolioQuotes" type="button">刷新行情</button>
+    </section>
+    <nav class="portfolio-section-nav" aria-label="持仓功能"><a href="#portfolioEntry">管理持仓</a><a href="#portfolioTools">分析持仓</a><a href="#portfolioWorkbench">持仓池回测 / 部署</a><a href="#portfolioHistory">回测记录</a></nav>
+    <details id="portfolioEntry" class="task-panel portfolio-entry">
+      <summary>持仓管理<span>文字 / 图片添加 · 编辑股数 · 移除持仓 · A股、港股与美股</span></summary>
+      <p>填写股票代码和当前持有股数，或上传股票列表、持仓截图。图片识别结果会填入下方文本框，核对并补齐股数后再保存。6 位数字代码识别为 A 股，1–5 位数字代码识别为港股；也可以注明“港股”或使用 .HK 后缀。美股使用 ticker（例如 AAPL 1.5股）。再次识别只新增或更新本次输入的持仓，未提及的持仓会保留。</p>
+      <form id="portfolioEntryForm">
+        <div id="portfolioImageDrop" class="portfolio-image-upload">
+          <label for="portfolioEntryImage">上传图片识别</label>
+          <p id="portfolioImageHelp" class="ranking-note">选择、拖入或粘贴截图，支持 PNG、JPEG、WebP，单张不超过 8 MB。仅有代码和名称的图片也可以识别。</p>
+          <input id="portfolioEntryImage" type="file" accept="image/png,image/jpeg,image/webp" aria-describedby="portfolioImageHelp">
+          <div id="portfolioImagePreview" class="portfolio-image-preview" hidden><img id="portfolioImageThumbnail" alt="待识别的股票截图"><span id="portfolioImageName"></span><button id="portfolioImageRemove" type="button">移除图片</button></div>
+          <button id="portfolioImageRecognize" type="submit" value="image" disabled>识别图片并填入文字</button>
+        </div>
+        <label for="portfolioEntryText">我的持仓</label>
+        <textarea id="portfolioEntryText" name="text" rows="4" maxlength="6000" placeholder="600519 100股&#10;000858 200股&#10;港股 00700 300股"></textarea>
+        <p class="ranking-note">数量按“股”填写，不按手。同市场同代码更新为本次股数，其他持仓保留；无需填写成本价。</p>
+        <div class="portfolio-entry-actions"><button class="primary" type="submit" value="save">DSH 识别并保存</button><button type="submit" value="preview">仅预览识别结果</button><button id="portfolioEntryCancel" type="button" hidden>取消任务</button></div>
+      </form>
+      <p id="portfolioEntryStatus" class="portfolio-entry-status" role="status" aria-live="polite"></p>
+      <div id="portfolioEntryResults"></div>
+    </details>
+    <section id="portfolioTools" class="insight-card portfolio-shell" aria-labelledby="portfolioTitle">
+      <div class="section-heading"><div><p class="eyebrow">ON-DEMAND PORTFOLIO</p><h2 id="portfolioTitle">持仓分析与仓位总结</h2><p id="portfolioMeta" class="insight-meta">默认不读取持仓；点击后对照个股研究与所选策略。</p></div><div class="portfolio-actions"><label class="select-control" for="portfolioKind"><span>策略类型</span><select id="portfolioMarket" aria-label="持仓市场"><option value="a">A股</option><option value="hk">港股</option><option value="us">美股</option></select><select id="portfolioKind"><option value="fixed">经典策略</option><option value="model">多因子模型策略</option></select></label><label class="select-control" for="portfolioStrategy"><span>经典策略 / 已训练 checkpoint</span><select id="portfolioStrategy" disabled><option value="">正在读取策略…</option></select></label><button id="portfolioButton" type="button">分析我的持仓</button></div></div>
+      <div id="portfolioParameters" class="strategy-parameters"></div>
+      <div id="portfolioContent" aria-live="polite"></div>
+    </section>
+    <section id="portfolioWorkbench" class="task-panel" aria-labelledby="poolTitle">
+      <p class="eyebrow">HOLDINGS STRATEGY LAB</p><h2 id="poolTitle">持仓股票池回测与部署</h2>
+      <p>自动使用所选市场的已保存持仓，无需重新填写代码。启动时固定名单；修改持仓后，新任务使用更新后的名单。</p>
+      <p id="portfolioPoolSummary" class="pool-summary" role="status"></p>
+      <form id="portfolioTaskForm" class="task-fields">
+        <label>任务<select name="kind"><option value="backtest">持仓池回测</option><option value="deploy">持仓池部署</option></select></label>
+        <label>K线周期<select name="timeframe"><option value="daily">日线</option><option value="weekly">周线</option><option value="monthly">月线</option></select></label>
+        <label>策略 / 已训练模型<select name="strategy" required disabled><option value="">正在读取…</option></select></label>
+        <label id="portfolioStartField">回测开始<input type="date" name="start" required></label>
+        <label id="portfolioEndField">回测结束<input type="date" name="end" required></label>
+        <details class="parameter-editor"><summary>策略超参数</summary><div id="portfolioTaskParameters" class="task-fields"></div></details>
+        <button class="primary" type="submit" disabled>运行持仓池回测</button><button id="portfolioTaskCancel" type="button" hidden>取消任务</button>
+      </form>
+      <p class="ranking-note">回测仅将当前持仓代码作为固定股票池，使用策略的模拟资金与配置规则，不还原实际持股数量、成本或历史仓位；存在幸存者偏差。部署生成当前信号与排名，仅供模拟研究。因子模型部署须通过验证。</p>
+      <pre id="portfolioTaskLog" class="task-log" role="status" aria-live="polite"></pre>
+      <div id="portfolioDeployment" aria-live="polite"></div>
+    </section>
+    <section id="portfolioHistory" class="insight-card" aria-labelledby="portfolioHistoryTitle">
+      <p class="eyebrow">PORTFOLIO BACKTESTS</p><h2 id="portfolioHistoryTitle">持仓池回测记录</h2><p id="portfolioHistoryMeta" class="insight-meta" role="status">正在读取持仓池回测…</p>
+      <div id="portfolioRuns"></div><div id="portfolioRunDetail" aria-live="polite"></div>
+    </section>
+  </main>
+  <footer><span>本地保存 · 仅供研究</span><a href="/backtests">前往自定义回测与模型训练 ↗</a></footer>
+  <script src="/portfolio-charts.js" defer></script>
+  <script src="/portfolio.js" defer></script>
+  <script src="/portfolio-analysis.js" defer></script>
+  <script src="/portfolio-entry.js" defer></script>
+</body>
+</html>

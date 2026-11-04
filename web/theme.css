@@ -1,0 +1,104 @@
+/* Keep the shared compact layout in both themes; only the screen palette changes. */
+@media screen {
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --soft-bg: #f3f5fa; --soft-ink: #252d40; --soft-muted: #5d6b82;
+    --soft-accent: #694bb8; --soft-border: #d8dfeb;
+    --soft-shadow: 0 8px 25px #28334b0a;
+    --ink: var(--soft-ink); --subtle-ink: var(--soft-muted);
+    --line: #d8dfeb; --border: #c8d2e2; --surface: #fff;
+    --blue: #7556df; --blue-deep: #694bb8;
+  }
+  [data-theme="light"] body.home-page { background: radial-gradient(ellipse at 18% 28%, #e8e0fa66, transparent 40%), var(--soft-bg); }
+  [data-theme="light"] input, [data-theme="light"] select, [data-theme="light"] textarea { color-scheme: light; }
+  [data-theme="light"] .topbar { background: #f3f5faf2; }
+  [data-theme="light"] .workspace-navigation, [data-theme="light"] .studio-nav .workspace-navigation,
+  [data-theme="light"] .studio-nav nav, [data-theme="light"] .workbench-tabs, [data-theme="light"] .segmented { background: #e9edf5; box-shadow: none; }
+  [data-theme="light"] .workspace-navigation a:hover, [data-theme="light"] .studio-nav .workspace-navigation a:hover,
+  [data-theme="light"] .workspace-navigation a[aria-current="page"], [data-theme="light"] .studio-nav .workspace-navigation a[aria-current="page"],
+  [data-theme="light"] .studio-nav nav a[aria-current], [data-theme="light"] .workbench-tabs button[aria-selected=true],
+  [data-theme="light"] .segmented button[aria-pressed=true] { background: #fff; color: #694bb8; box-shadow: 0 1px 5px #28334b12; }
+  [data-theme="light"] .nav-status, [data-theme="light"] .hero-label,
+  [data-theme="light"] .suggestions button, [data-theme="light"] .quiet, [data-theme="light"] .chart-download,
+  [data-theme="light"] .lan-access button, [data-theme="light"] .review-caption .chart-download,
+  [data-theme="light"] .soft-tag, [data-theme="light"] .ranking-badge,
+  [data-theme="light"] .portfolio-section-nav a, [data-theme="light"] .pool-summary { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .suggestions button:hover, [data-theme="light"] .quiet:hover, [data-theme="light"] .chart-download:hover,
+  [data-theme="light"] .portfolio-section-nav a:hover { background: #ded4f5; color: #573b9d; }
+  [data-theme="light"] .soft-tag.mint { background: #dcf2e9; color: #247859; }
+  [data-theme="light"] .research-composer textarea, [data-theme="light"] .portfolio-entry textarea,
+  [data-theme="light"] .task-fields select, [data-theme="light"] .task-fields input, [data-theme="light"] select,
+  [data-theme="light"] .strategy-parameters input, [data-theme="light"] .portfolio-row-editor input,
+  [data-theme="light"] .portfolio-run-select select { background: #f7f8fc; color: var(--ink); border-color: #c8d2e2; box-shadow: inset 0 1px 3px #28334b0a; }
+  [data-theme="light"] .research-composer textarea::placeholder, [data-theme="light"] .portfolio-entry textarea::placeholder,
+  [data-theme="light"] input::placeholder { color: #718097; }
+  [data-theme="light"] .portfolio-entry-status, [data-theme="light"] .portfolio-saved-list li>span,
+  [data-theme="light"] .portfolio-list-heading>button, [data-theme="light"] .lan-label, [data-theme="light"] .lan-access a { color: #694bb8; }
+  [data-theme="light"] .portfolio-entry-actions button[value=preview], [data-theme="light"] .portfolio-row-actions button,
+  [data-theme="light"] .portfolio-row-editor button, [data-theme="light"] .model-list button { background: #eae4fa; color: #694bb8; border-color: #cfc4e9; }
+  [data-theme="light"] .portfolio-row-actions .portfolio-remove, [data-theme="light"] .model-list .model-remove { background: #fae5eb; color: #a62e51; }
+  [data-theme="light"] .portfolio-row-editor button:last-child { background: #e9edf5; color: var(--subtle-ink); }
+  [data-theme="light"] .portfolio-saved-list li, [data-theme="light"] .model-list article,
+  [data-theme="light"] .watch-card, [data-theme="light"] .backtest-metric, [data-theme="light"] .holding-card,
+  [data-theme="light"] .portfolio-metrics>div { background: #f4f6fb; }
+  [data-theme="light"] .portfolio-curve, [data-theme="light"] .table-wrap,
+  [data-theme="light"] .strategy-chart, [data-theme="light"] .review-comparison, [data-theme="light"] .lan-access { background: #f7f9fd; }
+  [data-theme="light"] .report-topline, [data-theme="light"] .research-tools>summary, [data-theme="light"] th { background: #edf1f8; color: var(--ink); }
+  [data-theme="light"] .report p, [data-theme="light"] .report ul, [data-theme="light"] td,
+  [data-theme="light"] .index-panel>summary, [data-theme="light"] .report-index a, [data-theme="light"] .segmented button { color: #45536a; }
+  [data-theme="light"] .report code, [data-theme="light"] .job-result code { background: #f8eaf0; color: #973856; }
+  [data-theme="light"] .job-error, [data-theme="light"] #notice { color: #aa2c4b; }
+  [data-theme="light"] tbody tr:hover { background: #ece8f8; }
+  [data-theme="light"] .position-total { background: #ece8f8; }
+  [data-theme="light"] .report-index a:hover, [data-theme="light"] .report-index a[aria-current="location"] { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .index-subsections { border-color: var(--line); }
+  [data-theme="light"] .chart-grid { stroke: #d3dce9; }
+  [data-theme="light"] .chart-axis { fill: #5d6b82; }
+  [data-theme="light"] .chart-line { stroke: #7556df; }
+  [data-theme="light"] .drawdown-line { stroke: #c34150; }
+  [data-theme="light"] .bar-track, [data-theme="light"] .review-track { background: #e0e6f0; }
+  [data-theme="light"] .review-track::after { background: #a4b0c3; }
+  [data-theme="light"] .review-status { background: #e7ecf5; color: #45536a; }
+  [data-theme="light"] .review-status-aligned { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .review-status-contradicted { background: #faedcd; color: #795a15; }
+  [data-theme="light"] .positive, [data-theme="light"] .review-value.is-up, [data-theme="light"] .portfolio-page .is-up,
+  [data-theme="light"] .profit-up, [data-theme="light"] .holding-chart-dialog .is-up { color: #bb304d; }
+  [data-theme="light"] .negative, [data-theme="light"] .review-value.is-down, [data-theme="light"] .portfolio-page .is-down,
+  [data-theme="light"] .profit-down, [data-theme="light"] .holding-chart-dialog .is-down { color: #167a55; }
+  [data-theme="light"] .coverage-ok, [data-theme="light"] .daily-overview .coverage-ok { background: #dcf0f4; color: #27616c; }
+  [data-theme="light"] .coverage-missing, [data-theme="light"] .daily-overview .coverage-missing { background: #faedcd; color: #795a15; }
+  [data-theme="light"] .data-notice, [data-theme="light"] .daily-overview .data-notice { color: #795a15; }
+  [data-theme="light"] .heat-flat, [data-theme="light"] .heat-missing { background: #e7ecf5; color: #45536a; }
+  [data-theme="light"] .status-card.error { background: linear-gradient(135deg, #fae5eb, #fff); }
+  [data-theme="light"] .status-icon { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .holding-chart-dialog { background: #fff; border-color: var(--line); }
+  [data-theme="light"] .holding-chart-tools button, [data-theme="light"] .holding-dialog-close { background: #e9edf5; color: #45536a; }
+  [data-theme="light"] .holding-chart-tools button:hover, [data-theme="light"] .holding-chart-tools button[aria-pressed=true],
+  [data-theme="light"] .holding-range button[aria-pressed=true], [data-theme="light"] .holding-range button:hover { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .holding-detail-plot, [data-theme="light"] .holding-day-values>div,
+  [data-theme="light"] .holding-indicator-toolbar { background: #f4f6fb; }
+  [data-theme="light"] .holding-day-controls select, [data-theme="light"] .holding-indicator-controls select { background: #f7f8fc; box-shadow: inset 0 0 0 1px var(--line); }
+  [data-theme="light"] .holding-day-controls button, [data-theme="light"] .holding-view-reset,
+  [data-theme="light"] .holding-chart-retry { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .holding-daily-table summary, [data-theme="light"] .holding-daily-table td button,
+  [data-theme="light"] .holding-indicator-methods summary, [data-theme="light"] .holding-view-status>span:last-of-type,
+  [data-theme="light"] button.report-stock-link { color: #694bb8; }
+  [data-theme="light"] .holding-daily-table tr[aria-selected=true], [data-theme="light"] .holding-daily-table td button:hover { background: #eae4fa; }
+  [data-theme="light"] .holding-indicator-controls, [data-theme="light"] .holding-detail-heading .holding-chart-context { color: #45536a; }
+  [data-theme="light"] .holding-indicator-title { fill: #45536a; }
+  [data-theme="light"] .holding-ma5 { color: #956000; stroke: #956000; }
+  [data-theme="light"] .holding-ma20 { color: #694bb8; stroke: #694bb8; }
+  [data-theme="light"] .holding-dif-line, [data-theme="light"] .holding-boll-mid { stroke: #956000; }
+  [data-theme="light"] .holding-dea-line { stroke: #694bb8; }
+  [data-theme="light"] .holding-rsi-line, [data-theme="light"] .holding-boll-edge { stroke: #167795; }
+  [data-theme="light"] .holding-dif-value { color: #956000; }
+  [data-theme="light"] .holding-dea-value { color: #694bb8; }
+  [data-theme="light"] .holding-rsi-value, [data-theme="light"] .holding-boll-value { color: #167795; }
+  [data-theme="light"] .holding-allocation progress, [data-theme="light"] .holding-allocation progress::-webkit-progress-bar { background: #d8dfeb; }
+  [data-theme="light"] .guide-actions a, [data-theme="light"] .guide-index a,
+  [data-theme="light"] .guide-sources a, [data-theme="light"] .card-kicker span:last-child { background: #eae4fa; color: #694bb8; }
+  [data-theme="light"] .guide-primer p:last-child, [data-theme="light"] .card-idea { color: #45536a; }
+  [data-theme="light"] .guide-primer strong, [data-theme="light"] .orientation-grid strong,
+  [data-theme="light"] .card-kicker, [data-theme="light"] .guide-card dt, [data-theme="light"] .card-rule strong { color: #694bb8; }
+  [data-theme="light"] .card-rule { background: #edf1f8; color: #45536a; }
+}

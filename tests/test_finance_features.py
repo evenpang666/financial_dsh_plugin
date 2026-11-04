@@ -33,10 +33,10 @@ class FakeAkshare(types.ModuleType):
         ])
 
 
-sys.modules["akshare"] = FakeAkshare("akshare")
 spec = importlib.util.spec_from_file_location("stock_data_server", ROOT / "scripts" / "stock_data_server.py")
 server = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(server)
+with patch.dict(sys.modules, {"akshare": FakeAkshare("akshare")}):
+    spec.loader.exec_module(server)
 
 
 class FinanceFeatureTests(unittest.TestCase):
@@ -332,6 +332,27 @@ class FinanceFeatureTests(unittest.TestCase):
         self.assertEqual(report["intraday_review"]["contradicted"], 1)
         self.assertIn("日报1与日报2一致性复盘", report["markdown"])
         self.assertIn("明显背离", report["markdown"])
+
+    def test_manual_report_has_own_snapshot_without_changing_morning_baseline(self):
+        morning_path = server.save_report_snapshot({"as_of": str(server.date.today()), "market": "a", "session": "morning", "candidates": {"ranking": []}})
+        original = morning_path.read_bytes()
+        panorama = {"market_state": {"summary": "测试", "risk_level": "中", "reference_position": "待评估"},
+                    "market_breadth": {"label": "均衡", "advancing": 1, "declining": 1},
+                    "social_sentiment": {"label": "中性"}, "international_events": [], "domestic_policies": [], "unavailable": []}
+        with patch.object(server, "trading_day_response", return_value={"is_trading_day": True, "source": "test"}), \
+             patch.object(server, "market_panorama_response", return_value=panorama), \
+             patch.object(server, "global_market_response", return_value={"indices": [], "source": "test"}), \
+             patch.object(server, "sector_focus_response", return_value={"boards": [], "source": "test"}), \
+             patch.object(server, "market_events_response", return_value={"events": [], "source": "test"}), \
+             patch.object(server, "candidate_ranking_response", return_value={"ranking": [], "method": "test"}), \
+             patch.object(server, "horizon_recommendations", return_value={"horizons": {}, "pool_size": 0}):
+            report = server.daily_report_response(5, "a", "manual")
+        self.assertEqual(report["session"], "manual")
+        self.assertIn("-a-manual-", report["report_id"])
+        self.assertIn("手动报告", report["markdown"])
+        self.assertNotIn("intraday_review", report)
+        self.assertTrue(Path(report["snapshot_path"]).exists())
+        self.assertEqual(morning_path.read_bytes(), original)
 
     def test_hk_symbol_normalization_and_mixed_portfolio(self):
         self.assertEqual(server.normalize_hk_symbol("700"), "00700")

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="设置 DSH 研究模型、推理强度与网页主题">
+  <title>设置 · 知衡</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/soft-ui.css"><link rel="stylesheet" href="/dark-ui.css"><link rel="stylesheet" href="/theme.css"><link rel="stylesheet" href="/settings.css">
+<link rel="stylesheet" href="/workspace.css"><script src="/workspace.js" defer></script></head>
+<body>
+  <header class="topbar workspace-header">
+    <a class="workspace-brand" href="/" aria-label="返回知衡研究首页"><img src="/icon.svg" width="32" height="32" alt=""><strong>知衡</strong></a>
+    <nav class="workspace-navigation" aria-label="工作台导航"><a href="/">研究</a><a href="/reports">日报</a><a href="/portfolio">持仓</a><a href="/backtests">回测</a><a href="/simulation">模拟</a><a href="/strategy-guide">策略解读</a><a href="/settings" aria-current="page">设置</a></nav>
+    <span class="workspace-connection" data-state="pending" role="status" aria-live="polite" aria-label="本地服务连接状态">正在连接</span>
+  </header>
+  <main class="report-page settings-page">
+    <section class="intro"><div class="intro-heading"><div><h1>设置</h1><p>选择研究模型与工作台外观。</p></div></div></section>
+    <section class="insight-card" aria-labelledby="agentSettingsTitle">
+      <h2 id="agentSettingsTitle">DSH 模型</h2>
+      <p class="insight-meta">用于研究问答、日报复核、持仓识别与 AI 策略分析。默认跟随 DSH 宿主，也可为知衡单独选择已配置的模型。保存后对后续任务生效。</p>
+      <form id="agentSettingsForm" class="settings-form">
+        <div class="settings-fields"><label for="agentModel">模型<select id="agentModel" name="model" disabled><option value="">正在读取模型…</option></select></label><label for="reasoningEffort">推理强度<select id="reasoningEffort" name="reasoningEffort" disabled><option value="">跟随模型默认</option></select></label></div>
+        <p class="insight-meta">模型列表和推理强度来自 DSH；API Key 与供应商配置在 DSH Web 的模型设置中管理。</p>
+        <div class="settings-actions"><button id="saveAgentSettings" type="submit" disabled>保存模型设置</button><button id="reloadSettings" class="quiet" type="button">重新读取</button></div>
+        <p id="agentSettingsStatus" class="settings-status" role="status" aria-live="polite">正在读取设置…</p>
+      </form>
+    </section>
+    <section class="insight-card" aria-labelledby="themeSettingsTitle">
+      <h2 id="themeSettingsTitle">网页主题</h2><p class="insight-meta">默认深色。选择后立即生效，并保存在当前浏览器中。</p>
+      <fieldset class="theme-options"><legend class="sr-only">选择网页主题</legend><label><input type="radio" name="theme" value="dark"><span class="theme-preview theme-preview-dark" aria-hidden="true"><i></i><i></i><i></i></span><strong>深色</strong><span>柔和暗色背景</span></label><label><input type="radio" name="theme" value="light"><span class="theme-preview theme-preview-light" aria-hidden="true"><i></i><i></i><i></i></span><strong>浅色</strong><span>明亮清晰界面</span></label></fieldset>
+      <p id="themeSettingsStatus" class="settings-status" role="status" aria-live="polite"></p>
+    </section>
+  </main><footer><span>知衡 · 本地工作台</span><a href="/">返回研究 ↗</a></footer>
+  <script src="/settings.js" defer></script>
+</body></html>

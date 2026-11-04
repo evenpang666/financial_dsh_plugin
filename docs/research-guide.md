@@ -2,16 +2,18 @@
 
 [← 项目首页](../README.md) · [文档导航](README.md)
 
-8 个内置 Skills 组织研究流程；工具返回的数据、来源与日期是报告的证据基础。
+10 个内置 Skills 组织研究流程；工具返回的数据、来源与日期是报告的证据基础。
 
 ## 内置 Skills
 
-`dsh-finance-agent/skills/` 中的文件随插件自动加载：
+`dsh-finance-agent/skills/` 中的文件随 DSH 插件加载：
 
 | Skill | 何时使用 |
 |---|---|
 | `a-share-research` | 用户要求研究、比较或复盘 A 股时 |
 | `hk-share-research` | 用户要求研究、比较或复盘港股时，使用 `market=hk` |
+| `us-share-research` | 用户要求研究美股、美国上市 ETF 或 ADR 时，使用 `market=us` |
+| `financial-workspace` | 打开工作台、查看归档、管理任务与调度、排查插件问题时 |
 | `investment-risk-control` | 每次涉及市场判断或动作建议时 |
 | `earnings-and-announcement-analysis` | 解读财报、业绩预告和公告事件时 |
 | `quant-strategy-research` | 要求回测或评估规则时 |
